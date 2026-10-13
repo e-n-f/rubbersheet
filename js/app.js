@@ -300,7 +300,7 @@ function drawOverlay() {
   const parts = [];
   const outline = meshOutline(state.mesh).map(mercToScreen);
   parts.push(`<polygon class="outline" points="${outline.map(p => p.join(',')).join(' ')}"/>`);
-  if (!state.drag || state.drag.kind === 'corner') {
+  if (imageDraggable() && (!state.drag || state.drag.kind === 'corner')) {
     meshCorners(state.mesh).map(mercToScreen).forEach(([x, y], i) => {
       const hover = state.hover && state.hover.kind === 'corner' && state.hover.index === i;
       parts.push(`<rect class="handle${hover ? ' hover' : ''}" x="${x - 5}" y="${y - 5}" width="10" height="10"/>`);
@@ -329,9 +329,11 @@ function hitTest(p) {
   for (let i = state.points.length - 1; i >= 0; i--) {
     if (near(mercToScreen([state.points[i].x, state.points[i].y]))) return { kind: 'point', index: i };
   }
-  const corners = meshCorners(state.mesh);
-  for (let i = 0; i < 4; i++) {
-    if (near(mercToScreen(corners[i]))) return { kind: 'corner', index: i };
+  if (imageDraggable()) {
+    const corners = meshCorners(state.mesh);
+    for (let i = 0; i < 4; i++) {
+      if (near(mercToScreen(corners[i]))) return { kind: 'corner', index: i };
+    }
   }
   const m = screenToMerc(p);
   const uv = invertMesh(state.mesh, m[0], m[1]);
@@ -354,8 +356,8 @@ function cursorFor(hit, cmd) {
   return imageDraggable() ? 'move' : '';
 }
 
-// Once the image is pinned by a control point, dragging its background pans
-// the map instead of moving the image.
+// Once the image is pinned by a control point, its corner handles go away and
+// dragging its background pans the map instead of moving the image.
 const imageDraggable = () => state.points.length === 0;
 
 let lastPointer = null;
