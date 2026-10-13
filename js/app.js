@@ -351,8 +351,12 @@ function cursorFor(hit, cmd) {
   if (hit.kind === 'point') return cmd ? 'pointer' : 'grab';
   if (cmd) return 'copy';
   if (hit.kind === 'corner') return hit.index % 2 === 0 ? 'nwse-resize' : 'nesw-resize';
-  return 'move';
+  return imageDraggable() ? 'move' : '';
 }
+
+// Once the image is pinned by a control point, dragging its background pans
+// the map instead of moving the image.
+const imageDraggable = () => state.points.length === 0;
 
 let lastPointer = null;
 let swallowing = false;
@@ -373,6 +377,7 @@ container.addEventListener('pointerdown', (e) => {
   const p = localPoint(e);
   const hit = hitTest(p);
   if (!hit) return;
+  if (hit.kind === 'image' && !isCommand(e) && !imageDraggable()) return;
   // Keep MapLibre from starting a pan/rotate for this gesture.
   e.preventDefault();
   e.stopPropagation();

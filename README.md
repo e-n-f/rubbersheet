@@ -5,7 +5,7 @@ Map rubbersheeting in the browser. Drop a scanned map or photo onto a MapLibre b
 ## Using it
 
 - **Drop** a JPEG, PNG or WebP onto the map, or use the *choose a file* link. The image is centred where you drop it and sized to cover about 75% of the view.
-- **Drag** the image to move it. With two or more control points, this moves all of them together.
+- **Drag** the image to move it. Once you add a control point, the image is pinned: dragging its background pans the map instead. Drag the control points (or the corner handles) to adjust it from then on.
 - **Drag a corner handle** to scale and rotate around the image centre. Hold <kbd>Shift</kbd> to scale without rotating.
 - **⌘-click** (Ctrl-click on Windows/Linux) the image to add a control point. ⌘-click a point to remove it.
 - **Drag a control point** to move that spot of the image to a new place on the map. The image goes half-transparent while you drag so you can see the map underneath.
@@ -16,7 +16,8 @@ How the image is fitted depends on the number of control points:
 
 | Points | Transformation |
 |---|---|
-| 0–1 | Moves, scales and rotates freely (the single point just goes along with it) |
+| 0 | Moves, scales and rotates freely |
+| 1 | Dragging the point moves the whole image; the corner handles scale and rotate it |
 | 2 | The similarity transform (shift + scale + rotation) through both points |
 | 3+ | A least-squares similarity, then rigid Moving Least Squares (Schaefer et al. 2006) to bend the rest of the way. Every point lands exactly where you put it. |
 
