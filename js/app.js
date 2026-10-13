@@ -50,6 +50,9 @@ const state = {
 const $ = (id) => document.getElementById(id);
 const overlay = $('overlay');
 
+// The map writes its own hash, so note whether the link came with a view.
+const linkHasView = !!window.location.hash;
+
 const map = new maplibregl.Map({
   container: 'map',
   style: STYLES.streets,
@@ -548,7 +551,7 @@ function decodeImage(file) {
   });
 }
 
-async function loadFiles(files, dropPoint) {
+async function loadFiles(files, dropPoint, { keepView = false, fromURL = false } = {}) {
   const imageFile = files.find(f => IMAGE_RE.test(f.name) || /^image\//.test(f.type));
   if (!imageFile) {
     setStatus('That doesn’t look like a JPEG, PNG or WebP image.', true);
@@ -589,8 +592,42 @@ async function loadFiles(files, dropPoint) {
   state.drag = null;
   imageLayer.texDirty = true;
   update();
-  if (placement.points.length || how) zoomToImage();
+  if ((placement.points.length || how) && !keepView) zoomToImage();
+  if (!fromURL) clearImageParam();
   setStatus(`<b>${escapeHTML(imageFile.name)}</b> (${W}×${H})${how ? ', ' + how : ''}.`);
+}
+
+// ?image=<url> loads an image from the web. The server has to allow
+// cross-origin requests.
+function clearImageParam() {
+  const u = new URL(window.location.href);
+  if (!u.searchParams.has('image')) return;
+  u.searchParams.delete('image');
+  history.replaceState(history.state, '', u);
+}
+
+async function loadURL(url, keepView = false) {
+  setStatus(`Loading <b>${escapeHTML(url)}</b>…`);
+  let blob;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    blob = await res.blob();
+  } catch (err) {
+    console.warn(err);
+    setStatus(`Could not load <b>${escapeHTML(url)}</b> (${escapeHTML(err.message)}). ` +
+      'The server must allow cross-origin requests.', true);
+    return;
+  }
+  let name = '';
+  try {
+    name = decodeURIComponent(new URL(url, window.location.href).pathname.split('/').pop());
+  } catch { /* keep the fallback */ }
+  if (!IMAGE_RE.test(name)) {
+    const ext = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' }[blob.type] || 'png';
+    name = `image.${ext}`;
+  }
+  await loadFiles([new File([blob], name, { type: blob.type })], null, { keepView, fromURL: true });
 }
 
 // Centre the image on the drop point, upright on screen, at 75% of the view.
@@ -822,6 +859,7 @@ $('remove').addEventListener('click', () => {
   map.triggerRepaint();
   statusBase = '';
   $('status').innerHTML = initialStatus;
+  clearImageParam();
   updateUI();
 });
 $('opacity').addEventListener('input', (e) => {
@@ -832,5 +870,8 @@ $('basemap').addEventListener('change', (e) => {
   map.setStyle(STYLES[e.target.value], { diff: false });
 });
 
+const imageParam = new URLSearchParams(window.location.search).get('image');
+if (imageParam) loadURL(imageParam, linkHasView);
+
 // Exposed for debugging and automated tests.
-window.rubbersheet = { map, state, update, loadFiles, exportImage };
+window.rubbersheet = { map, state, update, loadFiles, loadURL, exportImage };
