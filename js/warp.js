@@ -283,3 +283,40 @@ export function affineToWorldFile(T) {
   const [C, F] = mercToMeters(c + 0.5 * a + 0.5 * b, f + 0.5 * d + 0.5 * e);
   return [A, D, B, E, C, F];
 }
+
+// Longitude/latitude <-> MapLibre Mercator units, without MapLibre, so the
+// exporters and tests can share them. No wrapping or clamping.
+export function lngToMercX(lng) {
+  return (lng + 180) / 360;
+}
+
+export function mercXToLng(x) {
+  return x * 360 - 180;
+}
+
+export function latToMercY(lat) {
+  return (180 - 180 / Math.PI * Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360))) / 360;
+}
+
+export function mercYToLat(y) {
+  return 360 / Math.PI * Math.atan(Math.exp((180 - y * 360) * Math.PI / 180)) - 90;
+}
+
+// A north-up EPSG:4326 image (world file [A, D, B, E, C, F] in degrees) is
+// placed by resampling its rows into Mercator, keeping its W×H size. Returns
+// the affine T for the resampled image and the row mapping both ways, in
+// continuous pixel coordinates, or null if the image isn't north-up.
+export function geographicRows(wf, H) {
+  const [A, D, B, E, C, F] = wf;
+  if (D !== 0 || B !== 0 || !(A > 0) || !(E < 0)) return null;
+  const west = C - A / 2, north = F - E / 2;
+  const yN = latToMercY(north), yS = latToMercY(north + E * H);
+  const dy = (yS - yN) / H;
+  return {
+    T: [A / 360, 0, lngToMercX(west), 0, dy, yN],
+    // Source row of a resampled row.
+    sourceV: (v) => (mercYToLat(yN + v * dy) - north) / E,
+    // Resampled row of a source row.
+    targetV: (v) => (latToMercY(north + E * v) - yN) / dy,
+  };
+}

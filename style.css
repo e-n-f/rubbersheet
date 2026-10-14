@@ -93,6 +93,7 @@ button:disabled { opacity: 0.45; cursor: default; }
   color: #fff;
 }
 .check { display: block; font-size: 12.5px; color: #4a535c; }
+.check[hidden] { display: none; }
 details { margin-top: 10px; }
 summary { cursor: pointer; font-weight: 600; }
 details ul { padding-left: 18px; margin: 6px 0 0; }
