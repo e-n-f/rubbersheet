@@ -10,12 +10,12 @@
 <body>
   <div id="map"></div>
   <svg id="overlay" aria-hidden="true"></svg>
-  <div id="drop-hint">Drop a JPEG, PNG or WebP image</div>
+  <div id="drop-hint">Drop a JPEG, PNG, WebP or KMZ file</div>
 
   <aside id="panel">
     <h1>Rubbersheet</h1>
     <p id="status">Drag an image onto the map, or <label class="link" for="file">choose a file</label>.</p>
-    <input id="file" type="file" accept="image/png,image/jpeg,image/webp,.wld,.pgw,.jgw,.wpw,.prj,.xml" multiple hidden>
+    <input id="file" type="file" accept="image/png,image/jpeg,image/webp,.kmz,.wld,.pgw,.jgw,.wpw,.prj,.xml" multiple hidden>
 
     <div class="row">
       <label for="opacity">Opacity</label>
@@ -31,7 +31,8 @@
     </div>
 
     <div class="buttons">
-      <button id="export" disabled>Export warped PNG</button>
+      <button id="export" disabled>Export PNG</button>
+      <button id="export-kmz" disabled title="For Google Earth">Export KMZ</button>
       <button id="zoom" disabled>Zoom to image</button>
       <button id="clear" disabled>Clear points</button>
       <button id="remove" disabled>Remove image</button>
@@ -45,7 +46,8 @@
         <li><b>Drag a corner</b> to scale and rotate. Hold <kbd>Shift</kbd> to scale without rotating. The corners lock once there's a control point.</li>
         <li><b><kbd>⌘</kbd>/<kbd>Ctrl</kbd>-click</b> the image to add a control point. Do it again on a point to remove it.</li>
         <li><b>Drag a control point</b> to pin that spot of the image to a new place on the map. The image warps to fit.</li>
-        <li><b>Export</b> saves a north-up PNG in Web Mercator. The placement and control points are stored inside it, so dropping it back on the map puts it in the same place.</li>
+        <li><b>Export PNG</b> saves a north-up PNG in Web Mercator. The placement and control points are stored inside it, so dropping it back on the map puts it in the same place.</li>
+        <li><b>Export KMZ</b> saves a file you can open in or drag into Google Earth. You can drop it, or the PNG inside it, back on the map too.</li>
       </ul>
     </details>
   </aside>

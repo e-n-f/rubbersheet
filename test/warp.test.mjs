@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import {
   applyAffine, fitSimilarity, makeWarp, buildMesh, invertMesh,
   worldFileToAffine, affineToWorldFile, similarityAboutPivot,
+  lngToMercX, mercXToLng, latToMercY, mercYToLat, geographicRows,
 } from '../js/warp.js';
 import { addTextChunk, readTextChunks } from '../js/png-text.js';
+import { makeZip, readZip } from '../js/zip.js';
 
 const close = (a, b, eps = 1e-12) => assert.ok(Math.abs(a - b) <= eps, `${a} != ${b}`);
 
@@ -74,4 +76,49 @@ test('PNG text chunk round-trips', () => {
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64'));
   const out = addTextChunk(png, 'rubbersheet', '{"a":"é"}');
   assert.deepEqual(JSON.parse(readTextChunks(out).rubbersheet), { a: 'é' });
+});
+
+test('lng/lat <-> Mercator round-trips and matches known values', () => {
+  close(lngToMercX(0), 0.5);
+  close(latToMercY(0), 0.5);
+  close(latToMercY(85.0511287798066), 0, 1e-12);
+  for (const lat of [-80, -33.3, 0, 12.5, 51.48, 84]) close(mercYToLat(latToMercY(lat)), lat, 1e-9);
+  for (const lng of [-180, -73.9, 0, 151.2, 190]) close(mercXToLng(lngToMercX(lng)), lng, 1e-9);
+});
+
+test('geographic rows map a 4326 image onto Mercator', () => {
+  // 1000×800 image covering 10°E–15°E, 50°N–46°N.
+  const W = 1000, H = 800;
+  const A = 5 / W, E = -4 / H;
+  const rows = geographicRows([A, 0, 0, E, 10 + A / 2, 50 + E / 2], H);
+  close(rows.targetV(0), 0, 1e-9);
+  close(rows.targetV(H), H, 1e-9);
+  for (const v of [0, 123.4, 400, 799]) close(rows.sourceV(rows.targetV(v)), v, 1e-6);
+  // A pixel lands at its own lng/lat.
+  const [x, y] = applyAffine(rows.T, 250, rows.targetV(200));
+  close(x, lngToMercX(11.25), 1e-12);
+  close(y, latToMercY(49), 1e-12);
+  // Mercator stretches rows towards the pole, so the middle source row
+  // moves south of the middle.
+  assert.ok(rows.targetV(H / 2) > H / 2);
+  assert.equal(geographicRows([A, 0.001, 0, E, 10, 50], H), null);
+});
+
+test('zip round-trips stored entries', async () => {
+  const png = new Uint8Array(300).map((_, i) => i * 7);
+  const kml = new TextEncoder().encode('<kml>é</kml>');
+  const zip = makeZip([{ name: 'doc.kml', data: kml }, { name: 'map.png', data: png }]);
+  const out = await readZip(zip);
+  assert.deepEqual(out.map(e => e.name), ['doc.kml', 'map.png']);
+  assert.deepEqual([...out[0].data], [...kml]);
+  assert.deepEqual([...out[1].data], [...png]);
+});
+
+test('zip reads deflated entries', async () => {
+  const zip = Uint8Array.from(Buffer.from('UEsDBBQAAAAIACsrTl3glUN0FQAAADcBAAAHAAAAZG9jLmttbLPJzs2xy0jNyclXGCWJIW30QSEGAFBLAwQUAAAACAArK05dAAAAAAIAAAAAAAAABgAAAGZpbGVzLwMAUEsDBBQAAAAIACsrTl0mTAu3GAEAAAAEAAALAAAAZmlsZXMvYS5wbmdjYGRiZmFlY+fg5OLm4eXjFxAUEhYRFROXkJSSlpGVk1dQVFJWUVVT19DU0tbR1dM3MDQyNjE1M7ewtLK2sbWzd3B0cnZxdXP38PTy9vH18w8IDAoOCQ0Lj4iMio6JjYtPSExKTklNS8/IzMrOyc3LLygsKi4pLSuvqKyqrqmtq29obGpuaW1r7+js6u7p7eufMHHS5ClTp02fMXPW7Dlz581fsHDR4iVLly1fsXLV6jVr163fsHHT5i1bt23fsXPX7j179+0/cPDQ4SNHjx0/cfLU6TNnz52/cPHS5StXr12/cfPW7Tt3791/8PDR4ydPnz1/8fLV6zdv373/8PHT5y9fv33/8fPX7z9///1nGPX/qP9HsP8BUEsBAhQDFAAAAAgAKytOXeCVQ3QVAAAANwEAAAcAAAAAAAAAAAAAAIABAAAAAGRvYy5rbWxQSwECFAMUAAAACAArK05dAAAAAAIAAAAAAAAABgAAAAAAAAAAABAA/UE6AAAAZmlsZXMvUEsBAhQDFAAAAAgAKytOXSZMC7cYAQAAAAQAAAsAAAAAAAAAAAAAAIABYAAAAGZpbGVzL2EucG5nUEsFBgAAAAADAAMAogAAAKEBAAAAAA==', 'base64'));
+  const out = await readZip(zip);
+  assert.deepEqual(out.map(e => e.name), ['doc.kml', 'files/a.png']);
+  assert.equal(new TextDecoder().decode(out[0].data), '<kml>' + 'hello '.repeat(50) + '</kml>');
+  assert.equal(out[1].data.length, 1024);
+  assert.equal(out[1].data[300], 300 % 256);
 });

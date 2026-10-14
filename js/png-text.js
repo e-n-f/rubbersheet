@@ -3,7 +3,7 @@
 const SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10];
 
 let crcTable = null;
-function crc32(bytes) {
+export function crc32(bytes) {
   if (!crcTable) {
     crcTable = new Uint32Array(256);
     for (let n = 0; n < 256; n++) {
