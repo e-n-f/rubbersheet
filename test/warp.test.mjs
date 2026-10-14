@@ -7,6 +7,7 @@ import {
 } from '../js/warp.js';
 import { addTextChunk, readTextChunks } from '../js/png-text.js';
 import { makeZip, readZip } from '../js/zip.js';
+import { isTIFF, readGeoTIFF, writeGeoTIFF } from '../js/tiff.js';
 
 const close = (a, b, eps = 1e-12) => assert.ok(Math.abs(a - b) <= eps, `${a} != ${b}`);
 
@@ -121,4 +122,38 @@ test('zip reads deflated entries', async () => {
   assert.equal(new TextDecoder().decode(out[0].data), '<kml>' + 'hello '.repeat(50) + '</kml>');
   assert.equal(out[1].data.length, 1024);
   assert.equal(out[1].data[300], 300 % 256);
+});
+
+test('GeoTIFF round-trips pixels and georeferencing', async () => {
+  const W = 301, H = 157;
+  const rgba = new Uint8Array(W * H * 4).map((_, k) => (k * 37 + (k >> 9)) & 255);
+  const tiff = await writeGeoTIFF({
+    width: W, height: H, rgba, epsg: 3857, scale: [12.5, 12.5], origin: [-13627000, 4562000],
+    description: '{"generator":"rubbersheet"}',
+  });
+  assert.ok(isTIFF(tiff));
+  const t = await readGeoTIFF(tiff);
+  assert.equal(t.width, W);
+  assert.equal(t.height, H);
+  assert.deepEqual([...t.rgba], [...rgba]);
+  assert.equal(t.epsg, 3857);
+  assert.deepEqual(t.scale, [12.5, 12.5]);
+  assert.deepEqual(t.origin, [-13627000, 4562000]);
+  assert.equal(t.description, '{"generator":"rubbersheet"}');
+});
+
+test('GeoTIFF reads a GDAL file: tiled, LZW, predictor 2, EPSG:4326', async () => {
+  // 40×24 RGB written by GDAL 3.12: R = 6i, G = 10j, B = ij mod 256.
+  const t = await readGeoTIFF(Uint8Array.from(Buffer.from('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', 'base64')));
+  assert.equal(t.width, 40);
+  assert.equal(t.height, 24);
+  assert.equal(t.epsg, 4326);
+  close(t.origin[0], -122.5);
+  close(t.origin[1], 37.9);
+  close(t.scale[0], 0.001);
+  close(t.scale[1], 0.0008);
+  for (let j = 0; j < 24; j++) for (let i = 0; i < 40; i++) {
+    const k = (j * 40 + i) * 4;
+    assert.deepEqual([...t.rgba.subarray(k, k + 4)], [i * 6, j * 10, (i * j) & 255, 255]);
+  }
 });
