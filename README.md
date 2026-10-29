@@ -56,7 +56,7 @@ A GeoTIFF is placed from its own tags. It can be in:
 
 - latitude/longitude, or Web Mercator;
 - UTM, given as an EPSG code (WGS84 `326xx`/`327xx`, NAD83 `269xx`, NAD27 `267xx`, ETRS89 `258xx`) or spelled out;
-- Transverse Mercator, Lambert Conformal Conic (1SP or 2SP) or Polyconic, spelled out in the file's GeoKeys, in metres or feet. The USGS Historical Topographic Map Collection scans use Polyconic.
+- Transverse Mercator, Lambert Conformal Conic (1SP or 2SP) or Polyconic, spelled out in the file's GeoKeys, in metres or feet. The USGS Historical Topographic Map Collection scans, downloadable as GeoTIFFs from [TopoView](https://ngmdb.usgs.gov/topoview/viewer/), use Polyconic.
 
 The datum can be WGS84, NAD83, ETRS89 or NAD27. NAD27 is shifted to WGS84 with the average shift for the contiguous US, which is good to about 5–10 m; add control points if you need better. Other EPSG codes, such as State Plane zones given only by number, aren't supported yet. The image still loads, and the status line says why it couldn't be placed.
 
