@@ -860,16 +860,22 @@ const WKT_3857 = 'PROJCS["WGS 84 / Pseudo-Mercator",GEOGCS["WGS 84",DATUM["WGS_1
   '+x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs"],AUTHORITY["EPSG","3857"]]';
 
 const MAX_EXPORT_PIXELS = 64e6;
+const MAX_EXPORT_SIDE = 16384;
+// Pixels per WebGL strip, comfortably under the browsers' drawing buffer caps.
+const MAX_STRIP_PIXELS = 16e6;
 // Google Earth downsamples or refuses larger overlays on many graphics cards.
 const MAX_KMZ_SIDE = 8192;
 
 // Draw `mesh` with its positions replaced by `pos` (a y-down plane, x right)
 // into a north-up raster whose pixels are px × py units. The pixel size grows
-// if needed to stay within browser limits and `maxSide`. Returns
+// if needed to stay within `maxSide` and the export limits. Returns
 // {bytes, canvas, ow, oh, px, py, minX, minY}: by `output`, bytes is a PNG
 // ('png'), or the raw unpremultiplied RGBA pixels, top row first ('rgba'),
 // or canvas is a 2D canvas holding the raster ('canvas'). `img` is the
 // texture, by default the current image.
+//
+// Browsers cap a WebGL drawing buffer well below what a large scan needs
+// (Chrome at 2^25 pixels), so the raster is drawn in horizontal strips.
 async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', img = state.image.img) {
   const [minX, minY, maxX, maxY] = meshBounds({ pos });
   const canvas = document.createElement('canvas');
@@ -877,75 +883,88 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
   const glOpts = { preserveDrawingBuffer: true, premultipliedAlpha: true, antialias: false, alpha: true };
   const gl = canvas.getContext('webgl2', glOpts) || canvas.getContext('webgl', glOpts);
   if (!gl) throw new Error('this needs WebGL.');
-  maxSide = Math.min(maxSide, 16384, gl.getParameter(gl.MAX_RENDERBUFFER_SIZE),
-    ...gl.getParameter(gl.MAX_VIEWPORT_DIMS));
+  const [maxViewW, maxViewH] = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
+  const maxW = Math.min(gl.getParameter(gl.MAX_RENDERBUFFER_SIZE), maxViewW);
+  maxSide = Math.min(maxSide, MAX_EXPORT_SIDE);
 
-  // Keep roughly the source resolution, within browser limits.
+  // Keep roughly the source resolution, within the export limits.
   let ow, oh;
-  for (let attempt = 0; attempt < 8; attempt++) {
+  for (;;) {
     ow = Math.max(1, Math.ceil((maxX - minX) / px));
     oh = Math.max(1, Math.ceil((maxY - minY) / py));
-    const shrink = Math.max(1, ow / maxSide, oh / maxSide, Math.sqrt(ow * oh / MAX_EXPORT_PIXELS));
-    if (shrink > 1) {
-      px *= shrink * 1.0001;
-      py *= shrink * 1.0001;
-      continue;
-    }
-    canvas.width = ow;
-    canvas.height = oh;
-    if (gl.drawingBufferWidth === ow && gl.drawingBufferHeight === oh) break;
-    const s = Math.max(ow / gl.drawingBufferWidth, oh / gl.drawingBufferHeight) * 1.0001;
-    px *= s;
-    py *= s;
+    const shrink = Math.max(1, ow / maxSide, oh / maxSide, ow / maxW, Math.sqrt(ow * oh / MAX_EXPORT_PIXELS));
+    if (shrink === 1) break;
+    px *= shrink * 1.0001;
+    py *= shrink * 1.0001;
   }
 
-  const spanX = ow * px, spanY = oh * py;
-  const origin = [minX + spanX / 2, minY + spanY / 2];
+  // Find a strip height the browser will actually allocate.
+  let sh = Math.max(1, Math.min(oh, maxViewH, gl.getParameter(gl.MAX_RENDERBUFFER_SIZE),
+    Math.floor(MAX_STRIP_PIXELS / ow)));
+  for (;;) {
+    canvas.width = ow;
+    canvas.height = sh;
+    if (gl.drawingBufferWidth === ow && gl.drawingBufferHeight === sh) break;
+    if (sh === 1) throw new Error('the browser could not allocate an image this wide.');
+    // Browsers shrink an oversized buffer in both directions; try shorter.
+    sh = Math.max(1, Math.min(gl.drawingBufferHeight, Math.floor(sh / 2)));
+  }
+
+  const spanX = ow * px;
+  const origin = [minX + spanX / 2, minY + oh * py / 2];
   const renderer = new MeshRenderer(gl);
   renderer.setTexture(textureSource(img, gl.getParameter(gl.MAX_TEXTURE_SIZE)));
   renderer.setTriangles(meshTriangles({ ...mesh, pos }, origin));
-  gl.viewport(0, 0, ow, oh);
+  gl.viewport(0, 0, ow, sh);
   gl.clearColor(0, 0, 0, 0);
-  gl.clear(gl.COLOR_BUFFER_BIT);
   gl.disable(gl.BLEND);
-  const matrix = new Float32Array([2 / spanX, 0, 0, 0, 0, -2 / spanY, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
-  renderer.draw(matrix, 1);
-  gl.finish();
 
-  if (output === 'canvas') {
-    const out = document.createElement('canvas');
-    out.width = ow;
-    out.height = oh;
-    out.getContext('2d').drawImage(canvas, 0, 0);
-    renderer.destroy();
-    gl.getExtension('WEBGL_lose_context')?.loseContext();
-    return { canvas: out, ow, oh, px, py, minX, minY };
-  }
+  let out2d = null, ctx = null, rgba = null, strip = null;
   if (output === 'rgba') {
-    const pixels = new Uint8Array(ow * oh * 4);
-    gl.readPixels(0, 0, ow, oh, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-    renderer.destroy();
-    gl.getExtension('WEBGL_lose_context')?.loseContext();
-    // GL rows run bottom-up, and the colours are premultiplied.
-    const out = new Uint8Array(pixels.length);
-    const row = ow * 4;
-    for (let j = 0; j < oh; j++) out.set(pixels.subarray((oh - 1 - j) * row, (oh - j) * row), j * row);
-    for (let k = 0; k < out.length; k += 4) {
-      const a = out[k + 3];
-      if (a > 0 && a < 255) {
-        out[k] = Math.min(255, Math.round(out[k] * 255 / a));
-        out[k + 1] = Math.min(255, Math.round(out[k + 1] * 255 / a));
-        out[k + 2] = Math.min(255, Math.round(out[k + 2] * 255 / a));
-      }
-    }
-    return { bytes: out, ow, oh, px, py, minX, minY };
+    rgba = new Uint8Array(ow * oh * 4);
+    strip = new Uint8Array(ow * sh * 4);
+  } else {
+    out2d = document.createElement('canvas');
+    out2d.width = ow;
+    out2d.height = oh;
+    ctx = out2d.getContext('2d');
   }
-
-  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+  const row = ow * 4;
+  for (let y0 = 0; y0 < oh; y0 += sh) {
+    const h = Math.min(sh, oh - y0);
+    // This strip's rows, in positions relative to `origin`.
+    const centreY = minY + (y0 + sh / 2) * py - origin[1];
+    const sy = -2 / (sh * py);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    renderer.draw(new Float32Array([2 / spanX, 0, 0, 0, 0, sy, 0, 0, 0, 0, 1, 0, 0, -sy * centreY, 0, 1]), 1);
+    if (rgba) {
+      gl.readPixels(0, 0, ow, sh, gl.RGBA, gl.UNSIGNED_BYTE, strip);
+      // GL rows run bottom-up.
+      for (let j = 0; j < h; j++) rgba.set(strip.subarray((sh - 1 - j) * row, (sh - j) * row), (y0 + j) * row);
+    } else {
+      ctx.drawImage(canvas, 0, 0, ow, h, 0, y0, ow, h);
+    }
+  }
   renderer.destroy();
   gl.getExtension('WEBGL_lose_context')?.loseContext();
+
+  const result = { ow, oh, px, py, minX, minY };
+  if (output === 'canvas') return { ...result, canvas: out2d };
+  if (output === 'rgba') {
+    // The colours are premultiplied.
+    for (let k = 0; k < rgba.length; k += 4) {
+      const a = rgba[k + 3];
+      if (a > 0 && a < 255) {
+        rgba[k] = Math.min(255, Math.round(rgba[k] * 255 / a));
+        rgba[k + 1] = Math.min(255, Math.round(rgba[k + 1] * 255 / a));
+        rgba[k + 2] = Math.min(255, Math.round(rgba[k + 2] * 255 / a));
+      }
+    }
+    return { ...result, bytes: rgba };
+  }
+  const blob = await new Promise(resolve => out2d.toBlob(resolve, 'image/png'));
   if (!blob) throw new Error('the browser could not encode the image.');
-  return { bytes: new Uint8Array(await blob.arrayBuffer()), ow, oh, px, py, minX, minY };
+  return { ...result, bytes: new Uint8Array(await blob.arrayBuffer()) };
 }
 
 // The export mesh: dense enough for the warp, and for reprojection.
