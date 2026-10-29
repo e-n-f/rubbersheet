@@ -1,11 +1,12 @@
 import {
   applyAffine, affineScale, affineToWorldFile, buildMesh, invertMesh, makeWarp,
-  geographicRows, meshBounds, meshCorners, meshOutline, meshTriangles, mercXToLng, mercYToLat,
+  meshBounds, meshCorners, meshOutline, meshTriangles, mercXToLng, mercYToLat,
   EARTH_CIRCUMFERENCE, mercToMeters, similarityAboutPivot, translateAffine, worldFileToAffine,
 } from './warp.js';
 import { addTextChunk, isPNG, readTextChunks } from './png-text.js';
 import { makeZip, readZip } from './zip.js';
 import { isTIFF, readGeoTIFF, writeGeoTIFF } from './tiff.js';
+import { crsFromGeoKeys } from './proj.js';
 
 const maplibregl = window.maplibregl;
 const META_KEY = 'rubbersheet';
@@ -578,7 +579,8 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
   let img, tiff = null;
   try {
     if (isTIFF(bytes)) {
-      tiff = await readGeoTIFF(bytes);
+      setStatus(`Reading <b>${escapeHTML(imageFile.name)}</b>…`);
+      tiff = await readGeoTIFF(bytes, decodeJPEG);
       img = document.createElement('canvas');
       img.width = tiff.width;
       img.height = tiff.height;
@@ -592,21 +594,22 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
     return;
   }
   let source = img;
-  const W = img.naturalWidth || img.width, H = img.naturalHeight || img.height;
+  let W = img.naturalWidth || img.width, H = img.naturalHeight || img.height;
 
-  let placement = null, how = '';
+  let placement = null, how = '', problem = '';
   try {
     if (isPNG(bytes)) placement = placementFromMetadata(readTextChunks(bytes)[META_KEY], W, H);
     if (tiff?.description?.includes('"generator":"rubbersheet"')) {
       placement = placementFromMetadata(tiff.description, W, H);
     }
     if (placement) how = 'placed from embedded metadata';
-    if (!placement && tiff?.scale) {
-      // GeoTIFF corner and pixel size, as a world file (pixel centres).
-      const [sx, sy] = tiff.scale, [ox, oy] = tiff.origin;
-      placement = placementFromWorldFile(`${sx} 0 0 ${-sy} ${ox + sx / 2} ${oy - sy / 2}`,
-        tiff.epsg ? `EPSG:${tiff.epsg}` : '', W, H);
-      if (placement) how = 'placed from its GeoTIFF tags';
+    if (!placement && tiff?.toModel) {
+      try {
+        placement = placementFromGeoTIFF(tiff);
+        how = 'placed from its GeoTIFF tags';
+      } catch (err) {
+        problem = `It couldn’t be placed: ${err.message}.`;
+      }
     }
     if (!placement && worldFile) {
       placement = placementFromWorldFile(await worldFile.text(),
@@ -617,16 +620,11 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
       placement = placementFromKML(kmlText, W, H);
       if (placement) how = 'placed from the KML';
     }
-    if (placement?.geo) {
-      const rows = geographicRows(placement.geo.wf, H);
-      source = resampleRows(img, W, H, rows.sourceV);
-      placement = {
-        T: rows.T,
-        points: placement.geo.points.map(p => {
-          const [x, y] = toMerc({ lng: p.lng, lat: p.lat });
-          return { u: p.u, v: rows.targetV(p.v), x, y };
-        }),
-      };
+    if (placement?.project) {
+      setStatus(`Reprojecting <b>${escapeHTML(imageFile.name)}</b>…`);
+      const r = await reproject(img, W, H, placement.project, placement.points);
+      ({ img: source, W, H } = r);
+      placement = r;
     }
   } catch (err) {
     console.warn(err);
@@ -645,7 +643,8 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
   update();
   if ((placement.points.length || how) && !keepView) zoomToImage();
   if (!fromURL) clearImageParam();
-  setStatus(`<b>${escapeHTML(imageFile.name)}</b> (${W}×${H})${how ? ', ' + how : ''}.`);
+  setStatus(`<b>${escapeHTML(imageFile.name)}</b> (${W}×${H})${how ? ', ' + how : ''}.` +
+    (problem ? ` ${escapeHTML(problem)}` : ''), !!problem);
 }
 
 // ?image=<url> loads an image from the web. The server has to allow
@@ -710,11 +709,11 @@ function placementFromMetadata(text, W, H) {
     for (const cp of meta.controlPoints || []) cp.pixel = [cp.pixel[0] / sx, cp.pixel[1] / sy];
   }
   if (meta.crs === 'EPSG:4326') {
-    // Exported for Google Earth: resampled back to Mercator by the caller.
+    // Exported for Google Earth: reprojected back to Mercator by the caller.
     const points = (meta.controlPoints || []).map(cp => ({
       u: cp.pixel[0], v: cp.pixel[1], lng: cp.lngLat[0], lat: cp.lngLat[1],
     }));
-    return geographicRows(meta.worldFile, H) ? { geo: { wf: meta.worldFile, points } } : null;
+    return { project: worldFileProject(meta.worldFile), points };
   }
   const T = worldFileToAffine(meta.worldFile);
   const points = (meta.controlPoints || []).map(cp => {
@@ -738,20 +737,67 @@ function placementFromWorldFile(text, crsText, W, H) {
     geographic = Math.abs(C) <= 180 && Math.abs(F) <= 90 && Math.abs(A) < 1 && Math.abs(E) < 1;
   }
   if (!geographic) return { T: worldFileToAffine(wf), points: [] };
-  if (geographicRows(wf, H)) return { geo: { wf, points: [] } };
-  // Rotated: approximate with an affine through three corners.
-  const corner = (u, v) => toMerc({
-    lng: A * (u - 0.5) + B * (v - 0.5) + C,
-    lat: D * (u - 0.5) + E * (v - 0.5) + F,
-  });
-  const p0 = corner(0, 0), p1 = corner(W, 0), p2 = corner(0, H);
+  return { project: worldFileProject(wf), points: [] };
+}
+
+// Pixel -> lng/lat for an EPSG:4326 world file (which references pixel
+// centres).
+function worldFileProject([A, D, B, E, C, F]) {
+  return (u, v) => [A * (u - 0.5) + B * (v - 0.5) + C, D * (u - 0.5) + E * (v - 0.5) + F];
+}
+
+// Placement from GeoTIFF tags: exact for Web Mercator, otherwise a pixel ->
+// lng/lat function for the caller to reproject. Throws if the CRS isn't
+// supported.
+function placementFromGeoTIFF(tiff) {
+  const crs = crsFromGeoKeys(tiff.geoKeys);
+  const [a, b, c, d, e, f] = tiff.toModel;
+  if (crs.kind === 'mercator') {
+    const k = 1 / EARTH_CIRCUMFERENCE;
+    return { T: [a * k, b * k, c * k + 0.5, -d * k, -e * k, 0.5 - f * k], points: [] };
+  }
+  return { project: (u, v) => crs.toLngLat(a * u + b * v + c, d * u + e * v + f), points: [] };
+}
+
+// Redraw an image placed by `project` (pixel -> [lng, lat]) as a north-up
+// Web Mercator raster at about the same resolution, through the same mesh
+// renderer as the export. `points` ({u, v, lng, lat}) are moved to match.
+// Returns {img, W, H, T, points}.
+async function reproject(img, W, H, project, points) {
+  const merc = (u, v) => {
+    const [lng, lat] = project(u, v);
+    return toMerc({ lng, lat });
+  };
+  const mesh = buildMesh(merc, W, H, cellsAcross(W, H, DISPLAY_CELLS));
+  // Pixel size from the middle of the image.
+  const p = merc(W / 2, H / 2), pu = merc(W / 2 + 1, H / 2), pv = merc(W / 2, H / 2 + 1);
+  const ps = Math.sqrt(Math.hypot(pu[0] - p[0], pu[1] - p[1]) * Math.hypot(pv[0] - p[0], pv[1] - p[1]));
+  const r = await rasterize(mesh, mesh.pos, ps, ps, Infinity, 'canvas', img);
   return {
-    T: [(p1[0] - p0[0]) / W, (p2[0] - p0[0]) / H, p0[0], (p1[1] - p0[1]) / W, (p2[1] - p0[1]) / H, p0[1]],
-    points: [],
+    img: r.canvas,
+    W: r.ow,
+    H: r.oh,
+    T: [r.px, 0, r.minX, 0, r.py, r.minY],
+    points: points.map(pt => {
+      const [mx, my] = merc(pt.u, pt.v);
+      const [x, y] = toMerc({ lng: pt.lng, lat: pt.lat });
+      return { u: (mx - r.minX) / r.px, v: (my - r.minY) / r.py, x, y };
+    }),
   };
 }
 
-// Placement from a KML GroundOverlay's LatLonBox (unrotated only).
+// Decode one JPEG to RGBA, for JPEG-compressed GeoTIFFs.
+async function decodeJPEG(bytes) {
+  const bmp = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }),
+    { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+  const c = new OffscreenCanvas(bmp.width, bmp.height);
+  const ctx = c.getContext('2d');
+  ctx.drawImage(bmp, 0, 0);
+  bmp.close();
+  return { width: c.width, height: c.height, rgba: ctx.getImageData(0, 0, c.width, c.height).data };
+}
+
+// Placement from a KML GroundOverlay's LatLonBox.
 function placementFromKML(text, W, H) {
   const doc = new DOMParser().parseFromString(text, 'application/xml');
   const box = doc.getElementsByTagName('LatLonBox')[0];
@@ -761,10 +807,17 @@ function placementFromKML(text, W, H) {
   let east = get('east');
   const rotation = get('rotation') || 0;
   if (![north, south, east, west].every(Number.isFinite) || north <= south) return null;
-  if (rotation) return null; // not supported; fall back to the drop placement
   if (east <= west) east += 360;
-  const A = (east - west) / W, E = (south - north) / H;
-  return { geo: { wf: [A, 0, 0, E, west + A / 2, north + E / 2], points: [] } };
+  // The box is rotated anticlockwise about its centre, in degrees of lng/lat.
+  const cx = (west + east) / 2, cy = (north + south) / 2;
+  const cos = Math.cos(rotation * Math.PI / 180), sin = Math.sin(rotation * Math.PI / 180);
+  return {
+    project: (u, v) => {
+      const dx = west + (east - west) * u / W - cx, dy = north + (south - north) * v / H - cy;
+      return [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos];
+    },
+    points: [],
+  };
 }
 
 const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp' };
@@ -794,20 +847,6 @@ async function unpackKMZ(file) {
   return { imageFile: new File([entry.data], name, { type }), kmlText };
 }
 
-// Redraw the image row by row, taking output row j from source row
-// sourceV(j + 0.5). Used to turn EPSG:4326 rows into Mercator rows.
-function resampleRows(img, W, H, sourceV) {
-  const c = document.createElement('canvas');
-  c.width = W;
-  c.height = H;
-  const ctx = c.getContext('2d');
-  for (let j = 0; j < H; j++) {
-    const v = Math.min(H - 1, Math.max(0, Math.floor(sourceV(j + 0.5))));
-    ctx.drawImage(img, 0, v, W, 1, 0, j, W, 1);
-  }
-  return c;
-}
-
 // ---------------------------------------------------------------------------
 // Export
 
@@ -827,15 +866,17 @@ const MAX_KMZ_SIDE = 8192;
 // Draw `mesh` with its positions replaced by `pos` (a y-down plane, x right)
 // into a north-up raster whose pixels are px × py units. The pixel size grows
 // if needed to stay within browser limits and `maxSide`. Returns
-// {bytes, ow, oh, px, py, minX, minY}, where bytes is a PNG, or with
-// `rgba` set, the raw unpremultiplied RGBA pixels, top row first.
-async function rasterize(mesh, pos, px, py, maxSide = Infinity, rgba = false) {
+// {bytes, canvas, ow, oh, px, py, minX, minY}: by `output`, bytes is a PNG
+// ('png'), or the raw unpremultiplied RGBA pixels, top row first ('rgba'),
+// or canvas is a 2D canvas holding the raster ('canvas'). `img` is the
+// texture, by default the current image.
+async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', img = state.image.img) {
   const [minX, minY, maxX, maxY] = meshBounds({ pos });
   const canvas = document.createElement('canvas');
   canvas.width = canvas.height = 1;
   const glOpts = { preserveDrawingBuffer: true, premultipliedAlpha: true, antialias: false, alpha: true };
   const gl = canvas.getContext('webgl2', glOpts) || canvas.getContext('webgl', glOpts);
-  if (!gl) throw new Error('export needs WebGL.');
+  if (!gl) throw new Error('this needs WebGL.');
   maxSide = Math.min(maxSide, 16384, gl.getParameter(gl.MAX_RENDERBUFFER_SIZE),
     ...gl.getParameter(gl.MAX_VIEWPORT_DIMS));
 
@@ -861,7 +902,7 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, rgba = false) {
   const spanX = ow * px, spanY = oh * py;
   const origin = [minX + spanX / 2, minY + spanY / 2];
   const renderer = new MeshRenderer(gl);
-  renderer.setTexture(textureSource(state.image.img, gl.getParameter(gl.MAX_TEXTURE_SIZE)));
+  renderer.setTexture(textureSource(img, gl.getParameter(gl.MAX_TEXTURE_SIZE)));
   renderer.setTriangles(meshTriangles({ ...mesh, pos }, origin));
   gl.viewport(0, 0, ow, oh);
   gl.clearColor(0, 0, 0, 0);
@@ -871,7 +912,16 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, rgba = false) {
   renderer.draw(matrix, 1);
   gl.finish();
 
-  if (rgba) {
+  if (output === 'canvas') {
+    const out = document.createElement('canvas');
+    out.width = ow;
+    out.height = oh;
+    out.getContext('2d').drawImage(canvas, 0, 0);
+    renderer.destroy();
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+    return { canvas: out, ow, oh, px, py, minX, minY };
+  }
+  if (output === 'rgba') {
     const pixels = new Uint8Array(ow * oh * 4);
     gl.readPixels(0, 0, ow, oh, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
     renderer.destroy();
@@ -955,7 +1005,7 @@ async function exportImage() {
 async function exportGeoTIFF() {
   if (!state.image) return;
   const mesh = exportMesh(0);
-  const r = await rasterize(mesh, mesh.pos, ...Array(2).fill(affineScale(state.warp.S)), Infinity, true);
+  const r = await rasterize(mesh, mesh.pos, ...Array(2).fill(affineScale(state.warp.S)), Infinity, 'rgba');
   const { ow, oh, px: ps, minX, minY } = r;
   const worldFile = affineToWorldFile([ps, 0, minX, 0, ps, minY]);
   const nw = toLngLat([minX, minY]), se = toLngLat([minX + ow * ps, minY + oh * ps]);
@@ -1107,4 +1157,4 @@ const imageParam = new URLSearchParams(window.location.search).get('image');
 if (imageParam) loadURL(imageParam, linkHasView);
 
 // Exposed for debugging and automated tests.
-window.rubbersheet = { map, state, update, loadFiles, loadURL, exportImage, exportGeoTIFF, exportKMZ };
+window.rubbersheet = { map, state, update, loadFiles, loadURL, exportImage, exportGeoTIFF, exportKMZ, decodeJPEG };

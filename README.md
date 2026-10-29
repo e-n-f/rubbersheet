@@ -46,9 +46,21 @@ Exported PNGs carry a `tEXt` chunk with the keyword `rubbersheet` holding JSON (
 }
 ```
 
-`worldFile` uses the standard [world file](https://gdal.org/en/stable/drivers/raster/wld.html) parameters in the units of `crs`: EPSG:3857 metres for the PNG and GeoTIFF exports, and degrees (`"crs": "EPSG:4326"`) for the PNG inside a KMZ. `pixel` is the point's position in the exported image, and `sourcePixel` is its position in the original image. If you drop an exported PNG, GeoTIFF or KMZ (or the PNG from inside a KMZ) back on the map, it goes to the same place with its control points restored, so you can keep adjusting it. EPSG:4326 images are resampled row by row into Mercator when they are loaded.
+`worldFile` uses the standard [world file](https://gdal.org/en/stable/drivers/raster/wld.html) parameters in the units of `crs`: EPSG:3857 metres for the PNG and GeoTIFF exports, and degrees (`"crs": "EPSG:4326"`) for the PNG inside a KMZ. `pixel` is the point's position in the exported image, and `sourcePixel` is its position in the original image. If you drop an exported PNG, GeoTIFF or KMZ (or the PNG from inside a KMZ) back on the map, it goes to the same place with its control points restored, so you can keep adjusting it. Images in any other projection are reprojected into Web Mercator when they are loaded, using the same mesh renderer as the export.
 
-Tick *Also download world file* to get `name.pgw` and `name.png.aux.xml` (the CRS) next to the PNG. GDAL and QGIS can open the result directly. You can also drop an image together with its world file (`.wld`, `.pgw`, `.jgw`, …) and an optional `.prj` or `.aux.xml`. Images in EPSG:3857 and EPSG:4326 are placed from the world file. A KMZ from elsewhere is placed from its first GroundOverlay's `LatLonBox`, unless the overlay is rotated. A GeoTIFF from elsewhere is placed from its own tags if it is in EPSG:3857 or EPSG:4326. The reader handles 8-bit greyscale, RGB and RGBA files, in strips or tiles, uncompressed or with LZW or deflate. That covers most files GDAL and QGIS write, but not JPEG-compressed, 16-bit or paletted ones.
+Tick *Also download world file* to get `name.pgw` and `name.png.aux.xml` (the CRS) next to the PNG. GDAL and QGIS can open the result directly. You can also drop an image together with its world file (`.wld`, `.pgw`, `.jgw`, …) and an optional `.prj` or `.aux.xml`. Images in EPSG:3857 and EPSG:4326 are placed from the world file. A KMZ from elsewhere is placed from its first GroundOverlay's `LatLonBox`, including its rotation.
+
+### GeoTIFFs from elsewhere
+
+A GeoTIFF is placed from its own tags. It can be in:
+
+- latitude/longitude, or Web Mercator;
+- UTM, given as an EPSG code (WGS84 `326xx`/`327xx`, NAD83 `269xx`, NAD27 `267xx`, ETRS89 `258xx`) or spelled out;
+- Transverse Mercator, Lambert Conformal Conic (1SP or 2SP) or Polyconic, spelled out in the file's GeoKeys, in metres or feet. The USGS Historical Topographic Map Collection scans use Polyconic.
+
+The datum can be WGS84, NAD83, ETRS89 or NAD27. NAD27 is shifted to WGS84 with the average shift for the contiguous US, which is good to about 5–10 m; add control points if you need better. Other EPSG codes, such as State Plane zones given only by number, aren't supported yet. The image still loads, and the status line says why it couldn't be placed.
+
+The reader handles 8-bit greyscale, paletted, RGB and RGBA images, in strips or tiles, uncompressed or with LZW, deflate or JPEG compression. That covers what GDAL and QGIS usually write and USGS scans, but not 16-bit or BigTIFF files. Only the first (full-resolution) image in a file is read.
 
 ## Hosting on GitHub Pages
 

@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import {
   applyAffine, fitSimilarity, makeWarp, buildMesh, invertMesh,
   worldFileToAffine, affineToWorldFile, similarityAboutPivot,
-  lngToMercX, mercXToLng, latToMercY, mercYToLat, geographicRows,
+  lngToMercX, mercXToLng, latToMercY, mercYToLat,
 } from '../js/warp.js';
 import { addTextChunk, readTextChunks } from '../js/png-text.js';
 import { makeZip, readZip } from '../js/zip.js';
 import { isTIFF, readGeoTIFF, writeGeoTIFF } from '../js/tiff.js';
+import { crsFromGeoKeys, ELLIPSOIDS, utm, polyconic, lambertConformalConic } from '../js/proj.js';
 
 const close = (a, b, eps = 1e-12) => assert.ok(Math.abs(a - b) <= eps, `${a} != ${b}`);
 
@@ -87,24 +88,6 @@ test('lng/lat <-> Mercator round-trips and matches known values', () => {
   for (const lng of [-180, -73.9, 0, 151.2, 190]) close(mercXToLng(lngToMercX(lng)), lng, 1e-9);
 });
 
-test('geographic rows map a 4326 image onto Mercator', () => {
-  // 1000×800 image covering 10°E–15°E, 50°N–46°N.
-  const W = 1000, H = 800;
-  const A = 5 / W, E = -4 / H;
-  const rows = geographicRows([A, 0, 0, E, 10 + A / 2, 50 + E / 2], H);
-  close(rows.targetV(0), 0, 1e-9);
-  close(rows.targetV(H), H, 1e-9);
-  for (const v of [0, 123.4, 400, 799]) close(rows.sourceV(rows.targetV(v)), v, 1e-6);
-  // A pixel lands at its own lng/lat.
-  const [x, y] = applyAffine(rows.T, 250, rows.targetV(200));
-  close(x, lngToMercX(11.25), 1e-12);
-  close(y, latToMercY(49), 1e-12);
-  // Mercator stretches rows towards the pole, so the middle source row
-  // moves south of the middle.
-  assert.ok(rows.targetV(H / 2) > H / 2);
-  assert.equal(geographicRows([A, 0.001, 0, E, 10, 50], H), null);
-});
-
 test('zip round-trips stored entries', async () => {
   const png = new Uint8Array(300).map((_, i) => i * 7);
   const kml = new TextEncoder().encode('<kml>é</kml>');
@@ -156,4 +139,56 @@ test('GeoTIFF reads a GDAL file: tiled, LZW, predictor 2, EPSG:4326', async () =
     const k = (j * 40 + i) * 4;
     assert.deepEqual([...t.rgba.subarray(k, k + 4)], [i * 6, j * 10, (i * j) & 255, 255]);
   }
+});
+
+// Reference values below are from PROJ (via GDAL 3.12).
+const lngLatClose = ([lng, lat], [elng, elat], metres) => {
+  close(lng, elng, metres / 111320 / Math.cos(elat * Math.PI / 180));
+  close(lat, elat, metres / 110574);
+};
+
+test('projections match PROJ and round-trip', () => {
+  const cases = [
+    [utm(ELLIPSOIDS.WGS84, 17), [-84.3, 33.7]],
+    [utm(ELLIPSOIDS.WGS84, 56, true), [151.2, -33.9]],
+    [polyconic(ELLIPSOIDS.Clarke1866, { lon0: -87.625 }), [-87.77, 38.48]],
+    [lambertConformalConic(ELLIPSOIDS.GRS80, {
+      lon0: -120.5, lat0: 36.5, lat1: 38.43333333333333, lat2: 37.06666666666667, x0: 2000000, y0: 500000,
+    }), [-122.27, 37.8]],
+    [lambertConformalConic(ELLIPSOIDS.Clarke1866, { lon0: -77, lat0: 18, lat1: 18, x0: 250000, y0: 150000 }),
+      [-78.3, 18.4]],
+  ];
+  for (const [proj, ll] of cases) lngLatClose(proj.inverse(...proj.forward(...ll)), ll, 0.005);
+  const [x, y] = polyconic(ELLIPSOIDS.Clarke1866, { lon0: -87.625 }).forward(-80, 45);
+  // PROJ: +proj=poly +lon_0=-87.625 +ellps=clrk66
+  close(x, 600337.9140093253, 0.001);
+  close(y, 5012994.681007552, 0.001);
+});
+
+test('GeoKeys: USGS polyconic NAD27 quad lands where PROJ puts it', () => {
+  // Keys from a USGS Historical Topographic Map Collection GeoTIFF.
+  const crs = crsFromGeoKeys({
+    1024: 1, 1025: 1, 2048: 4267, 2054: 9102, 2057: 6378206.4, 2059: 294.9786982139006,
+    3072: 32767, 3074: 32767, 3075: 22, 3076: 9001, 3080: -87.625, 3081: 0, 3082: 0, 3083: 0, 3092: 1,
+  });
+  assert.equal(crs.kind, 'projected');
+  // PROJ with +towgs84=-8,160,176, the same NAD27 shift.
+  lngLatClose(crs.toLngLat(-12920.116139306203, 4292378.991206516), [-87.7736768026703, 38.766491300526496], 0.01);
+  lngLatClose(crs.toLngLat(13342.425527360465, 4260718.949539849), [-87.47210220276833, 38.48128012436943], 0.01);
+});
+
+test('GeoKeys: EPSG UTM, Lambert in US feet, Mercator, unsupported', () => {
+  const utm17 = crsFromGeoKeys({ 1024: 1, 3072: 32617 });
+  lngLatClose(utm17.toLngLat(500000, 3700000), [-81, 33.439394672509394], 0.01);
+  lngLatClose(utm17.toLngLat(700000, 5000000), [-78.45687651021706, 45.125153847634174], 0.01);
+  // California zone 3 (NAD83, US survey feet), spelled out.
+  const lcc = crsFromGeoKeys({
+    1024: 1, 2048: 4269, 3072: 32767, 3074: 32767, 3075: 8, 3076: 9003,
+    3078: 38.43333333333333, 3079: 37.06666666666667, 3084: -120.5, 3085: 36.5,
+    3086: 6561666.667, 3087: 1640416.667,
+  });
+  lngLatClose(lcc.toLngLat(6050000, 2120000), [-122.27113499585046, 37.80383969140445], 0.01);
+  assert.equal(crsFromGeoKeys({ 1024: 1, 3072: 3857 }).kind, 'mercator');
+  assert.equal(crsFromGeoKeys({ 1024: 2, 2048: 4326 }).toLngLat(-120, 40).join(), '-120,40');
+  assert.throws(() => crsFromGeoKeys({ 1024: 1, 3072: 2227 }), /EPSG:2227 isn’t supported/);
 });
