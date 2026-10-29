@@ -359,12 +359,25 @@ function cursorFor(hit, cmd) {
   if (hit.kind === 'point') return cmd ? 'pointer' : 'grab';
   if (cmd) return 'copy';
   if (hit.kind === 'corner') return hit.index % 2 === 0 ? 'nwse-resize' : 'nesw-resize';
-  return imageDraggable() ? 'move' : '';
+  return imageMovable() ? 'move' : '';
 }
 
 // Once the image is pinned by a control point, its corner handles go away and
 // dragging its background pans the map instead of moving the image.
 const imageDraggable = () => state.points.length === 0;
+
+// Dragging the image's background moves it only while a corner handle is in
+// view; zoomed in past all four, it pans the map instead.
+function imageMovable() {
+  if (!imageDraggable() || !state.mesh) return false;
+  const canvas = map.getCanvas();
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const box = map.getContainer().getBoundingClientRect();
+  const pr = $('panel').getBoundingClientRect();
+  return meshCorners(state.mesh).map(mercToScreen).some(([x, y]) =>
+    x >= 0 && x <= w && y >= 0 && y <= h &&
+    !(x + box.left >= pr.left && x + box.left <= pr.right && y + box.top >= pr.top && y + box.top <= pr.bottom));
+}
 
 let lastPointer = null;
 let swallowing = false;
@@ -385,7 +398,7 @@ container.addEventListener('pointerdown', (e) => {
   const p = localPoint(e);
   const hit = hitTest(p);
   if (!hit) return;
-  if (hit.kind === 'image' && !isCommand(e) && !imageDraggable()) return;
+  if (hit.kind === 'image' && !isCommand(e) && !imageMovable()) return;
   // Keep MapLibre from starting a pan/rotate for this gesture.
   e.preventDefault();
   e.stopPropagation();

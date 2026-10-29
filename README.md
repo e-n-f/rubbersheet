@@ -6,7 +6,7 @@ Map rubbersheeting in the browser. Drop a scanned map or photo onto a MapLibre b
 
 - **Drop** a JPEG, PNG, WebP, GeoTIFF or KMZ onto the map, or use the *choose a file* link. The image is centred where you drop it and sized to cover about 75% of the view.
 - **Link** to an image on the web by adding `?image=` and the URL-encoded image address to the page URL, for example `https://e-n-f.github.io/rubbersheet/?image=https%3A%2F%2Fwww.flickr.com%2Fphoto_download.gne%3Fsize%3Do%26id%3D55586523402%26secret%3D33ed8c454a`. A PNG exported from rubbersheet goes to its georeferenced place and the map zooms to it, unless the link also has a map view (`#zoom/lat/lng`). The image's server must allow cross-origin requests (Flickr does).
-- **Drag** the image to move it. Once you add a control point, the image is pinned: dragging its background pans the map instead, and the corner handles disappear. From then on, you adjust it by dragging control points.
+- **Drag** the image to move it. When you're zoomed in so far that none of its corner handles are in view, dragging pans the map instead. Once you add a control point, the image is pinned: dragging its background pans the map instead, and the corner handles disappear. From then on, you adjust it by dragging control points.
 - **Drag a corner handle** to scale and rotate around the image centre. Hold <kbd>Shift</kbd> to scale without rotating. (This works only before the first control point is added.)
 - **⌘-click** (Ctrl-click on Windows/Linux) the image to add a control point. ⌘-click a point to remove it.
 - **Drag a control point** to move that spot of the image to a new place on the map. The image goes half-transparent while you drag so you can see the map underneath.
