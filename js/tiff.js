@@ -2,9 +2,10 @@
 //
 // Writing produces an 8-bit RGBA, deflate-compressed, stripped GeoTIFF with
 // the georeferencing in ModelPixelScale / ModelTiepoint / GeoKeyDirectory.
-// Reading handles the common simple cases: 8-bit grey, RGB or RGBA, chunky,
-// strips or tiles, uncompressed, LZW or deflate, with or without the horizontal
-// predictor. That covers rubbersheet's own files and many GDAL defaults.
+// Reading handles the common cases: 8-bit grey, paletted, RGB or RGBA, chunky,
+// strips or tiles, uncompressed, LZW, deflate or JPEG (with a decoder passed
+// in, since that needs a browser), with or without the horizontal predictor.
+// That covers rubbersheet's own files, GDAL's usual output and USGS scans.
 
 const SHORT = 3, LONG = 4, ASCII = 2, DOUBLE = 12;
 const TYPE_SIZE = { 1: 1, 2: 1, 3: 2, 4: 4, 6: 1, 7: 1, 8: 2, 9: 4, 11: 4, 12: 8, 16: 8 };
@@ -14,7 +15,9 @@ const TAG = {
   Photometric: 262, ImageDescription: 270, StripOffsets: 273, SamplesPerPixel: 277,
   RowsPerStrip: 278, StripByteCounts: 279, PlanarConfig: 284, Predictor: 317,
   TileWidth: 322, TileLength: 323, TileOffsets: 324, TileByteCounts: 325,
-  ExtraSamples: 338, ModelPixelScale: 33550, ModelTiepoint: 33922, GeoKeyDirectory: 34735,
+  ExtraSamples: 338, ColorMap: 320, JPEGTables: 347, ModelPixelScale: 33550,
+  ModelTiepoint: 33922, ModelTransformation: 34264, GeoKeyDirectory: 34735,
+  GeoDoubleParams: 34736, GeoAsciiParams: 34737,
 };
 
 // GeoKeys.
@@ -177,7 +180,9 @@ export async function writeGeoTIFF({ width, height, rgba, scale, origin, epsg, d
 
 // Returns {width, height, rgba, scale, origin, epsg, description}. scale,
 // origin and epsg are undefined when the file doesn't say.
-export async function readGeoTIFF(bytes) {
+// decodeJPEG(bytes) -> Promise<{width, height, rgba}> decodes one JPEG; it is
+// only needed for JPEG-compressed files.
+export async function readGeoTIFF(bytes, decodeJPEG = null) {
   if (!isTIFF(bytes)) throw new Error('Not a TIFF');
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const le = bytes[0] === 0x49;
@@ -195,13 +200,12 @@ export async function readGeoTIFF(bytes) {
       continue;
     }
     const values = [];
-    for (let k = 0; k < count; k++) {
+    for (let k = 0; k < count && type !== 1 && type !== 7; k++) {
       if (type === SHORT) values.push(dv.getUint16(at + k * 2, le));
       else if (type === LONG) values.push(dv.getUint32(at + k * 4, le));
       else if (type === DOUBLE) values.push(dv.getFloat64(at + k * 8, le));
-      else if (type === 1 || type === 7) values.push(bytes[at + k]);
     }
-    tags[tag] = values;
+    tags[tag] = type === 1 || type === 7 ? bytes.subarray(at, at + count) : values;
   }
   const one = (t, d) => (tags[t] ? tags[t][0] : d);
   const width = one(TAG.ImageWidth), height = one(TAG.ImageLength);
@@ -211,10 +215,14 @@ export async function readGeoTIFF(bytes) {
   const photometric = one(TAG.Photometric, spp >= 3 ? 2 : 1);
   if ((tags[TAG.BitsPerSample] || [1]).some(b => b !== 8)) throw new Error('only 8-bit TIFFs are supported');
   if (one(TAG.PlanarConfig, 1) !== 1) throw new Error('planar TIFFs aren’t supported');
-  if (![1, 5, 8, 32946].includes(compression)) throw new Error(`TIFF compression ${compression} isn’t supported`);
+  const jpeg = compression === 7;
+  if (![1, 5, 7, 8, 32946].includes(compression)) throw new Error(`TIFF compression ${compression} isn’t supported`);
+  if (jpeg && !decodeJPEG) throw new Error('JPEG-compressed TIFFs need a browser');
   if (![1, 2].includes(predictor)) throw new Error(`TIFF predictor ${predictor} isn’t supported`);
-  if (!(photometric === 2 && spp >= 3) && !(photometric <= 1 && spp <= 2)) {
-    throw new Error('only greyscale and RGB TIFFs are supported');
+  const palette = photometric === 3 && spp === 1 && tags[TAG.ColorMap];
+  if (!(photometric === 2 && spp >= 3) && !(photometric <= 1 && spp <= 2) && !palette &&
+      !(jpeg && photometric === 6 && spp === 3)) {
+    throw new Error('only greyscale, paletted and RGB TIFFs are supported');
   }
 
   const tiled = !!tags[TAG.TileOffsets];
@@ -227,14 +235,24 @@ export async function readGeoTIFF(bytes) {
     const raw = bytes.subarray(o, o + counts[i]);
     if (compression === 1) return raw;
     if (compression === 5) return lzwDecode(raw, cw * ch * spp);
+    if (jpeg) return decodeJPEG(jpegStream(raw, tags[TAG.JPEGTables], photometric === 2 && spp === 3));
     return pipe(raw, new DecompressionStream('deflate'));
   }));
 
   const rgba = new Uint8ClampedArray(width * height * 4);
   const alpha = spp === 2 || spp >= 4;
   const premultiplied = alpha && (tags[TAG.ExtraSamples] || [])[0] === 1;
+  const colors = palette ? tags[TAG.ColorMap] : null;
   chunks.forEach((chunk, i) => {
     const x0 = (i % across) * cw, y0 = Math.floor(i / across) * ch;
+    if (jpeg) {
+      // Decoded to RGBA already; copy the part inside the image.
+      const rows = Math.min(chunk.height, height - y0), cols = Math.min(chunk.width, width - x0);
+      for (let y = 0; y < rows; y++) {
+        rgba.set(chunk.rgba.subarray(y * chunk.width * 4, (y * chunk.width + cols) * 4), ((y0 + y) * width + x0) * 4);
+      }
+      return;
+    }
     const rowBytes = cw * spp;
     if (predictor === 2) {
       chunk = chunk.slice();
@@ -247,6 +265,9 @@ export async function readGeoTIFF(bytes) {
         const s = y * rowBytes + x * spp, d = ((y0 + y) * width + x0 + x) * 4;
         if (spp >= 3) {
           rgba[d] = chunk[s]; rgba[d + 1] = chunk[s + 1]; rgba[d + 2] = chunk[s + 2];
+        } else if (colors) {
+          const c = chunk[s], n = colors.length / 3;
+          rgba[d] = colors[c] >> 8; rgba[d + 1] = colors[n + c] >> 8; rgba[d + 2] = colors[2 * n + c] >> 8;
         } else {
           const g = photometric === 0 ? 255 - chunk[s] : chunk[s];
           rgba[d] = rgba[d + 1] = rgba[d + 2] = g;
@@ -261,21 +282,62 @@ export async function readGeoTIFF(bytes) {
   });
 
   const result = { width, height, rgba, description: tags[TAG.ImageDescription] };
+  const geoKeys = readGeoKeys(tags);
+  result.geoKeys = geoKeys;
   const scale = tags[TAG.ModelPixelScale], tie = tags[TAG.ModelTiepoint];
-  if (scale && tie) {
+  const m = tags[TAG.ModelTransformation];
+  // Affine from continuous pixel coordinates (0, 0 = top-left corner) to
+  // model coordinates: X = a*u + b*v + c, Y = d*u + e*v + f.
+  let T = null;
+  if (m && m.length >= 8) T = [m[0], m[1], m[3], m[4], m[5], m[7]];
+  else if (scale && tie) {
+    T = [scale[0], 0, tie[3] - tie[0] * scale[0], 0, -scale[1], tie[4] + tie[1] * scale[1]];
     result.scale = [scale[0], scale[1]];
-    // Tiepoint (i, j) -> (X, Y); move it to the top-left corner.
-    result.origin = [tie[3] - tie[0] * scale[0], tie[4] + tie[1] * scale[1]];
-    const keys = tags[TAG.GeoKeyDirectory] || [];
-    const key = (id) => {
-      for (let k = 4; k + 3 < keys.length; k += 4) if (keys[k] === id && keys[k + 1] === 0) return keys[k + 3];
-      return undefined;
-    };
-    result.epsg = key(GTModelType) === 2 ? key(GeographicType) : key(ProjectedCSType);
-    if (key(GTRasterType) === 2) {
-      // PixelIsPoint: the tiepoint is a pixel centre.
-      result.origin = [result.origin[0] - scale[0] / 2, result.origin[1] + scale[1] / 2];
+  }
+  if (T) {
+    if (geoKeys[GTRasterType] === 2) {
+      // PixelIsPoint: the model points are pixel centres.
+      T[2] -= (T[0] + T[1]) / 2;
+      T[5] -= (T[3] + T[4]) / 2;
     }
+    result.toModel = T;
+    result.origin = [T[2], T[5]];
+    result.epsg = geoKeys[GTModelType] === 2 ? geoKeys[GeographicType] : geoKeys[ProjectedCSType];
   }
   return result;
+}
+
+// GeoKeyDirectory as {keyId: value}, with values stored in the double and
+// ASCII parameter tags resolved.
+function readGeoKeys(tags) {
+  const keys = tags[TAG.GeoKeyDirectory] || [];
+  const out = {};
+  for (let k = 4; k + 3 < keys.length && k < 4 + keys[3] * 4; k += 4) {
+    const [id, loc, count, value] = keys.slice(k, k + 4);
+    if (loc === 0) out[id] = value;
+    else if (loc === TAG.GeoDoubleParams) {
+      const d = tags[loc] || [];
+      out[id] = count === 1 ? d[value] : d.slice(value, value + count);
+    } else if (loc === TAG.GeoAsciiParams) {
+      out[id] = (tags[loc] || '').slice(value, value + count).replace(/[|\0]+$/, '');
+    }
+  }
+  return out;
+}
+
+// A complete JPEG for one tile or strip: the shared tables spliced in after
+// SOI, and for RGB (not YCbCr) data an Adobe marker so decoders don't apply a
+// colour transform.
+function jpegStream(raw, tables, rgb) {
+  const parts = [raw.subarray(0, 2)];
+  if (rgb) parts.push(Uint8Array.of(0xff, 0xee, 0, 14, 0x41, 0x64, 0x6f, 0x62, 0x65, 0, 100, 0, 0, 0, 0, 0));
+  if (tables && tables.length > 4) parts.push(tables.subarray(2, tables.length - 2));
+  parts.push(raw.subarray(2));
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
 }

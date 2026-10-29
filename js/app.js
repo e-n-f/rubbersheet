@@ -1,11 +1,12 @@
 import {
   applyAffine, affineScale, affineToWorldFile, buildMesh, invertMesh, makeWarp,
-  geographicRows, meshBounds, meshCorners, meshOutline, meshTriangles, mercXToLng, mercYToLat,
+  meshBounds, meshCorners, meshOutline, meshTriangles, mercXToLng, mercYToLat,
   EARTH_CIRCUMFERENCE, mercToMeters, similarityAboutPivot, translateAffine, worldFileToAffine,
 } from './warp.js';
 import { addTextChunk, isPNG, readTextChunks } from './png-text.js';
 import { makeZip, readZip } from './zip.js';
 import { isTIFF, readGeoTIFF, writeGeoTIFF } from './tiff.js';
+import { crsFromGeoKeys } from './proj.js';
 
 const maplibregl = window.maplibregl;
 const META_KEY = 'rubbersheet';
@@ -358,12 +359,25 @@ function cursorFor(hit, cmd) {
   if (hit.kind === 'point') return cmd ? 'pointer' : 'grab';
   if (cmd) return 'copy';
   if (hit.kind === 'corner') return hit.index % 2 === 0 ? 'nwse-resize' : 'nesw-resize';
-  return imageDraggable() ? 'move' : '';
+  return imageMovable() ? 'move' : '';
 }
 
 // Once the image is pinned by a control point, its corner handles go away and
 // dragging its background pans the map instead of moving the image.
 const imageDraggable = () => state.points.length === 0;
+
+// Dragging the image's background moves it only while a corner handle is in
+// view; zoomed in past all four, it pans the map instead.
+function imageMovable() {
+  if (!imageDraggable() || !state.mesh) return false;
+  const canvas = map.getCanvas();
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const box = map.getContainer().getBoundingClientRect();
+  const pr = $('panel').getBoundingClientRect();
+  return meshCorners(state.mesh).map(mercToScreen).some(([x, y]) =>
+    x >= 0 && x <= w && y >= 0 && y <= h &&
+    !(x + box.left >= pr.left && x + box.left <= pr.right && y + box.top >= pr.top && y + box.top <= pr.bottom));
+}
 
 let lastPointer = null;
 let swallowing = false;
@@ -384,7 +398,7 @@ container.addEventListener('pointerdown', (e) => {
   const p = localPoint(e);
   const hit = hitTest(p);
   if (!hit) return;
-  if (hit.kind === 'image' && !isCommand(e) && !imageDraggable()) return;
+  if (hit.kind === 'image' && !isCommand(e) && !imageMovable()) return;
   // Keep MapLibre from starting a pan/rotate for this gesture.
   e.preventDefault();
   e.stopPropagation();
@@ -578,7 +592,8 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
   let img, tiff = null;
   try {
     if (isTIFF(bytes)) {
-      tiff = await readGeoTIFF(bytes);
+      setStatus(`Reading <b>${escapeHTML(imageFile.name)}</b>…`);
+      tiff = await readGeoTIFF(bytes, decodeJPEG);
       img = document.createElement('canvas');
       img.width = tiff.width;
       img.height = tiff.height;
@@ -592,21 +607,22 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
     return;
   }
   let source = img;
-  const W = img.naturalWidth || img.width, H = img.naturalHeight || img.height;
+  let W = img.naturalWidth || img.width, H = img.naturalHeight || img.height;
 
-  let placement = null, how = '';
+  let placement = null, how = '', problem = '';
   try {
     if (isPNG(bytes)) placement = placementFromMetadata(readTextChunks(bytes)[META_KEY], W, H);
     if (tiff?.description?.includes('"generator":"rubbersheet"')) {
       placement = placementFromMetadata(tiff.description, W, H);
     }
     if (placement) how = 'placed from embedded metadata';
-    if (!placement && tiff?.scale) {
-      // GeoTIFF corner and pixel size, as a world file (pixel centres).
-      const [sx, sy] = tiff.scale, [ox, oy] = tiff.origin;
-      placement = placementFromWorldFile(`${sx} 0 0 ${-sy} ${ox + sx / 2} ${oy - sy / 2}`,
-        tiff.epsg ? `EPSG:${tiff.epsg}` : '', W, H);
-      if (placement) how = 'placed from its GeoTIFF tags';
+    if (!placement && tiff?.toModel) {
+      try {
+        placement = placementFromGeoTIFF(tiff);
+        how = 'placed from its GeoTIFF tags';
+      } catch (err) {
+        problem = `It couldn’t be placed: ${err.message}.`;
+      }
     }
     if (!placement && worldFile) {
       placement = placementFromWorldFile(await worldFile.text(),
@@ -617,16 +633,11 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
       placement = placementFromKML(kmlText, W, H);
       if (placement) how = 'placed from the KML';
     }
-    if (placement?.geo) {
-      const rows = geographicRows(placement.geo.wf, H);
-      source = resampleRows(img, W, H, rows.sourceV);
-      placement = {
-        T: rows.T,
-        points: placement.geo.points.map(p => {
-          const [x, y] = toMerc({ lng: p.lng, lat: p.lat });
-          return { u: p.u, v: rows.targetV(p.v), x, y };
-        }),
-      };
+    if (placement?.project) {
+      setStatus(`Reprojecting <b>${escapeHTML(imageFile.name)}</b>…`);
+      const r = await reproject(img, W, H, placement.project, placement.points);
+      ({ img: source, W, H } = r);
+      placement = r;
     }
   } catch (err) {
     console.warn(err);
@@ -645,7 +656,8 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
   update();
   if ((placement.points.length || how) && !keepView) zoomToImage();
   if (!fromURL) clearImageParam();
-  setStatus(`<b>${escapeHTML(imageFile.name)}</b> (${W}×${H})${how ? ', ' + how : ''}.`);
+  setStatus(`<b>${escapeHTML(imageFile.name)}</b> (${W}×${H})${how ? ', ' + how : ''}.` +
+    (problem ? ` ${escapeHTML(problem)}` : ''), !!problem);
 }
 
 // ?image=<url> loads an image from the web. The server has to allow
@@ -710,11 +722,11 @@ function placementFromMetadata(text, W, H) {
     for (const cp of meta.controlPoints || []) cp.pixel = [cp.pixel[0] / sx, cp.pixel[1] / sy];
   }
   if (meta.crs === 'EPSG:4326') {
-    // Exported for Google Earth: resampled back to Mercator by the caller.
+    // Exported for Google Earth: reprojected back to Mercator by the caller.
     const points = (meta.controlPoints || []).map(cp => ({
       u: cp.pixel[0], v: cp.pixel[1], lng: cp.lngLat[0], lat: cp.lngLat[1],
     }));
-    return geographicRows(meta.worldFile, H) ? { geo: { wf: meta.worldFile, points } } : null;
+    return { project: worldFileProject(meta.worldFile), points };
   }
   const T = worldFileToAffine(meta.worldFile);
   const points = (meta.controlPoints || []).map(cp => {
@@ -738,20 +750,67 @@ function placementFromWorldFile(text, crsText, W, H) {
     geographic = Math.abs(C) <= 180 && Math.abs(F) <= 90 && Math.abs(A) < 1 && Math.abs(E) < 1;
   }
   if (!geographic) return { T: worldFileToAffine(wf), points: [] };
-  if (geographicRows(wf, H)) return { geo: { wf, points: [] } };
-  // Rotated: approximate with an affine through three corners.
-  const corner = (u, v) => toMerc({
-    lng: A * (u - 0.5) + B * (v - 0.5) + C,
-    lat: D * (u - 0.5) + E * (v - 0.5) + F,
-  });
-  const p0 = corner(0, 0), p1 = corner(W, 0), p2 = corner(0, H);
+  return { project: worldFileProject(wf), points: [] };
+}
+
+// Pixel -> lng/lat for an EPSG:4326 world file (which references pixel
+// centres).
+function worldFileProject([A, D, B, E, C, F]) {
+  return (u, v) => [A * (u - 0.5) + B * (v - 0.5) + C, D * (u - 0.5) + E * (v - 0.5) + F];
+}
+
+// Placement from GeoTIFF tags: exact for Web Mercator, otherwise a pixel ->
+// lng/lat function for the caller to reproject. Throws if the CRS isn't
+// supported.
+function placementFromGeoTIFF(tiff) {
+  const crs = crsFromGeoKeys(tiff.geoKeys);
+  const [a, b, c, d, e, f] = tiff.toModel;
+  if (crs.kind === 'mercator') {
+    const k = 1 / EARTH_CIRCUMFERENCE;
+    return { T: [a * k, b * k, c * k + 0.5, -d * k, -e * k, 0.5 - f * k], points: [] };
+  }
+  return { project: (u, v) => crs.toLngLat(a * u + b * v + c, d * u + e * v + f), points: [] };
+}
+
+// Redraw an image placed by `project` (pixel -> [lng, lat]) as a north-up
+// Web Mercator raster at about the same resolution, through the same mesh
+// renderer as the export. `points` ({u, v, lng, lat}) are moved to match.
+// Returns {img, W, H, T, points}.
+async function reproject(img, W, H, project, points) {
+  const merc = (u, v) => {
+    const [lng, lat] = project(u, v);
+    return toMerc({ lng, lat });
+  };
+  const mesh = buildMesh(merc, W, H, cellsAcross(W, H, DISPLAY_CELLS));
+  // Pixel size from the middle of the image.
+  const p = merc(W / 2, H / 2), pu = merc(W / 2 + 1, H / 2), pv = merc(W / 2, H / 2 + 1);
+  const ps = Math.sqrt(Math.hypot(pu[0] - p[0], pu[1] - p[1]) * Math.hypot(pv[0] - p[0], pv[1] - p[1]));
+  const r = await rasterize(mesh, mesh.pos, ps, ps, Infinity, 'canvas', img);
   return {
-    T: [(p1[0] - p0[0]) / W, (p2[0] - p0[0]) / H, p0[0], (p1[1] - p0[1]) / W, (p2[1] - p0[1]) / H, p0[1]],
-    points: [],
+    img: r.canvas,
+    W: r.ow,
+    H: r.oh,
+    T: [r.px, 0, r.minX, 0, r.py, r.minY],
+    points: points.map(pt => {
+      const [mx, my] = merc(pt.u, pt.v);
+      const [x, y] = toMerc({ lng: pt.lng, lat: pt.lat });
+      return { u: (mx - r.minX) / r.px, v: (my - r.minY) / r.py, x, y };
+    }),
   };
 }
 
-// Placement from a KML GroundOverlay's LatLonBox (unrotated only).
+// Decode one JPEG to RGBA, for JPEG-compressed GeoTIFFs.
+async function decodeJPEG(bytes) {
+  const bmp = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }),
+    { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+  const c = new OffscreenCanvas(bmp.width, bmp.height);
+  const ctx = c.getContext('2d');
+  ctx.drawImage(bmp, 0, 0);
+  bmp.close();
+  return { width: c.width, height: c.height, rgba: ctx.getImageData(0, 0, c.width, c.height).data };
+}
+
+// Placement from a KML GroundOverlay's LatLonBox.
 function placementFromKML(text, W, H) {
   const doc = new DOMParser().parseFromString(text, 'application/xml');
   const box = doc.getElementsByTagName('LatLonBox')[0];
@@ -761,10 +820,17 @@ function placementFromKML(text, W, H) {
   let east = get('east');
   const rotation = get('rotation') || 0;
   if (![north, south, east, west].every(Number.isFinite) || north <= south) return null;
-  if (rotation) return null; // not supported; fall back to the drop placement
   if (east <= west) east += 360;
-  const A = (east - west) / W, E = (south - north) / H;
-  return { geo: { wf: [A, 0, 0, E, west + A / 2, north + E / 2], points: [] } };
+  // The box is rotated anticlockwise about its centre, in degrees of lng/lat.
+  const cx = (west + east) / 2, cy = (north + south) / 2;
+  const cos = Math.cos(rotation * Math.PI / 180), sin = Math.sin(rotation * Math.PI / 180);
+  return {
+    project: (u, v) => {
+      const dx = west + (east - west) * u / W - cx, dy = north + (south - north) * v / H - cy;
+      return [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos];
+    },
+    points: [],
+  };
 }
 
 const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp' };
@@ -794,20 +860,6 @@ async function unpackKMZ(file) {
   return { imageFile: new File([entry.data], name, { type }), kmlText };
 }
 
-// Redraw the image row by row, taking output row j from source row
-// sourceV(j + 0.5). Used to turn EPSG:4326 rows into Mercator rows.
-function resampleRows(img, W, H, sourceV) {
-  const c = document.createElement('canvas');
-  c.width = W;
-  c.height = H;
-  const ctx = c.getContext('2d');
-  for (let j = 0; j < H; j++) {
-    const v = Math.min(H - 1, Math.max(0, Math.floor(sourceV(j + 0.5))));
-    ctx.drawImage(img, 0, v, W, 1, 0, j, W, 1);
-  }
-  return c;
-}
-
 // ---------------------------------------------------------------------------
 // Export
 
@@ -821,81 +873,111 @@ const WKT_3857 = 'PROJCS["WGS 84 / Pseudo-Mercator",GEOGCS["WGS 84",DATUM["WGS_1
   '+x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs"],AUTHORITY["EPSG","3857"]]';
 
 const MAX_EXPORT_PIXELS = 64e6;
+const MAX_EXPORT_SIDE = 16384;
+// Pixels per WebGL strip, comfortably under the browsers' drawing buffer caps.
+const MAX_STRIP_PIXELS = 16e6;
 // Google Earth downsamples or refuses larger overlays on many graphics cards.
 const MAX_KMZ_SIDE = 8192;
 
 // Draw `mesh` with its positions replaced by `pos` (a y-down plane, x right)
 // into a north-up raster whose pixels are px × py units. The pixel size grows
-// if needed to stay within browser limits and `maxSide`. Returns
-// {bytes, ow, oh, px, py, minX, minY}, where bytes is a PNG, or with
-// `rgba` set, the raw unpremultiplied RGBA pixels, top row first.
-async function rasterize(mesh, pos, px, py, maxSide = Infinity, rgba = false) {
+// if needed to stay within `maxSide` and the export limits. Returns
+// {bytes, canvas, ow, oh, px, py, minX, minY}: by `output`, bytes is a PNG
+// ('png'), or the raw unpremultiplied RGBA pixels, top row first ('rgba'),
+// or canvas is a 2D canvas holding the raster ('canvas'). `img` is the
+// texture, by default the current image.
+//
+// Browsers cap a WebGL drawing buffer well below what a large scan needs
+// (Chrome at 2^25 pixels), so the raster is drawn in horizontal strips.
+async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', img = state.image.img) {
   const [minX, minY, maxX, maxY] = meshBounds({ pos });
   const canvas = document.createElement('canvas');
   canvas.width = canvas.height = 1;
   const glOpts = { preserveDrawingBuffer: true, premultipliedAlpha: true, antialias: false, alpha: true };
   const gl = canvas.getContext('webgl2', glOpts) || canvas.getContext('webgl', glOpts);
-  if (!gl) throw new Error('export needs WebGL.');
-  maxSide = Math.min(maxSide, 16384, gl.getParameter(gl.MAX_RENDERBUFFER_SIZE),
-    ...gl.getParameter(gl.MAX_VIEWPORT_DIMS));
+  if (!gl) throw new Error('this needs WebGL.');
+  const [maxViewW, maxViewH] = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
+  const maxW = Math.min(gl.getParameter(gl.MAX_RENDERBUFFER_SIZE), maxViewW);
+  maxSide = Math.min(maxSide, MAX_EXPORT_SIDE);
 
-  // Keep roughly the source resolution, within browser limits.
+  // Keep roughly the source resolution, within the export limits.
   let ow, oh;
-  for (let attempt = 0; attempt < 8; attempt++) {
+  for (;;) {
     ow = Math.max(1, Math.ceil((maxX - minX) / px));
     oh = Math.max(1, Math.ceil((maxY - minY) / py));
-    const shrink = Math.max(1, ow / maxSide, oh / maxSide, Math.sqrt(ow * oh / MAX_EXPORT_PIXELS));
-    if (shrink > 1) {
-      px *= shrink * 1.0001;
-      py *= shrink * 1.0001;
-      continue;
-    }
+    const shrink = Math.max(1, ow / maxSide, oh / maxSide, ow / maxW, Math.sqrt(ow * oh / MAX_EXPORT_PIXELS));
+    if (shrink === 1) break;
+    px *= shrink * 1.0001;
+    py *= shrink * 1.0001;
+  }
+
+  // Find a strip height the browser will actually allocate.
+  let sh = Math.max(1, Math.min(oh, maxViewH, gl.getParameter(gl.MAX_RENDERBUFFER_SIZE),
+    Math.floor(MAX_STRIP_PIXELS / ow)));
+  for (;;) {
     canvas.width = ow;
-    canvas.height = oh;
-    if (gl.drawingBufferWidth === ow && gl.drawingBufferHeight === oh) break;
-    const s = Math.max(ow / gl.drawingBufferWidth, oh / gl.drawingBufferHeight) * 1.0001;
-    px *= s;
-    py *= s;
+    canvas.height = sh;
+    if (gl.drawingBufferWidth === ow && gl.drawingBufferHeight === sh) break;
+    if (sh === 1) throw new Error('the browser could not allocate an image this wide.');
+    // Browsers shrink an oversized buffer in both directions; try shorter.
+    sh = Math.max(1, Math.min(gl.drawingBufferHeight, Math.floor(sh / 2)));
   }
 
-  const spanX = ow * px, spanY = oh * py;
-  const origin = [minX + spanX / 2, minY + spanY / 2];
+  const spanX = ow * px;
+  const origin = [minX + spanX / 2, minY + oh * py / 2];
   const renderer = new MeshRenderer(gl);
-  renderer.setTexture(textureSource(state.image.img, gl.getParameter(gl.MAX_TEXTURE_SIZE)));
+  renderer.setTexture(textureSource(img, gl.getParameter(gl.MAX_TEXTURE_SIZE)));
   renderer.setTriangles(meshTriangles({ ...mesh, pos }, origin));
-  gl.viewport(0, 0, ow, oh);
+  gl.viewport(0, 0, ow, sh);
   gl.clearColor(0, 0, 0, 0);
-  gl.clear(gl.COLOR_BUFFER_BIT);
   gl.disable(gl.BLEND);
-  const matrix = new Float32Array([2 / spanX, 0, 0, 0, 0, -2 / spanY, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
-  renderer.draw(matrix, 1);
-  gl.finish();
 
-  if (rgba) {
-    const pixels = new Uint8Array(ow * oh * 4);
-    gl.readPixels(0, 0, ow, oh, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-    renderer.destroy();
-    gl.getExtension('WEBGL_lose_context')?.loseContext();
-    // GL rows run bottom-up, and the colours are premultiplied.
-    const out = new Uint8Array(pixels.length);
-    const row = ow * 4;
-    for (let j = 0; j < oh; j++) out.set(pixels.subarray((oh - 1 - j) * row, (oh - j) * row), j * row);
-    for (let k = 0; k < out.length; k += 4) {
-      const a = out[k + 3];
-      if (a > 0 && a < 255) {
-        out[k] = Math.min(255, Math.round(out[k] * 255 / a));
-        out[k + 1] = Math.min(255, Math.round(out[k + 1] * 255 / a));
-        out[k + 2] = Math.min(255, Math.round(out[k + 2] * 255 / a));
-      }
-    }
-    return { bytes: out, ow, oh, px, py, minX, minY };
+  let out2d = null, ctx = null, rgba = null, strip = null;
+  if (output === 'rgba') {
+    rgba = new Uint8Array(ow * oh * 4);
+    strip = new Uint8Array(ow * sh * 4);
+  } else {
+    out2d = document.createElement('canvas');
+    out2d.width = ow;
+    out2d.height = oh;
+    ctx = out2d.getContext('2d');
   }
-
-  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+  const row = ow * 4;
+  for (let y0 = 0; y0 < oh; y0 += sh) {
+    const h = Math.min(sh, oh - y0);
+    // This strip's rows, in positions relative to `origin`.
+    const centreY = minY + (y0 + sh / 2) * py - origin[1];
+    const sy = -2 / (sh * py);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    renderer.draw(new Float32Array([2 / spanX, 0, 0, 0, 0, sy, 0, 0, 0, 0, 1, 0, 0, -sy * centreY, 0, 1]), 1);
+    if (rgba) {
+      gl.readPixels(0, 0, ow, sh, gl.RGBA, gl.UNSIGNED_BYTE, strip);
+      // GL rows run bottom-up.
+      for (let j = 0; j < h; j++) rgba.set(strip.subarray((sh - 1 - j) * row, (sh - j) * row), (y0 + j) * row);
+    } else {
+      ctx.drawImage(canvas, 0, 0, ow, h, 0, y0, ow, h);
+    }
+  }
   renderer.destroy();
   gl.getExtension('WEBGL_lose_context')?.loseContext();
+
+  const result = { ow, oh, px, py, minX, minY };
+  if (output === 'canvas') return { ...result, canvas: out2d };
+  if (output === 'rgba') {
+    // The colours are premultiplied.
+    for (let k = 0; k < rgba.length; k += 4) {
+      const a = rgba[k + 3];
+      if (a > 0 && a < 255) {
+        rgba[k] = Math.min(255, Math.round(rgba[k] * 255 / a));
+        rgba[k + 1] = Math.min(255, Math.round(rgba[k + 1] * 255 / a));
+        rgba[k + 2] = Math.min(255, Math.round(rgba[k + 2] * 255 / a));
+      }
+    }
+    return { ...result, bytes: rgba };
+  }
+  const blob = await new Promise(resolve => out2d.toBlob(resolve, 'image/png'));
   if (!blob) throw new Error('the browser could not encode the image.');
-  return { bytes: new Uint8Array(await blob.arrayBuffer()), ow, oh, px, py, minX, minY };
+  return { ...result, bytes: new Uint8Array(await blob.arrayBuffer()) };
 }
 
 // The export mesh: dense enough for the warp, and for reprojection.
@@ -955,7 +1037,7 @@ async function exportImage() {
 async function exportGeoTIFF() {
   if (!state.image) return;
   const mesh = exportMesh(0);
-  const r = await rasterize(mesh, mesh.pos, ...Array(2).fill(affineScale(state.warp.S)), Infinity, true);
+  const r = await rasterize(mesh, mesh.pos, ...Array(2).fill(affineScale(state.warp.S)), Infinity, 'rgba');
   const { ow, oh, px: ps, minX, minY } = r;
   const worldFile = affineToWorldFile([ps, 0, minX, 0, ps, minY]);
   const nw = toLngLat([minX, minY]), se = toLngLat([minX + ow * ps, minY + oh * ps]);
@@ -1107,4 +1189,4 @@ const imageParam = new URLSearchParams(window.location.search).get('image');
 if (imageParam) loadURL(imageParam, linkHasView);
 
 // Exposed for debugging and automated tests.
-window.rubbersheet = { map, state, update, loadFiles, loadURL, exportImage, exportGeoTIFF, exportKMZ };
+window.rubbersheet = { map, state, update, loadFiles, loadURL, exportImage, exportGeoTIFF, exportKMZ, decodeJPEG };
