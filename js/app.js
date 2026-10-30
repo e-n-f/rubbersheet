@@ -54,7 +54,7 @@ const state = {
   opacity: 1,
   brushRadius: 100, // nudge brush radius, screen px
   altHeld: false,
-  streetsOnTop: false,
+  streets: 'off',   // street lines over the image: 'off', 'lines' or 'mask'
 };
 
 const $ = (id) => document.getElementById(id);
@@ -245,44 +245,115 @@ const imageLayer = {
 map.on('style.load', () => {
   if (!map.getLayer(imageLayer.id)) map.addLayer(imageLayer);
   raised = null;
-  if (state.streetsOnTop) setStreetsOnTop(true);
+  applyStreets();
 });
 
 // ---------------------------------------------------------------------------
-// Streets on top: the vector base map's road and rail lines lifted above the
-// image as thin, brightly coloured centrelines, to judge the image against.
-// Yellow rather than magenta, which many colour-blind eyes lose.
+// Streets over the image: the vector base map's road and rail lines lifted
+// above it, either as thin bright centrelines to align against ('lines'), or
+// as broad strokes in the image's paper colour ('mask') that hide the image's
+// streets where they line up, so the places that don't stand out. Yellow
+// rather than magenta, which many colour-blind eyes lose.
 
 const STREET_COLOUR = '#ffe600';
-let raised = null;  // {order: [layer ids], paint: {id: {color, width, opacity}}}
+const MASK_METRES = 150 * 0.3048;
+const STREET_PAINT = ['line-color', 'line-width', 'line-opacity', 'line-dasharray'];
+let raised = null;  // {order: [all layer ids], ids: [raised], paint: {id: [...]}, cap: {id}}
 
-function setStreetsOnTop(on) {
-  const layers = map.getStyle()?.layers || [];
-  if (on && !raised) {
-    // Roads and railways, not their casings, footpaths or ferry routes.
-    const ids = layers.filter(l => l.type === 'line' && l['source-layer'] === 'transportation' &&
-      !/casing|path|pedestrian|ferry|aeroway|pier/.test(l.id)).map(l => l.id);
-    if (!ids.length) return;
-    raised = { order: layers.map(l => l.id), ids, paint: {} };
-    for (const id of ids) {
-      raised.paint[id] = ['line-color', 'line-width', 'line-opacity'].map(k => map.getPaintProperty(id, k));
-      map.moveLayer(id);
-      map.setPaintProperty(id, 'line-color', STREET_COLOUR);
-      map.setPaintProperty(id, 'line-width', 1.5);
-      map.setPaintProperty(id, 'line-opacity', 1);
-    }
-  } else if (!on && raised) {
-    // Back where they were: each before the next layer of the original order.
-    const { order, ids, paint } = raised;
-    for (let i = order.length - 1; i >= 0; i--) {
-      const id = order[i];
-      if (!ids.includes(id)) continue;
-      const before = order.slice(i + 1).find(n => map.getLayer(n));
-      map.moveLayer(id, before);
-      ['line-color', 'line-width', 'line-opacity'].forEach((k, j) => map.setPaintProperty(id, k, paint[id][j]));
-    }
-    raised = null;
+// What to show now: the mask gives way to thin lines while a control point
+// is dragged, so you can see what you're aligning to.
+function streetMode() {
+  const mode = state.streets;
+  return mode === 'mask' && state.drag && state.drag.kind === 'point' ? 'lines' : mode;
+}
+
+function applyStreets() {
+  const mode = streetMode();
+  if (mode === 'off') {
+    lowerStreets();
+    return;
   }
+  if (!raised && !raiseStreets()) return;
+  const mask = mode === 'mask';
+  const width = mask ? maskWidth() : 1.5;
+  for (const id of raised.ids) {
+    const orig = raised.paint[id];
+    map.setPaintProperty(id, 'line-color', mask ? state.image?.paper || '#f1e4c3' : STREET_COLOUR);
+    map.setPaintProperty(id, 'line-width', width);
+    map.setPaintProperty(id, 'line-opacity', 1);
+    map.setPaintProperty(id, 'line-dasharray', mask ? undefined : orig[3]);
+    map.setLayoutProperty(id, 'line-cap', mask ? 'round' : raised.cap[id]);
+  }
+}
+
+// MASK_METRES on the ground at the image's latitude, at any zoom. MapLibre's
+// world is 512 px across at zoom 0.
+function maskWidth() {
+  let lat = map.getCenter().lat;
+  if (state.mesh) {
+    const [, minY, , maxY] = meshBounds(state.mesh);
+    lat = toLngLat([0.5, (minY + maxY) / 2]).lat;
+  }
+  const w0 = MASK_METRES * 512 / (EARTH_CIRCUMFERENCE * Math.cos(lat * Math.PI / 180));
+  return ['interpolate', ['exponential', 2], ['zoom'], 0, w0, 24, w0 * 2 ** 24];
+}
+
+function raiseStreets() {
+  const layers = map.getStyle()?.layers || [];
+  // Roads and railways, not their casings, footpaths or ferry routes.
+  const ids = layers.filter(l => l.type === 'line' && l['source-layer'] === 'transportation' &&
+    !/casing|path|pedestrian|ferry|aeroway|pier/.test(l.id)).map(l => l.id);
+  if (!ids.length) return false;
+  raised = { order: layers.map(l => l.id), ids, paint: {}, cap: {} };
+  for (const id of ids) {
+    raised.paint[id] = STREET_PAINT.map(k => map.getPaintProperty(id, k));
+    raised.cap[id] = map.getLayoutProperty(id, 'line-cap');
+    map.moveLayer(id);
+  }
+  return true;
+}
+
+function lowerStreets() {
+  if (!raised) return;
+  // Back where they were: each before the next layer of the original order.
+  const { order, ids, paint, cap } = raised;
+  for (let i = order.length - 1; i >= 0; i--) {
+    const id = order[i];
+    if (!ids.includes(id)) continue;
+    const before = order.slice(i + 1).find(n => map.getLayer(n));
+    map.moveLayer(id, before);
+    STREET_PAINT.forEach((k, j) => map.setPaintProperty(id, k, paint[id][j]));
+    map.setLayoutProperty(id, 'line-cap', cap[id]);
+  }
+  raised = null;
+}
+
+// The image's paper colour: the commonest colour, in coarse bins, among its
+// opaque pixels.
+function paperColour(img) {
+  const W = img.naturalWidth || img.width, H = img.naturalHeight || img.height;
+  const k = Math.min(1, 256 / Math.max(W, H));
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(W * k));
+  c.height = Math.max(1, Math.round(H * k));
+  const ctx = c.getContext('2d');
+  ctx.drawImage(img, 0, 0, c.width, c.height);
+  const px = ctx.getImageData(0, 0, c.width, c.height).data;
+  const count = new Map();
+  for (let i = 0; i < px.length; i += 4) {
+    if (px[i + 3] < 128) continue;
+    const key = (px[i] >> 4) << 8 | (px[i + 1] >> 4) << 4 | px[i + 2] >> 4;
+    count.set(key, (count.get(key) || 0) + 1);
+  }
+  let best = -1, n = 0;
+  for (const [key, v] of count) if (v > n) [best, n] = [key, v];
+  if (best < 0) return null;
+  let r = 0, g = 0, b = 0, m = 0;
+  for (let i = 0; i < px.length; i += 4) {
+    if (px[i + 3] < 128 || ((px[i] >> 4) << 8 | (px[i + 1] >> 4) << 4 | px[i + 2] >> 4) !== best) continue;
+    r += px[i]; g += px[i + 1]; b += px[i + 2]; m++;
+  }
+  return `rgb(${Math.round(r / m)}, ${Math.round(g / m)}, ${Math.round(b / m)})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -600,6 +671,7 @@ container.addEventListener('pointerdown', (e) => {
     drag.pivot = state.warp.map(W / 2, H / 2);
   }
   state.drag = drag;
+  if (state.streets === 'mask' && hit.kind === 'point') applyStreets();
   document.body.classList.add('dragging');
   map.getCanvas().style.cursor = hit.kind === 'point' ? 'grabbing' : cursorFor(hit, false);
   map.triggerRepaint();
@@ -722,6 +794,7 @@ function endDrag(cancel) {
   state.drag = null;
   document.body.classList.remove('dragging');
   update();
+  if (state.streets === 'mask' && d.kind === 'point') applyStreets();
   if (lastPointer) setHover(hitTest(lastPointer), false);
 }
 
@@ -888,7 +961,7 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
     placement = { T: dropPlacement(dropPoint, W, H), points: [] };
   }
 
-  state.image = { name: imageFile.name, img: source, W, H };
+  state.image = { name: imageFile.name, img: source, W, H, paper: paperColour(source) };
   state.T = placement.T;
   state.points = placement.points;
   state.nudge = null;
@@ -896,6 +969,7 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
   resetHistory();
   imageLayer.texDirty = true;
   update();
+  if (state.streets === 'mask') applyStreets();
   if ((placement.points.length || how) && !keepView) zoomToImage();
   if (!fromURL) clearImageParam();
   setStatus(`<b>${escapeHTML(imageFile.name)}</b> (${W}×${H})${how ? ', ' + how : ''}.` +
@@ -1440,11 +1514,11 @@ $('opacity').addEventListener('input', (e) => {
 $('basemap').addEventListener('change', (e) => {
   map.setStyle(STYLES[e.target.value], { diff: false });
   // Only the vector street map has separate road layers to lift.
-  $('streets-on-top').disabled = e.target.value !== 'streets';
+  $('streets').disabled = e.target.value !== 'streets';
 });
-$('streets-on-top').addEventListener('change', (e) => {
-  state.streetsOnTop = e.target.checked;
-  setStreetsOnTop(state.streetsOnTop);
+$('streets').addEventListener('change', (e) => {
+  state.streets = e.target.value;
+  applyStreets();
 });
 
 const imageParam = new URLSearchParams(window.location.search).get('image');
