@@ -232,6 +232,123 @@ export function refineMesh(map, mesh, i0, j0, i1, j1, s) {
   return { mesh: sub, i0, j0, i1, j1, s, u0, v0 };
 }
 
+// An export mesh that follows the warp to within `tol` (Mercator units)
+// everywhere: a cols-wide grid whose cells are checked against the warp at
+// their centres, edge midpoints and any `probes` ([u, v], the control points)
+// inside them, and split S × S where they're off by more than tol, along
+// with their neighbours. A cell left whole beside split ones takes their
+// extra edge vertices and is drawn as a fan from its centre, so the two
+// share every vertex along the edge and no hairline gaps open between them.
+// Returns a triangle soup {soup: true, pos, uv, W, H, refined}: three
+// vertices per triangle, positions absolute.
+export function refinedSoup(map, W, H, cols, tol, probes = [], S = 16) {
+  const nx = Math.max(1, cols), ny = Math.max(1, Math.round(cols * H / W));
+  const cw = W / nx, ch = H / ny;
+  const corner = new Float64Array((nx + 1) * (ny + 1) * 2);
+  for (let j = 0; j <= ny; j++) {
+    for (let i = 0; i <= nx; i++) {
+      const [x, y] = map(i * cw, j * ch);
+      corner[(j * (nx + 1) + i) * 2] = x;
+      corner[(j * (nx + 1) + i) * 2 + 1] = y;
+    }
+  }
+  const C = (i, j) => [corner[(j * (nx + 1) + i) * 2], corner[(j * (nx + 1) + i) * 2 + 1]];
+  // How far the warp is from the cell's bilinear interpolation at (a, b) in
+  // its unit square.
+  const off = (i, j, a, b) => {
+    const [x, y] = map((i + a) * cw, (j + b) * ch);
+    const p00 = C(i, j), p10 = C(i + 1, j), p01 = C(i, j + 1), p11 = C(i + 1, j + 1);
+    const bx = (1 - a) * (1 - b) * p00[0] + a * (1 - b) * p10[0] + (1 - a) * b * p01[0] + a * b * p11[0];
+    const by = (1 - a) * (1 - b) * p00[1] + a * (1 - b) * p10[1] + (1 - a) * b * p01[1] + a * b * p11[1];
+    return Math.hypot(x - bx, y - by);
+  };
+  const bad = new Uint8Array(nx * ny);
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      if (off(i, j, 0.5, 0.5) > tol || off(i, j, 0.5, 0) > tol || off(i, j, 0, 0.5) > tol ||
+          (i === nx - 1 && off(i, j, 1, 0.5) > tol) || (j === ny - 1 && off(i, j, 0.5, 1) > tol)) {
+        bad[j * nx + i] = 1;
+      }
+    }
+  }
+  for (const [u, v] of probes) {
+    const i = Math.min(nx - 1, Math.max(0, Math.floor(u / cw))), j = Math.min(ny - 1, Math.max(0, Math.floor(v / ch)));
+    if (off(i, j, u / cw - i, v / ch - j) > tol) bad[j * nx + i] = 1;
+  }
+  // Split the bad cells and their neighbours.
+  const split = new Uint8Array(nx * ny);
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      if (!bad[j * nx + i]) continue;
+      for (let jj = Math.max(0, j - 1); jj <= Math.min(ny - 1, j + 1); jj++) {
+        for (let ii = Math.max(0, i - 1); ii <= Math.min(nx - 1, i + 1); ii++) split[jj * nx + ii] = 1;
+      }
+    }
+  }
+  const isSplit = (i, j) => i >= 0 && j >= 0 && i < nx && j < ny && split[j * nx + i] === 1;
+
+  const pos = [], uv = [];
+  const vert = (u, v) => {
+    const [x, y] = map(u, v);
+    return [x, y, u, v];
+  };
+  const tri = (a, b, c) => {
+    for (const p of [a, b, c]) {
+      pos.push(p[0], p[1]);
+      uv.push(p[2] / W, p[3] / H);
+    }
+  };
+  let refined = 0;
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const u0 = i * cw, v0 = j * ch;
+      if (isSplit(i, j)) {
+        refined++;
+        const g = [];
+        for (let b = 0; b <= S; b++) {
+          for (let a = 0; a <= S; a++) {
+            // Corners and edges exactly as the neighbours compute them.
+            g.push(a === 0 && b === 0 ? [...C(i, j), u0, v0]
+              : a === S && b === 0 ? [...C(i + 1, j), u0 + cw, v0]
+                : a === 0 && b === S ? [...C(i, j + 1), u0, v0 + ch]
+                  : a === S && b === S ? [...C(i + 1, j + 1), u0 + cw, v0 + ch]
+                    : vert(u0 + cw * a / S, v0 + ch * b / S));
+          }
+        }
+        const n = (a, b) => g[b * (S + 1) + a];
+        for (let b = 0; b < S; b++) {
+          for (let a = 0; a < S; a++) {
+            tri(n(a, b), n(a + 1, b), n(a, b + 1));
+            tri(n(a + 1, b), n(a + 1, b + 1), n(a, b + 1));
+          }
+        }
+        continue;
+      }
+      const p00 = [...C(i, j), u0, v0], p10 = [...C(i + 1, j), u0 + cw, v0];
+      const p01 = [...C(i, j + 1), u0, v0 + ch], p11 = [...C(i + 1, j + 1), u0 + cw, v0 + ch];
+      const top = isSplit(i, j - 1), bottom = isSplit(i, j + 1), left = isSplit(i - 1, j), right = isSplit(i + 1, j);
+      if (!top && !bottom && !left && !right) {
+        tri(p00, p10, p01);
+        tri(p10, p11, p01);
+        continue;
+      }
+      // The boundary, clockwise from the top-left corner, with a split
+      // neighbour's edge vertices, fanned from the centre.
+      const ring = [p00];
+      for (let a = 1; top && a < S; a++) ring.push(vert(u0 + cw * a / S, v0));
+      ring.push(p10);
+      for (let b = 1; right && b < S; b++) ring.push(vert(u0 + cw, v0 + ch * b / S));
+      ring.push(p11);
+      for (let a = S - 1; bottom && a > 0; a--) ring.push(vert(u0 + cw * a / S, v0 + ch));
+      ring.push(p01);
+      for (let b = S - 1; left && b > 0; b--) ring.push(vert(u0, v0 + ch * b / S));
+      const mid = vert(u0 + cw / 2, v0 + ch / 2);
+      for (let k = 0; k < ring.length; k++) tri(mid, ring[k], ring[(k + 1) % ring.length]);
+    }
+  }
+  return { soup: true, pos: Float64Array.from(pos), uv: Float32Array.from(uv), W, H, refined };
+}
+
 // Invert the drawn mesh: the refined part first, then the rest.
 export function invertDrawn(mesh, fine, x, y) {
   if (fine) {
@@ -250,6 +367,14 @@ function node(mesh, i, j) {
 // `origin`, as Float32 for upload. With `fine` (from refineMesh), its cells
 // replace the coarse ones they cover.
 export function meshTriangles(mesh, origin, fine = null) {
+  if (mesh.soup) {
+    const positions = new Float32Array(mesh.pos.length);
+    for (let k = 0; k < positions.length; k += 2) {
+      positions[k] = mesh.pos[k] - origin[0];
+      positions[k + 1] = mesh.pos[k + 1] - origin[1];
+    }
+    return { positions, uvs: mesh.uv, count: mesh.pos.length / 2 };
+  }
   const covered = (i, j) => fine && i >= fine.i0 && i < fine.i1 && j >= fine.j0 && j < fine.j1;
   const coarse = mesh.nx * mesh.ny - (fine ? (fine.i1 - fine.i0) * (fine.j1 - fine.j0) : 0);
   const count = (coarse + (fine ? fine.mesh.nx * fine.mesh.ny : 0)) * 6;

@@ -33,7 +33,7 @@ How the image is fitted depends on the number of control points:
 
 Nudges are offsets on a 256-cell grid over the image, added on top of the points' warp. That warp aims each point at its target minus the nudge there, so points still land exactly.
 
-The warp is evaluated on a 64×64 grid and drawn as a textured mesh in a MapLibre custom WebGL layer, so it updates live while you drag. When you're zoomed in, the cells in view are split into pieces about 16 screen pixels across, evaluated exactly, and rebuilt whenever the warp changes or the map stops moving. Without that, the image near a control point that was moved a long way could be drawn tens of pixels from the point's marker. The export uses the same method on a 256×256 grid.
+The warp is evaluated on a 64×64 grid and drawn as a textured mesh in a MapLibre custom WebGL layer, so it updates live while you drag. When you're zoomed in, the cells in view are split into pieces about 16 screen pixels across, evaluated exactly, and rebuilt whenever the warp changes or the map stops moving. Without that, the image near a control point that was moved a long way could be drawn tens of pixels from the point's marker. The export uses the same method on a 256×256 grid. Each cell is checked against the exact warp at its centre, its edge midpoints and any control point inside it. Cells off by more than a quarter of an output pixel are split 16 × 16, along with their neighbours, so the export stays that accurate even right next to a point moved far out of line with its neighbours. A whole cell next to split ones shares their edge vertices, so no hairline gaps open between them.
 
 ## Georeferencing metadata
 

@@ -2,7 +2,7 @@ import {
   applyAffine, affineScale, affineToWorldFile, buildMesh, invertMesh, makeWarp,
   meshBounds, meshCorners, meshOutline, meshTriangles, mercXToLng, mercYToLat,
   EARTH_CIRCUMFERENCE, mercToMeters, similarityAboutPivot, translateAffine, worldFileToAffine,
-  makeNudge, nudgeAt, nudgeIsZero, brushNudge, sampleMesh, refineMesh, invertDrawn,
+  makeNudge, nudgeAt, nudgeIsZero, brushNudge, sampleMesh, refineMesh, invertDrawn, refinedSoup,
 } from './warp.js';
 import { addTextChunk, isPNG, readTextChunks } from './png-text.js';
 import { makeZip, readZip } from './zip.js';
@@ -1581,11 +1581,17 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
   return { ...result, bytes: new Uint8Array(await blob.arrayBuffer()) };
 }
 
-// The export mesh: dense enough for the warp, and for reprojection.
+// The export mesh: dense enough for the warp, and for reprojection. A bent
+// warp gets cells split where it bends sharply (near a control point moved
+// out of line with its neighbours), to stay within a quarter of an output
+// pixel everywhere.
 function exportMesh(minCells) {
   const { W, H } = state.image;
-  const cells = state.points.length >= 3 || state.nudge ? EXPORT_CELLS : minCells;
-  return buildMesh(state.warp.map, W, H, cells ? cellsAcross(W, H, cells) : 1);
+  if (state.points.length < 3 && !state.nudge) {
+    return buildMesh(state.warp.map, W, H, minCells ? cellsAcross(W, H, minCells) : 1);
+  }
+  return refinedSoup(state.warp.map, W, H, cellsAcross(W, H, EXPORT_CELLS),
+    affineScale(state.warp.S) / 4, state.points.map(p => [p.u, p.v]));
 }
 
 // Metadata for an exported raster. `toPixel` maps Mercator units to its
