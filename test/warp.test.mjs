@@ -5,6 +5,7 @@ import {
   worldFileToAffine, affineToWorldFile, similarityAboutPivot,
   lngToMercX, mercXToLng, latToMercY, mercYToLat,
   makeNudge, nudgeAt, nudgeIsZero, brushNudge, sampleMesh,
+  refineMesh, invertDrawn, meshTriangles,
 } from '../js/warp.js';
 import { addTextChunk, readTextChunks } from '../js/png-text.js';
 import { makeZip, readZip } from '../js/zip.js';
@@ -132,6 +133,27 @@ test('sampling a mesh on a grid agrees with inverting it point by point', () => 
     }
   }
   assert.ok(inside > 100);
+});
+
+test('a refined patch follows the warp exactly and replaces the cells it covers', () => {
+  const T = [1e-6, 0, 0.3, 0, 1e-6, 0.4];
+  const pts = [[0, 0], [1000, 0], [0, 800], [1000, 800], [530, 420]].map(([u, v], i) => {
+    const [x, y] = applyAffine(T, u, v);
+    return { u, v, x: x + (i === 4 ? 1e-4 : 0), y };  // a 100 px re-pin, between coarse nodes
+  });
+  const w = makeWarp(T, pts);
+  const mesh = buildMesh(w.map, 1000, 800, 10);
+  const fine = refineMesh(w.map, mesh, 4, 3, 6, 5, 8);
+  assert.equal(fine.mesh.nx, 16); assert.equal(fine.mesh.ny, 16);
+  // Close at the re-pinned point (530, 420), where the coarse mesh alone is well off.
+  const uv = invertDrawn(mesh, fine, ...w.map(530, 420));
+  assert.ok(Math.hypot(uv[0] - 530, uv[1] - 420) < 0.5, `${uv}`);
+  const coarse = invertMesh(mesh, ...w.map(530, 420));
+  assert.ok(Math.hypot(coarse[0] - 530, coarse[1] - 420) > 2, `coarse ${coarse}`);
+  // Texture coordinates are for the whole image.
+  close(fine.mesh.uv[0], 0.4, 1e-7); close(fine.mesh.uv[1], 0.375, 1e-7);
+  const tris = meshTriangles(mesh, [0, 0], fine);
+  assert.equal(tris.count, (10 * 8 - 4 + 256) * 6);
 });
 
 test('world file conversion round-trips', () => {

@@ -2,7 +2,7 @@ import {
   applyAffine, affineScale, affineToWorldFile, buildMesh, invertMesh, makeWarp,
   meshBounds, meshCorners, meshOutline, meshTriangles, mercXToLng, mercYToLat,
   EARTH_CIRCUMFERENCE, mercToMeters, similarityAboutPivot, translateAffine, worldFileToAffine,
-  makeNudge, nudgeAt, nudgeIsZero, brushNudge, sampleMesh,
+  makeNudge, nudgeAt, nudgeIsZero, brushNudge, sampleMesh, refineMesh, invertDrawn,
 } from './warp.js';
 import { addTextChunk, isPNG, readTextChunks } from './png-text.js';
 import { makeZip, readZip } from './zip.js';
@@ -48,6 +48,7 @@ const state = {
   nudge: null,      // offsets brushed on top of the point warp (makeNudge)
   warp: null,       // {map, S}
   mesh: null,       // display mesh
+  fine: null,       // finer patch of it over the part in view (refineMesh)
   origin: [0, 0],   // GPU rebasing origin for the display mesh
   drag: null,
   hover: null,
@@ -55,6 +56,7 @@ const state = {
   brushRadius: 100, // nudge brush radius, screen px
   altHeld: false,
   streetsOnTop: false,
+  ease: null,       // a world anchor's release in progress (easeWorldRelease)
 };
 
 const $ = (id) => document.getElementById(id);
@@ -229,7 +231,7 @@ const imageLayer = {
       this.texDirty = false;
     }
     if (this.meshDirty) {
-      this.renderer.setTriangles(meshTriangles(state.mesh, state.origin));
+      this.renderer.setTriangles(meshTriangles(state.mesh, state.origin, state.fine));
       this.meshDirty = false;
     }
     gl.disable(gl.DEPTH_TEST);
@@ -370,9 +372,11 @@ function update() {
       pos[k * 2 + 1] = d.base[k * 2 + 1] + n.dy[k];
     }
     state.mesh = { ...state.mesh, pos };
+    state.fine = null;  // Rebuilt when the stroke ends.
   } else {
     const cols = n ? n.nx : state.points.length >= 3 ? cellsAcross(W, H, DISPLAY_CELLS) : 1;
     state.mesh = buildMesh(state.warp.map, W, H, cols);
+    state.fine = refineView(state.mesh);
   }
   const [minX, minY, maxX, maxY] = meshBounds(state.mesh);
   state.origin = [(minX + maxX) / 2, (minY + maxY) / 2];
@@ -402,6 +406,48 @@ function warpFor(T, points, nudge) {
   if (points.length === 1) T = placementFor(T, points[0], nudge);
   return makeWarp(T, points, nudge);
 }
+
+// The warp bends sharply near a control point that was moved a long way,
+// more sharply than the display grid can follow, so at high zoom the cells
+// in view are split into pieces about FINE_PX on screen, evaluated exactly.
+// Rebuilt whenever the warp changes or the map stops moving.
+const FINE_PX = 16;
+const FINE_MAX_CELLS = 40000;
+
+function refineView(mesh) {
+  if (!mesh || mesh.nx < 2 || !state.warp) return null;
+  const canvas = map.getCanvas();
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const A = mercToScreenAffine();
+  const { nx, ny, pos } = mesh;
+  const sx = (n) => A[0] * pos[n * 2] + A[1] * pos[n * 2 + 1] + A[2];
+  const sy = (n) => A[3] * pos[n * 2] + A[4] * pos[n * 2 + 1] + A[5];
+  let i0 = Infinity, j0 = Infinity, i1 = -1, j1 = -1, size = 0;
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const c = [j * (nx + 1) + i, j * (nx + 1) + i + 1, (j + 1) * (nx + 1) + i, (j + 1) * (nx + 1) + i + 1];
+      const xs = c.map(sx), ys = c.map(sy);
+      if (Math.max(...xs) < 0 || Math.min(...xs) > w || Math.max(...ys) < 0 || Math.min(...ys) > h) continue;
+      i0 = Math.min(i0, i); i1 = Math.max(i1, i); j0 = Math.min(j0, j); j1 = Math.max(j1, j);
+      size = Math.max(size, Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+    }
+  }
+  if (i1 < 0) return null;
+  // One cell of margin, so the seam with the coarse cells is out of view.
+  i0 = Math.max(0, i0 - 1); j0 = Math.max(0, j0 - 1);
+  i1 = Math.min(nx, i1 + 2); j1 = Math.min(ny, j1 + 2);
+  let s = Math.min(32, Math.ceil(size / FINE_PX));
+  while (s > 1 && (i1 - i0) * (j1 - j0) * s * s > FINE_MAX_CELLS) s--;
+  if (s < 2) return null;
+  return refineMesh(state.warp.map, mesh, i0, j0, i1, j1, s);
+}
+
+map.on('moveend', () => {
+  if (!state.image || !state.mesh || state.drag || state.ease) return;
+  state.fine = refineView(state.mesh);
+  imageLayer.meshDirty = true;
+  map.triggerRepaint();
+});
 
 // Columns for a grid whose longer side has `cells` cells.
 function cellsAcross(W, H, cells) {
@@ -463,13 +509,13 @@ function settle(token, cancelled) {
 }
 
 function undo() {
-  if (state.drag || !edits.undo.length) return;
+  if (state.drag || state.ease || !edits.undo.length) return;
   edits.redo.push(snapshot());
   restore(edits.undo.pop());
 }
 
 function redo() {
-  if (state.drag || !edits.redo.length) return;
+  if (state.drag || state.ease || !edits.redo.length) return;
   edits.undo.push(snapshot());
   restore(edits.redo.pop());
 }
@@ -498,12 +544,16 @@ function drawOverlay() {
   }
   const d = state.drag;
   if (d && d.kind === 'world' && d.preview) {
-    parts.push(`<path class="bent-streets" d="${bentStreetsPath(d)}"/>`);
+    parts.push(`<path class="bent-streets" d="${polylinePath(bentStreets(d))}"/>`);
+  } else if (state.ease) {
+    parts.push(`<path class="bent-streets" d="${easedStreetsPath(state.ease)}"/>`);
   }
   state.points.forEach((p, i) => {
     const active = d && ['point', 'world'].includes(d.kind) && d.index === i;
     // A world anchor being dragged rides on its bent street, at the pointer.
-    const [x, y] = active && d.kind === 'world' && d.cursor ? d.cursor : mercToScreen([p.x, p.y]);
+    const easing = state.ease && state.ease.index === i;
+    const [x, y] = active && d.kind === 'world' && d.cursor ? d.cursor
+      : easing ? state.ease.cursor : mercToScreen([p.x, p.y]);
     const hover = state.hover && state.hover.kind === 'point' && state.hover.index === i;
     // World anchors are squares, image anchors circles.
     const ring = p.world ? '<rect class="ring" x="-6.5" y="-6.5" width="13" height="13"/>' : '<circle class="ring" r="7"/>';
@@ -538,7 +588,7 @@ function hitTest(p) {
     }
   }
   const m = screenToMerc(p);
-  const uv = invertMesh(state.mesh, m[0], m[1]);
+  const uv = invertDrawn(state.mesh, state.fine, m[0], m[1]);
   if (uv) return { kind: 'image', uv, merc: m };
   return null;
 }
@@ -590,7 +640,7 @@ function setHover(hit, cmd) {
 const container = map.getContainer();
 
 container.addEventListener('pointerdown', (e) => {
-  if (e.button !== 0 || !e.isPrimary || state.drag) return;
+  if (e.button !== 0 || !e.isPrimary || state.drag || state.ease) return;
   if (e.target.closest('.maplibregl-ctrl')) return;
   const p = localPoint(e);
   const hit = hitTest(p);
@@ -835,18 +885,35 @@ function startWorldDrag(index, token, offset) {
     T0: state.T.slice(),
     pts0: state.points.map(q => ({ ...q })),
     mesh: state.mesh,
+    fine: state.fine,
     A, nx, ny,
-    under: sampleMesh(state.mesh, A, nx, ny, PREVIEW_STEP),
+    under: sampleDrawn(A, nx, ny),
     streets,
     preview: null,
     cursor: null,
   };
 }
 
+// The image pixel under each grid node, as drawn: the fine patch where it
+// covers, the coarse mesh elsewhere.
+function sampleDrawn(A, nx, ny) {
+  const under = sampleMesh(state.mesh, A, nx, ny, PREVIEW_STEP);
+  const f = state.fine;
+  if (f) {
+    const fine = sampleMesh(f.mesh, A, nx, ny, PREVIEW_STEP);
+    for (let k = 0; k < fine.length; k += 2) {
+      if (Number.isNaN(fine[k])) continue;
+      under[k] = fine[k] + f.u0;
+      under[k + 1] = fine[k + 1] + f.v0;
+    }
+  }
+  return under;
+}
+
 function worldStep(d, cursor) {
   d.cursor = cursor;
   const m = screenToMerc(cursor);
-  const uv = invertMesh(d.mesh, m[0], m[1]);
+  const uv = invertDrawn(d.mesh, d.fine, m[0], m[1]);
   if (!uv) return;  // Off the image: keep the last good preview.
   const pts = d.pts0.map(q => ({ ...q }));
   pts[d.index].u = uv[0];
@@ -867,7 +934,8 @@ function worldStep(d, cursor) {
 
 // The streets bent by the preview: a street at screen v is drawn at q with
 // q + off(q) = v (the image pixel at q will move to v), found by iterating.
-function bentStreetsPath(d) {
+// Returns polylines like d.streets.
+function bentStreets(d) {
   const { nx, ny } = d, { off } = d.preview;
   const at = (x, y) => {
     const fx = Math.min(Math.max(x / PREVIEW_STEP, 0), nx - 1.000001);
@@ -880,8 +948,8 @@ function bentStreetsPath(d) {
       w[0] * off[k + 1] + w[1] * off[k + 3] + w[2] * off[k2 + 1] + w[3] * off[k2 + 3],
     ];
   };
-  const out = [];
-  for (const line of d.streets) {
+  return d.streets.map(line => {
+    const bent = new Float64Array(line.length);
     for (let k = 0; k < line.length; k += 2) {
       const vx = line[k], vy = line[k + 1];
       let qx = vx, qy = vy;
@@ -890,10 +958,104 @@ function bentStreetsPath(d) {
         qx = vx - ox;
         qy = vy - oy;
       }
-      out.push(`${k ? 'L' : 'M'}${qx.toFixed(1)},${qy.toFixed(1)}`);
+      bent[k] = qx;
+      bent[k + 1] = qy;
     }
+    return bent;
+  });
+}
+
+function polylinePath(lines) {
+  const out = [];
+  for (const line of lines) {
+    for (let k = 0; k < line.length; k += 2) out.push(`${k ? 'L' : 'M'}${line[k].toFixed(1)},${line[k + 1].toFixed(1)}`);
   }
   return out.join('');
+}
+
+// After a world anchor is released, ease the map so the anchor stays where
+// it was let go, easing the image from the old warp to the new and the
+// streets from bent to true in step: with the camera moved a fraction e of
+// the way, the image blended e of the way and the streets likewise, the
+// anchor's spot stays put on screen throughout.
+const EASE = { ms: 250 };
+
+function easeWorldRelease(d) {
+  const q = state.points[d.index];
+  const [sx, sy] = mercToScreen([q.x, q.y]);
+  const [cx, cy] = d.preview.cursor;
+  const dx = sx - cx, dy = sy - cy;
+  if (!dx && !dy) return false;
+  const canvas = map.getCanvas();
+  const w = canvas.clientWidth / 2, h = canvas.clientHeight / 2;
+  const from = d.mesh, to = state.mesh, fineFrom = d.fine;
+  const same = (a, b) => a.nx === b.nx && a.ny === b.ny;
+  // The new warp's fine patch over the same cells as the old, to blend.
+  const fineTo = fineFrom && same(from, to)
+    ? refineMesh(state.warp.map, to, fineFrom.i0, fineFrom.j0, fineFrom.i1, fineFrom.j1, fineFrom.s)
+    : state.fine;
+  const ease = {
+    index: d.index, cursor: [cx, cy], dx, dy, e: 0,
+    c0: screenToMerc([w, h]), c1: screenToMerc([w + dx, h + dy]),
+    blend: same(from, to),
+    // The fine patches blend too when they cover the same cells.
+    blendFine: !!fineFrom && !!fineTo && same(fineFrom.mesh, fineTo.mesh) &&
+      fineFrom.i0 === fineTo.i0 && fineFrom.j0 === fineTo.j0,
+    streets: d.streets, bent: bentStreets(d),
+  };
+  state.ease = ease;
+  hideStreets(true);
+  const lerp = (a, b, e) => {
+    const pos = new Float64Array(b.length);
+    for (let k = 0; k < pos.length; k++) pos[k] = a[k] + (b[k] - a[k]) * e;
+    return pos;
+  };
+  const show = (e) => {
+    if (ease.blend) state.mesh = { ...to, pos: lerp(from.pos, to.pos, e) };
+    state.fine = ease.blendFine ? { ...fineTo, mesh: { ...fineTo.mesh, pos: lerp(fineFrom.mesh.pos, fineTo.mesh.pos, e) } }
+      : ease.blend ? null : fineTo;
+    imageLayer.meshDirty = true;
+  };
+  // Start from what was on screen: update() has already made the new mesh.
+  show(0);
+  let start = null;
+  const frame = (now) => {
+    // Time from the first frame's own timestamp, which can be earlier than
+    // performance.now() when this was scheduled.
+    start ??= now;
+    const t = Math.min(1, (now - start) / EASE.ms);
+    const e = ease.e = 1 - (1 - t) ** 3;
+    const { c0, c1 } = ease;
+    map.jumpTo({ center: toLngLat([c0[0] + (c1[0] - c0[0]) * e, c0[1] + (c1[1] - c0[1]) * e]) });
+    show(e);
+    if (t < 1) {
+      map.triggerRepaint();
+      requestAnimationFrame(frame);
+      return;
+    }
+    state.ease = null;
+    state.mesh = to;
+    state.fine = refineView(to);
+    imageLayer.meshDirty = true;
+    hideStreets(false);
+    map.triggerRepaint();
+    drawOverlay();
+  };
+  requestAnimationFrame(frame);
+  return true;
+}
+
+// The streets part way through the ease, at the current camera.
+function easedStreetsPath(ease) {
+  const { e, dx, dy, streets, bent } = ease;
+  return polylinePath(streets.map((line, i) => {
+    const b = bent[i], out = new Float64Array(line.length);
+    for (let k = 0; k < line.length; k += 2) {
+      out[k] = b[k] + (line[k] - b[k]) * e - dx * e;
+      out[k + 1] = b[k + 1] + (line[k + 1] - b[k + 1]) * e - dy * e;
+    }
+    return out;
+  }));
 }
 
 function endDrag(cancel) {
@@ -918,14 +1080,7 @@ function endDrag(cancel) {
   state.drag = null;
   document.body.classList.remove('dragging');
   update();
-  if (d.kind === 'world' && !cancel && d.preview) {
-    // Keep the anchor where it was let go: ease the map so its place comes
-    // to the release point, instead of the streets jumping back under it.
-    const q = state.points[d.index];
-    const [sx, sy] = mercToScreen([q.x, q.y]);
-    const [cx, cy] = d.preview.cursor;
-    if (sx !== cx || sy !== cy) map.panBy([sx - cx, sy - cy], { duration: 250 });
-  }
+  if (d.kind === 'world' && !cancel && d.preview) easeWorldRelease(d);
   if (lastPointer) setHover(hitTest(lastPointer), false);
 }
 
@@ -1628,6 +1783,7 @@ $('redo').addEventListener('click', redo);
 $('remove').addEventListener('click', () => {
   state.image = null;
   state.mesh = null;
+  state.fine = null;
   state.points = [];
   state.nudge = null;
   resetHistory();
@@ -1658,4 +1814,4 @@ const imageParam = new URLSearchParams(window.location.search).get('image');
 if (imageParam) loadURL(imageParam, linkHasView);
 
 // Exposed for debugging and automated tests.
-window.rubbersheet = { map, state, update, loadFiles, loadURL, exportImage, exportGeoTIFF, exportKMZ, decodeJPEG };
+window.rubbersheet = { map, state, update, loadFiles, loadURL, exportImage, exportGeoTIFF, exportKMZ, decodeJPEG, invertDrawn, EASE };

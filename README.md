@@ -12,7 +12,7 @@ Map rubbersheeting in the browser. Drop a scanned map or photo onto a MapLibre b
 - **Drag a control point** to move that spot of the image to a new place on the map. The image goes half-transparent while you drag so you can see the map underneath.
 - **⌥-drag** (Alt-drag on Windows/Linux) to nudge. Everything inside the circle moves with the pointer, fully at the centre and fading to nothing at the rim. ⌥-scroll, or <kbd>[</kbd> and <kbd>]</kbd>, sizes the circle. Control points under the brush move along with the image, so a nudge only changes what's inside the circle. *Clear nudges* undoes all nudging and leaves the control points where they are on the map.
 - **Streets on top of the image** draws the street base map's roads and railways over the image as thin bright yellow lines. It only works with the *Streets* base map, which has separate road layers. While it's on, ⌘-clicking the image adds a **world anchor**, drawn as a blue square. A world anchor is tied to that place on the map, not to the spot in the image.
-  - **Dragging a world anchor** keeps the image still and bends the streets around the anchor, as the new warp will. Drag the street onto the image's feature and let go. The image warps to bring the feature under the pointer to the anchor's place, and the map eases so the anchor stays where you let go. Everything else, the streets included, settles around it.
+  - **Dragging a world anchor** keeps the image still and bends the streets around the anchor, as the new warp will. Drag the street onto the image's feature and let go. The image warps to bring the feature under the pointer to the anchor's place, and the map eases so the anchor stays where you let go. The image eases from the old warp to the new and the streets from bent to straight, in step with the map, so the anchor and its feature stay under the pointer the whole way.
   - **Image anchors** are points added with the streets off, drawn as red circles. Dragging one moves the image as before.
   - **Both kinds** are ordinary control points in the same warp. They differ only in which half a drag changes: the image spot for a world anchor, the map place for an image anchor.
 - <kbd>Esc</kbd> during a drag cancels it.
@@ -33,7 +33,7 @@ How the image is fitted depends on the number of control points:
 
 Nudges are offsets on a 256-cell grid over the image, added on top of the points' warp. That warp aims each point at its target minus the nudge there, so points still land exactly.
 
-The warp is evaluated on a 64×64 grid and drawn as a textured mesh in a MapLibre custom WebGL layer, so it updates live while you drag. The export uses the same method on a 256×256 grid.
+The warp is evaluated on a 64×64 grid and drawn as a textured mesh in a MapLibre custom WebGL layer, so it updates live while you drag. When you're zoomed in, the cells in view are split into pieces about 16 screen pixels across, evaluated exactly, and rebuilt whenever the warp changes or the map stops moving. Without that, the image near a control point that was moved a long way could be drawn tens of pixels from the point's marker. The export uses the same method on a 256×256 grid.
 
 ## Georeferencing metadata
 

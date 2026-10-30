@@ -194,11 +194,12 @@ export function brushNudge(n, pos, cx, cy, radius, ddx, ddy) {
 }
 
 // Evaluate the warp on a grid over the image. `cols` cells across; rows are
-// chosen to keep cells roughly square. Positions are absolute Mercator units
-// (Float64) so callers can rebase them before handing them to the GPU.
-export function buildMesh(map, W, H, cols) {
+// chosen to keep cells roughly square unless given. Positions are absolute
+// Mercator units (Float64) so callers can rebase them before handing them to
+// the GPU.
+export function buildMesh(map, W, H, cols, rows = Math.round(cols * H / W)) {
   const nx = Math.max(1, cols);
-  const ny = Math.max(1, Math.round(cols * H / W));
+  const ny = Math.max(1, rows);
   const pos = new Float64Array((nx + 1) * (ny + 1) * 2);
   const uv = new Float32Array((nx + 1) * (ny + 1) * 2);
   let k = 0;
@@ -215,34 +216,67 @@ export function buildMesh(map, W, H, cols) {
   return { pos, uv, nx, ny, W, H };
 }
 
+// A finer grid over cells [i0, i1) × [j0, j1) of `mesh`, each split s × s and
+// evaluated with `map`, for drawing the part of the image in view exactly
+// enough at high zoom. It is a mesh in its own right over that part of the
+// image (pixel u0 + u, v0 + v), with texture coordinates for the whole image.
+export function refineMesh(map, mesh, i0, j0, i1, j1, s) {
+  const { W, H, nx, ny } = mesh;
+  const u0 = W * i0 / nx, v0 = H * j0 / ny;
+  const sw = W * i1 / nx - u0, sh = H * j1 / ny - v0;
+  const sub = buildMesh((u, v) => map(u0 + u, v0 + v), sw, sh, (i1 - i0) * s, (j1 - j0) * s);
+  for (let k = 0; k < sub.uv.length; k += 2) {
+    sub.uv[k] = (u0 + sub.uv[k] * sw) / W;
+    sub.uv[k + 1] = (v0 + sub.uv[k + 1] * sh) / H;
+  }
+  return { mesh: sub, i0, j0, i1, j1, s, u0, v0 };
+}
+
+// Invert the drawn mesh: the refined part first, then the rest.
+export function invertDrawn(mesh, fine, x, y) {
+  if (fine) {
+    const r = invertMesh(fine.mesh, x, y);
+    if (r) return [r[0] + fine.u0, r[1] + fine.v0];
+  }
+  return invertMesh(mesh, x, y);
+}
+
 // Vertex index of grid node (i, j).
 function node(mesh, i, j) {
   return j * (mesh.nx + 1) + i;
 }
 
 // Expand the grid into a flat list of triangles, positions relative to
-// `origin`, as Float32 for upload.
-export function meshTriangles(mesh, origin) {
-  const { nx, ny, pos, uv } = mesh;
-  const count = nx * ny * 6;
+// `origin`, as Float32 for upload. With `fine` (from refineMesh), its cells
+// replace the coarse ones they cover.
+export function meshTriangles(mesh, origin, fine = null) {
+  const covered = (i, j) => fine && i >= fine.i0 && i < fine.i1 && j >= fine.j0 && j < fine.j1;
+  const coarse = mesh.nx * mesh.ny - (fine ? (fine.i1 - fine.i0) * (fine.j1 - fine.j0) : 0);
+  const count = (coarse + (fine ? fine.mesh.nx * fine.mesh.ny : 0)) * 6;
   const p = new Float32Array(count * 2);
   const t = new Float32Array(count * 2);
   let k = 0;
-  const push = (n) => {
-    p[k] = pos[n * 2] - origin[0];
-    p[k + 1] = pos[n * 2 + 1] - origin[1];
-    t[k] = uv[n * 2];
-    t[k + 1] = uv[n * 2 + 1];
-    k += 2;
-  };
-  for (let j = 0; j < ny; j++) {
-    for (let i = 0; i < nx; i++) {
-      const a = node(mesh, i, j), b = node(mesh, i + 1, j);
-      const c = node(mesh, i, j + 1), d = node(mesh, i + 1, j + 1);
-      push(a); push(b); push(c);
-      push(b); push(d); push(c);
+  const emit = (m, skip) => {
+    const { nx, ny, pos, uv } = m;
+    const push = (n) => {
+      p[k] = pos[n * 2] - origin[0];
+      p[k + 1] = pos[n * 2 + 1] - origin[1];
+      t[k] = uv[n * 2];
+      t[k + 1] = uv[n * 2 + 1];
+      k += 2;
+    };
+    for (let j = 0; j < ny; j++) {
+      for (let i = 0; i < nx; i++) {
+        if (skip && skip(i, j)) continue;
+        const a = node(m, i, j), b = node(m, i + 1, j);
+        const c = node(m, i, j + 1), d = node(m, i + 1, j + 1);
+        push(a); push(b); push(c);
+        push(b); push(d); push(c);
+      }
     }
-  }
+  };
+  emit(mesh, covered);
+  if (fine) emit(fine.mesh, null);
   return { positions: p, uvs: t, count };
 }
 
