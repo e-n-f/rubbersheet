@@ -106,12 +106,36 @@ class Georef:
         return float(np.hypot(x[0, -1] - x[0, 0], y[0, -1] - y[0, 0]) / (self.us[-1] - self.us[0]))
 
 
+class ScaledGeoref:
+    """A Georef for the image shrunk by a factor k."""
+
+    def __init__(self, geo, k):
+        self.geo, self.k = geo, k
+        self.W, self.H = int(geo.W // k), int(geo.H // k)
+        self.lng, self.lat, self.lat0 = geo.lng, geo.lat, geo.lat0
+
+    def to_m(self, lng, lat):
+        return self.geo.to_m(lng, lat)
+
+    def from_lnglat(self, lng, lat):
+        u, v = self.geo.from_lnglat(lng, lat)
+        return u / self.k, v / self.k
+
+    def to_lnglat(self, u, v):
+        return self.geo.to_lnglat(np.asarray(u) * self.k, np.asarray(v) * self.k)
+
+    def metres_per_pixel(self):
+        return self.geo.metres_per_pixel() * self.k
+
+
 # ---------------------------------------------------------------------------
 # Linework
 
 
-def extract_ink(rgb, min_extent):
+def extract_ink(rgb, min_extent, mode='usgs'):
     """Boolean mask of black linework."""
+    if mode == 'relative':
+        return drop_small(relative_ink(rgb), min_extent)
     a = rgb.astype(np.float32)
     r, g, b = a[..., 0], a[..., 1], a[..., 2]
     lum = a.mean(-1)
@@ -124,8 +148,33 @@ def extract_ink(rgb, min_extent):
     f = ink.astype(np.float32)
     hue = ndi.gaussian_filter(f * (r - g), 4) / np.maximum(ndi.gaussian_filter(f, 4), 1e-3)
     ink &= hue >= 6
-    # Drop lettering and dots: components smaller than min_extent pixels
-    # in both directions.
+    return drop_small(ink, min_extent)
+
+
+def relative_ink(rgb, dark=0.25):
+    """Neutral (black or brown-black) ink judged against the local paper
+    colour rather than in absolute terms, for maps on strongly tinted paper
+    with coloured parcels: black ink absorbs red, green and blue in about
+    the same proportion, red tints and brown contours absorb green and blue
+    more, blue ink absorbs red more."""
+    a = rgb.astype(np.float32) + 1
+    paper = np.stack([ndi.grey_closing(a[..., c], size=9) for c in range(3)], -1)
+    k = 1 - a / paper
+    total = k.mean(-1)
+    ink = total > dark
+    f = ink.astype(np.float32)
+    w = ndi.gaussian_filter(f, 3)
+
+    def near(x):
+        return ndi.gaussian_filter(f * x, 3) / np.maximum(w, 1e-3)
+    rg = near((k[..., 0] - k[..., 1]) / np.maximum(total, 1e-3))
+    rb = near((k[..., 0] - k[..., 2]) / np.maximum(total, 1e-3))
+    return ink & (np.abs(rg) < 0.25) & (rb > -0.6)
+
+
+def drop_small(ink, min_extent):
+    """Drop lettering and dots: components smaller than min_extent pixels
+    in both directions."""
     lab, n = ndi.label(ink, structure=np.ones((3, 3)))
     keep = np.zeros(n + 1, bool)
     for i, sl in enumerate(ndi.find_objects(lab), 1):
@@ -228,13 +277,19 @@ def sample_lines(lines, geo, spacing):
 class Scorer:
     """Gaussian-truncated chamfer score of points against the ink."""
 
-    def __init__(self, ink, sigma):
+    def __init__(self, ink, sigma, highpass=0):
         self.dist = ndi.distance_transform_edt(~ink).astype(np.float32)
+        self.highpass = highpass
         self.set_sigma(sigma)
 
     def set_sigma(self, sigma):
         self.sigma = sigma
         self.field = np.exp(-self.dist ** 2 / (2 * sigma * sigma)).astype(np.float32)
+        if self.highpass:
+            # Score closeness to ink relative to what's typical nearby, so a
+            # patch dense with unrelated ink (lettering, parcel lines) earns
+            # nothing just for being dense.
+            self.field -= ndi.gaussian_filter(self.field, self.highpass)
 
     def values(self, p):
         return ndi.map_coordinates(self.field, [p[:, 1], p[:, 0]], order=1, mode='constant', cval=0)
@@ -295,7 +350,13 @@ def global_fit(scorer, pts, w, search_px, log):
     for sigma in (4, 2.5):
         scorer.set_sigma(sigma)
         x0 = best if best is not None else np.array([t0[0], t0[1], 0.0, 0.0])
-        f = lambda x: -scorer.score(similarity_apply(x, p, c), ws)
+
+        def f(x):
+            # On a map dense with ink everywhere, shrinking all the vectors
+            # into the densest part can score well and means nothing: keep
+            # scale within 10% and rotation within 5 degrees.
+            over = max(abs(x[2]) - math.log(1.1), 0) + max(abs(x[3]) - math.radians(5), 0)
+            return -scorer.score(similarity_apply(x, p, c), ws) + 100 * over * over
         res = optimize.minimize(f, x0, method='Powell',
                                 options={'xtol': 1e-4, 'ftol': 1e-7, 'maxfev': 4000})
         best = res.x
@@ -633,6 +694,13 @@ def main():
     ap.add_argument('--out', default='out', help='output directory')
     ap.add_argument('--export', help='write the corrected map as a GeoTIFF that rubbersheet opens with '
                     'the control points in place')
+    ap.add_argument('--ink', choices=['usgs', 'relative'], default='usgs',
+                    help='how to find black linework: absolute colour thresholds tuned on USGS topos, '
+                    'or judged against the local paper colour (tinted paper, coloured parcels)')
+    ap.add_argument('--highpass', type=float, default=0,
+                    help='score closeness to ink relative to the neighbourhood within this many metres '
+                    '(for maps dense with ink that isn\'t in the vectors); 0 for off')
+    ap.add_argument('--downsample', type=int, default=1, help='work at 1/N size (the export stays full size)')
     ap.add_argument('--whole-image', action='store_true',
                     help='match over the whole image, for maps that run past their neatline')
     ap.add_argument('--search', type=float, default=600, help='global search radius, metres')
@@ -658,14 +726,26 @@ def main():
     mpp = geo.metres_per_pixel()
     log(f'{os.path.basename(args.tif)}: {geo.W}x{geo.H}, {mpp:.2f} m/px')
 
-    rgb = np.asarray(Image.open(args.tif).convert('RGB'))
+    src = Image.open(args.tif)
+    rgb_full = np.asarray(src.convert('RGB'))
+    geo_full = geo
+    k = args.downsample
+    if k > 1:
+        geo = ScaledGeoref(geo, k)
+        mpp = geo.metres_per_pixel()
+        src = src.reduce(k).crop((0, 0, geo.W, geo.H))
+        log(f'working at 1/{k} size: {geo.W}x{geo.H}, {mpp:.2f} m/px')
+    rgb = np.asarray(src.convert('RGB'))
     if args.whole_image:
         inside = np.zeros(rgb.shape[:2], bool)
         inside[40:-40, 40:-40] = True
+        if 'A' in src.getbands():
+            # A rubbersheet export: only where the image is, away from its edge.
+            inside &= ndi.binary_erosion(np.asarray(src.getchannel('A')) > 0, iterations=40)
     else:
         inside, quad = neatline_mask(geo, rgb.shape[:2])
         log(f'neatline (guessed): {quad}')
-    ink = extract_ink(rgb, min_extent=int(round(500 / mpp))) & inside
+    ink = extract_ink(rgb, min_extent=int(round(500 / mpp)), mode=args.ink) & inside
     log(f'ink: {ink.mean() * 100:.2f}% of pixels')
     Image.fromarray(np.where(ink, 0, 255).astype(np.uint8)).save(os.path.join(args.out, 'ink.png'))
 
@@ -696,7 +776,7 @@ def main():
         w = w / np.maximum(local / np.median(local), 1)
     log(f'vector samples: {len(pts)} ({is_rail.sum()} rail)')
 
-    scorer = Scorer(ink, 4)
+    scorer = Scorer(ink, 4, highpass=args.highpass / mpp)
     params, centre = global_fit(scorer, pts, w, int(args.search / mpp), log)
     gpts = similarity_apply(params, pts, centre)
     log(f'support: {(scorer.dist < 2).mean() * 100:.2f}% of pixels within 2 px of ink')
@@ -735,7 +815,9 @@ def main():
                    controlPoints=cps), open(os.path.join(args.out, 'controlpoints.json'), 'w'), indent=1)
     log(f'wrote {len(cps)} control points')
     if args.export:
-        export_geotiff(args.export, args.tif, rgb, geo, forward, inverse, cps, mpp, log)
+        export_geotiff(args.export, args.tif, rgb_full, geo_full, lambda p: forward(p / k) * k,
+                       lambda q: inverse(q / k) * k,
+                       [dict(cp, pixel=[x * k for x in cp['pixel']]) for cp in cps], mpp / k, log)
 
     # Diagnostics: vectors before (red), after the global fit (green) and
     # after the local field (blue), over the map; and the offsets.
@@ -767,6 +849,7 @@ def main():
 
     if args.reference:
         ref_px, ref_ll = load_reference(args.reference, args.tif, geo)
+        ref_px = ref_px / k
         log(f'evaluation against {len(ref_px)} hand-placed control points:')
         evaluate('original georeferencing', lambda p: geo.to_lnglat(p[:, 0], p[:, 1]), ref_px, ref_ll, geo, log)
 

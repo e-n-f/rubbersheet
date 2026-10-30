@@ -86,6 +86,17 @@ There are no hand-placed points for this sheet, so there is no score. This is a 
 - **Spot checks:** after the full correction, railroads line up at Burbank, Pasadena, San Gabriel / Mission, Puente, Home Junction and along the Los Angeles River downtown. Major roads line up at Santa Monica and Hollywood.
 - **Gaps:** many 1894 lines, like Glendale's railroad, are gone from TIGER. OSM's abandoned-railway tags would add some of them back.
 
+## Results: Woodward & Gamble, Map of the City of Oakland, 1888
+
+This is a photographed wall map with coloured parcels on orange-tan paper. It is not a USGS sheet. The input was a rubbersheet export placed with two control points, so its only georeferencing was a shift, rotation and scale. It needed four things the USGS sheets didn't:
+
+- **`--ink relative`:** judges ink against the local paper colour instead of fixed thresholds. Black ink darkens red, green and blue in about the same proportion; red tints and blue ink don't.
+- **`--highpass 200`:** scores closeness to ink relative to the surrounding 200 m. Otherwise the fit shrank the map to 61%, because pulling every vector into the dense downtown ink (block numbers, parcel lines) scores well.
+- **Global scale and rotation limits:** ±10% and ±5°, kept as soft penalties. A hard-bounded Powell search landed in a worse optimum on Portland.
+- **`--downsample 2`:** the scan is 3 m/px. The export stays full size.
+
+With those, the global fit leaves the two-point placement almost alone: 0.2% scale, 0.2° rotation, about 40 m of shift. The local field adds up to ~100 m, growing toward Alameda, Fruitvale and East Oakland, where the two points give no control. Side-by-side crops show modern streets sitting on the drawn ones there after correction, and not before. Downtown, Berkeley and Emeryville were already about right.
+
 ## Next steps
 
 - **Hydrography.** Extract the blue ink and match it against OSM waterways or NHD flowlines. That would cover marsh and bay margins like #14's, as long as the channel is natural and hasn't been rerouted since.
