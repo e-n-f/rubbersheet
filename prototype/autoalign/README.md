@@ -105,9 +105,23 @@ This is a photographed map with fine brown-black street lines on yellow paper an
 - **After the fix:** the fit adds a 1.2% scale change and ~40 m of shift to the two-point placement, plus up to ~55 m of local correction.
 - **Spot checks:** in side-by-side crops, Potrero's grid moves onto the modern streets, and North Beach and the Western Addition improve. Downtown, near one of the two points, stays where it was. The Presidio and the southern ranchos have too little matching linework to judge.
 
+Scored later against 139 hand-placed points:
+
+| | street-grid core (121 pts) RMS / median | outskirts and coast (18 pts) RMS |
+|---|---|---|
+| Two-point placement | 96 / 86 m | 372 m |
+| Automatic | 69 / 57 m | 303 m |
+| Hand points predicting each other (leave one out) | 39 / 31 m | 126 m |
+
+- **Automatic falls short of the hand alignment.** The map gets some junctions between its clashing grids wrong and miscounts or mislabels some streets, so its distortion has sharp local jumps.
+- **Finer fields didn't help.** Node spacing down to 600 m, cells of 1.2–1.5 km and search radii of 300–400 m all gave a core of 72–77 m. The limit seems to be ambiguity, not resolution: within a regular grid, being off by one street looks almost as good as being right. Telling them apart takes knowing which street is which, which is what local knowledge supplies.
+- **The outskirts miss by 300–600 m.** Those points are Point Lobos, Ocean Beach, Lake Merced and the southeast shore, with no streets near them. Stable stretches of coastline would help there; see below.
+
 ## Next steps
 
 - **Hydrography.** Extract the blue ink and match it against OSM waterways or NHD flowlines. That would cover marsh and bay margins like #14's, as long as the channel is natural and hasn't been rerouted since.
+- **Street names.** Read the map's street labels with OCR and match them against TIGER names. That would anchor each grid to the right streets, which is what's missing in grids like 1861 San Francisco's.
+- **Coastlines, selectively.** Match the edge of the map's water tint against TIGER `areawater`, but only where the modern shore rises steeply inland (cliffs like Lands End), since low flat shores are often fill. The digitized 1850s U.S. Coast Survey shorelines would cover filled shores properly.
 - **Contours against a DEM.** Match the brown linework against contours generated from modern elevation data (3DEP, or Terrarium tiles). Hills don't move, and the eastern third of this sheet is all hills with few roads.
 - **Into the app.** Every step here is simple enough for the browser. Distance transforms, a grid search and L-BFGS on a few thousand unknowns are all fine in JS. Overpass and the OSM API both allow cross-origin requests. An "auto-align" button could propose control points for the user to accept, edit or reject.
 - **Aerial photos.** Matching against vectors needs extracted linework. For old aerials, the counterpart is road segmentation, which is now a standard task for learned models. Alternatively, learned dense matchers can match old aerials directly against modern orthoimagery.
