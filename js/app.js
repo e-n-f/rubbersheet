@@ -861,7 +861,7 @@ function worldStep(d, cursor) {
     off[k * 2] = A[0] * x + A[1] * y + A[2] - (k % nx) * PREVIEW_STEP;
     off[k * 2 + 1] = A[3] * x + A[4] * y + A[5] - Math.floor(k / nx) * PREVIEW_STEP;
   }
-  d.preview = { pts, off };
+  d.preview = { pts, off, cursor };
   drawOverlay();
 }
 
@@ -918,6 +918,14 @@ function endDrag(cancel) {
   state.drag = null;
   document.body.classList.remove('dragging');
   update();
+  if (d.kind === 'world' && !cancel && d.preview) {
+    // Keep the anchor where it was let go: ease the map so its place comes
+    // to the release point, instead of the streets jumping back under it.
+    const q = state.points[d.index];
+    const [sx, sy] = mercToScreen([q.x, q.y]);
+    const [cx, cy] = d.preview.cursor;
+    if (sx !== cx || sy !== cy) map.panBy([sx - cx, sy - cy], { duration: 250 });
+  }
   if (lastPointer) setHover(hitTest(lastPointer), false);
 }
 
