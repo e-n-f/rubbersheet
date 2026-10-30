@@ -315,6 +315,56 @@ export function invertMesh(mesh, x, y) {
   return null;
 }
 
+// The image pixel under each node of a grid of nx × ny nodes, `step` apart
+// from the origin, in the plane that affine A ([a, b, c, d, e, f]) takes the
+// mesh's positions to (screen pixels, say). Each cell is visited once, so
+// this is far quicker than inverting node by node. Returns [u0, v0, u1, ...],
+// NaN where the image isn't.
+export function sampleMesh(mesh, A, nx, ny, step) {
+  const { nx: mx, ny: my, pos, W, H } = mesh;
+  const out = new Float64Array(nx * ny * 2).fill(NaN);
+  const n = pos.length / 2;
+  const sx = new Float64Array(n), sy = new Float64Array(n);
+  for (let k = 0; k < n; k++) {
+    sx[k] = A[0] * pos[k * 2] + A[1] * pos[k * 2 + 1] + A[2];
+    sy[k] = A[3] * pos[k * 2] + A[4] * pos[k * 2 + 1] + A[5];
+  }
+  const tri = (a, b, c, ua, va, ub, vb, uc, vc) => {
+    const ax = sx[a], ay = sy[a], bx = sx[b], by = sy[b], cx = sx[c], cy = sy[c];
+    const det = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
+    if (det === 0) return;
+    const i0 = Math.max(0, Math.ceil(Math.min(ax, bx, cx) / step));
+    const i1 = Math.min(nx - 1, Math.floor(Math.max(ax, bx, cx) / step));
+    const j0 = Math.max(0, Math.ceil(Math.min(ay, by, cy) / step));
+    const j1 = Math.min(ny - 1, Math.floor(Math.max(ay, by, cy) / step));
+    for (let j = j0; j <= j1; j++) {
+      const y = j * step;
+      for (let i = i0; i <= i1; i++) {
+        const k = (j * nx + i) * 2;
+        if (!Number.isNaN(out[k])) continue;
+        const x = i * step;
+        const l1 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / det;
+        const l2 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / det;
+        const l3 = 1 - l1 - l2;
+        if (l1 < -1e-9 || l2 < -1e-9 || l3 < -1e-9) continue;
+        out[k] = l1 * ua + l2 * ub + l3 * uc;
+        out[k + 1] = l1 * va + l2 * vb + l3 * vc;
+      }
+    }
+  };
+  for (let j = 0; j < my; j++) {
+    const v0 = H * j / my, v1 = H * (j + 1) / my;
+    for (let i = 0; i < mx; i++) {
+      const u0 = W * i / mx, u1 = W * (i + 1) / mx;
+      const a = node(mesh, i, j), b = node(mesh, i + 1, j);
+      const c = node(mesh, i, j + 1), d = node(mesh, i + 1, j + 1);
+      tri(a, b, c, u0, v0, u1, v0, u0, v1);
+      tri(b, d, c, u1, v0, u1, v1, u0, v1);
+    }
+  }
+  return out;
+}
+
 // Web Mercator (EPSG:3857) metres <-> MapLibre Mercator units.
 export const EARTH_CIRCUMFERENCE = 2 * Math.PI * 6378137;
 

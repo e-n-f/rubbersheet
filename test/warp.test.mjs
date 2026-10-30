@@ -4,7 +4,7 @@ import {
   applyAffine, fitSimilarity, makeWarp, buildMesh, invertMesh,
   worldFileToAffine, affineToWorldFile, similarityAboutPivot,
   lngToMercX, mercXToLng, latToMercY, mercYToLat,
-  makeNudge, nudgeAt, nudgeIsZero, brushNudge,
+  makeNudge, nudgeAt, nudgeIsZero, brushNudge, sampleMesh,
 } from '../js/warp.js';
 import { addTextChunk, readTextChunks } from '../js/png-text.js';
 import { makeZip, readZip } from '../js/zip.js';
@@ -105,6 +105,33 @@ test('a nudged warp still hits every control point exactly', () => {
       close(x, ex + dx, 1e-14); close(y, ey + dy, 1e-14);
     }
   }
+});
+
+test('sampling a mesh on a grid agrees with inverting it point by point', () => {
+  const T = [1e-6, 2e-7, 0.3, -2e-7, 1e-6, 0.4];
+  const pts = [[0, 0], [1000, 0], [0, 800], [600, 500]].map(([u, v], i) => {
+    const [x, y] = applyAffine(T, u, v);
+    return { u, v, x: x + i * 1e-5, y };
+  });
+  const mesh = buildMesh(makeWarp(T, pts).map, 1000, 800, 32);
+  // A screen-like plane: Mercator units scaled up and shifted.
+  const k = 2e6, A = [k, 0, -0.3 * k + 50, 0, k, -0.4 * k + 50];
+  const nx = 60, ny = 50, step = 40;
+  const out = sampleMesh(mesh, A, nx, ny, step);
+  let inside = 0;
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const x = (i * step - A[2]) / k, y = (j * step - A[5]) / k;
+      const want = invertMesh(mesh, x, y), u = out[(j * nx + i) * 2], v = out[(j * nx + i) * 2 + 1];
+      if (!want) {
+        assert.ok(Number.isNaN(u), `node ${i},${j} should be outside`);
+        continue;
+      }
+      inside++;
+      assert.ok(Math.hypot(u - want[0], v - want[1]) < 1e-6, `node ${i},${j}: ${u},${v} vs ${want}`);
+    }
+  }
+  assert.ok(inside > 100);
 });
 
 test('world file conversion round-trips', () => {

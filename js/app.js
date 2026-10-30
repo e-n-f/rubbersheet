@@ -2,7 +2,7 @@ import {
   applyAffine, affineScale, affineToWorldFile, buildMesh, invertMesh, makeWarp,
   meshBounds, meshCorners, meshOutline, meshTriangles, mercXToLng, mercYToLat,
   EARTH_CIRCUMFERENCE, mercToMeters, similarityAboutPivot, translateAffine, worldFileToAffine,
-  makeNudge, nudgeAt, nudgeIsZero, brushNudge,
+  makeNudge, nudgeAt, nudgeIsZero, brushNudge, sampleMesh,
 } from './warp.js';
 import { addTextChunk, isPNG, readTextChunks } from './png-text.js';
 import { makeZip, readZip } from './zip.js';
@@ -239,7 +239,7 @@ const imageLayer = {
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     // Half see-through while dragging, except when the streets on top are what
     // moves.
-    const see = state.drag && state.drag.kind !== 'streets';
+    const see = state.drag && state.drag.kind !== 'world';
     const opacity = see ? Math.min(0.5, state.opacity) : state.opacity;
     this.renderer.draw(rebaseMatrix(matrix, state.origin[0], state.origin[1]), opacity);
   },
@@ -254,11 +254,11 @@ map.on('style.load', () => {
 // ---------------------------------------------------------------------------
 // Streets on top: the vector base map's road and rail lines lifted above the
 // image as thin bright centrelines to align against. Yellow rather than
-// magenta, which many colour-blind eyes lose. While a control point is
-// dragged they shift with the pointer (see the 'streets' drag).
+// magenta, which many colour-blind eyes lose. Points added while they're on
+// are anchored to the world rather than the image (see the 'world' drag).
 
 const STREET_COLOUR = '#ffe600';
-const STREET_PAINT = ['line-color', 'line-width', 'line-opacity', 'line-translate'];
+const STREET_PAINT = ['line-color', 'line-width', 'line-opacity'];
 let raised = null;  // {order: [all layer ids], ids: [raised], paint: {id: [...]}}
 
 function applyStreets() {
@@ -274,21 +274,25 @@ function applyStreets() {
   }
 }
 
-// Draw the raised lines shifted by [dx, dy] screen pixels.
-function shiftStreets(dx, dy) {
-  if (!raised) return;
-  for (const id of raised.ids) map.setPaintProperty(id, 'line-translate', [dx, dy]);
-}
-
 function streetsRaised() {
   return !!raised;
 }
 
+// Roads and railways, not their casings, footpaths or ferry routes.
+function streetLayerIds() {
+  return (map.getStyle()?.layers || []).filter(l => l.type === 'line' &&
+    l['source-layer'] === 'transportation' && !/casing|path|pedestrian|ferry|aeroway|pier/.test(l.id)).map(l => l.id);
+}
+
+// Hide the raised lines while the overlay draws a bent copy of them.
+function hideStreets(hidden) {
+  if (!raised) return;
+  for (const id of raised.ids) map.setPaintProperty(id, 'line-opacity', hidden ? 0 : 1);
+}
+
 function raiseStreets() {
   const layers = map.getStyle()?.layers || [];
-  // Roads and railways, not their casings, footpaths or ferry routes.
-  const ids = layers.filter(l => l.type === 'line' && l['source-layer'] === 'transportation' &&
-    !/casing|path|pedestrian|ferry|aeroway|pier/.test(l.id)).map(l => l.id);
+  const ids = streetLayerIds();
   if (!ids.length) return false;
   raised = { order: layers.map(l => l.id), ids, paint: {} };
   for (const id of ids) {
@@ -345,14 +349,11 @@ function update() {
   if (!state.image) return;
   const { W, H } = state.image;
   if (state.points.length === 1) {
-    // A single point just rides along with the placement.
+    // A single image anchor just rides along with the placement; a single
+    // world anchor moves the placement to keep its spot on its place.
     const p = state.points[0];
-    [p.x, p.y] = applyAffine(state.T, p.u, p.v);
-    if (state.nudge) {
-      const [dx, dy] = nudgeAt(state.nudge, p.u, p.v);
-      p.x += dx;
-      p.y += dy;
-    }
+    state.T = placementFor(state.T, p, state.nudge);
+    if (!p.world) [p.x, p.y] = placed(state.T, p, state.nudge);
   }
   state.warp = makeWarp(state.T, state.points, state.nudge);
   // Keep the placement in sync, so that removing points back down to one or
@@ -379,6 +380,27 @@ function update() {
   map.triggerRepaint();
   drawOverlay();
   updateUI();
+}
+
+// Where point p's image spot is under placement T (plus any nudge).
+function placed(T, p, nudge) {
+  const [x, y] = applyAffine(T, p.u, p.v);
+  if (!nudge) return [x, y];
+  const [dx, dy] = nudgeAt(nudge, p.u, p.v);
+  return [x + dx, y + dy];
+}
+
+// T, shifted if p is a world anchor so that p's spot lands on its place.
+function placementFor(T, p, nudge) {
+  if (!p.world) return T;
+  const [x, y] = placed(T, p, nudge);
+  return translateAffine(T, p.x - x, p.y - y);
+}
+
+// The warp for a set of points, as update() would make it.
+function warpFor(T, points, nudge) {
+  if (points.length === 1) T = placementFor(T, points[0], nudge);
+  return makeWarp(T, points, nudge);
 }
 
 // Columns for a grid whose longer side has `cells` cells.
@@ -474,21 +496,22 @@ function drawOverlay() {
       parts.push(`<rect class="handle${hover ? ' hover' : ''}" x="${x - 5}" y="${y - 5}" width="10" height="10"/>`);
     });
   }
+  const d = state.drag;
+  if (d && d.kind === 'world' && d.preview) {
+    parts.push(`<path class="bent-streets" d="${bentStreetsPath(d)}"/>`);
+  }
   state.points.forEach((p, i) => {
-    const [x, y] = mercToScreen([p.x, p.y]);
-    const active = state.drag && ['point', 'streets'].includes(state.drag.kind) && state.drag.index === i;
+    const active = d && ['point', 'world'].includes(d.kind) && d.index === i;
+    // A world anchor being dragged rides on its bent street, at the pointer.
+    const [x, y] = active && d.kind === 'world' && d.cursor ? d.cursor : mercToScreen([p.x, p.y]);
     const hover = state.hover && state.hover.kind === 'point' && state.hover.index === i;
-    parts.push(`<g class="cp${active ? ' active' : ''}${hover ? ' hover' : ''}" transform="translate(${x},${y})">` +
-      `<circle class="ring" r="7"/>` +
+    // World anchors are squares, image anchors circles.
+    const ring = p.world ? '<rect class="ring" x="-6.5" y="-6.5" width="13" height="13"/>' : '<circle class="ring" r="7"/>';
+    parts.push(`<g class="cp${p.world ? ' world' : ''}${active ? ' active' : ''}${hover ? ' hover' : ''}" ` +
+      `transform="translate(${x},${y})">${ring}` +
       `<line x1="-4" y1="0" x2="4" y2="0"/><line x1="0" y1="-4" x2="0" y2="4"/>` +
       `<text x="10" y="-8">${i + 1}</text></g>`);
   });
-  const d = state.drag;
-  if (d && d.kind === 'streets' && d.index < 0 && lastPointer) {
-    // The new point: the part of the image under the pointer.
-    parts.push(`<g class="cp active" transform="translate(${lastPointer[0]},${lastPointer[1]})">` +
-      `<circle class="ring" r="7"/><line x1="-4" y1="0" x2="4" y2="0"/><line x1="0" y1="-4" x2="0" y2="4"/></g>`);
-  }
   const brushing = state.drag && state.drag.kind === 'nudge';
   if (lastPointer && (brushing || (state.altHeld && !state.drag))) {
     const [x, y] = lastPointer;
@@ -602,21 +625,26 @@ container.addEventListener('pointerdown', (e) => {
     return;
   }
 
-  // With the streets on top, dragging a control point moves the streets
-  // rather than the image, and ⌘-dragging the image does that for a new
-  // point. A ⌘-click that doesn't move still just adds a point in place.
-  if (streetsRaised() && (isCommand(e) ? hit.kind === 'image' : hit.kind === 'point')) {
-    state.drag = {
-      kind: 'streets',
-      token: checkpoint(),
-      index: hit.kind === 'point' ? hit.index : -1,
-      s0: p,
-      shift: [0, 0],
-      T0: state.T.slice(),
-      pts0: state.points.map(q => ({ ...q })),
-    };
+  // World anchors: dragging one bends the streets, not the image, and
+  // ⌘-clicking the image with the streets on top adds one (and drags it).
+  const grabWorld = hit.kind === 'point' && !isCommand(e) && state.points[hit.index].world;
+  const addWorld = isCommand(e) && hit.kind === 'image' && streetsRaised();
+  if (grabWorld || addWorld) {
+    const token = checkpoint();
+    let index = hit.index, offset = [0, 0];
+    if (addWorld) {
+      state.points.push({ u: hit.uv[0], v: hit.uv[1], x: hit.merc[0], y: hit.merc[1], world: true });
+      index = state.points.length - 1;
+      update();
+    } else {
+      const q = state.points[index];
+      const [sx, sy] = mercToScreen([q.x, q.y]);
+      offset = [sx - p[0], sy - p[1]];
+    }
+    state.drag = startWorldDrag(index, token, offset);
     document.body.classList.add('dragging');
     map.getCanvas().style.cursor = 'grabbing';
+    hideStreets(true);
     drawOverlay();
     return;
   }
@@ -703,10 +731,8 @@ window.addEventListener('pointermove', (e) => {
     nudgeStep(d, m, lastPointer);
     return;
   }
-  if (d.kind === 'streets') {
-    d.shift = [lastPointer[0] - d.s0[0], lastPointer[1] - d.s0[1]];
-    shiftStreets(...d.shift);
-    drawOverlay();
+  if (d.kind === 'world') {
+    worldStep(d, [lastPointer[0] + d.offset[0], lastPointer[1] + d.offset[1]]);
     return;
   }
   const dx = m[0] - d.m0[0], dy = m[1] - d.m0[1];
@@ -763,34 +789,121 @@ function nudgeStep(d, m, screen) {
   update();
 }
 
-// The streets were drawn shifted by d.shift: pin the image under where a
-// street was dragged to that street's real place.
-function finishStreetsDrag(d) {
-  const [dx, dy] = d.shift;
-  if (d.index >= 0) {
-    const q = state.points[d.index];
-    const [sx, sy] = mercToScreen([q.x, q.y]);
-    const [nx, ny] = screenToMerc([sx - dx, sy - dy]);
-    // A lone point rides on the placement, so move that.
-    if (state.points.length === 1) state.T = translateAffine(state.T, nx - q.x, ny - q.y);
-    q.x = nx;
-    q.y = ny;
-    return;
+// ---------------------------------------------------------------------------
+// World anchors. Dragging one keeps the image still and bends the streets:
+// a screen grid records which image pixel lies under each node; as the
+// anchor moves, each node's offset is how far the new warp would carry that
+// pixel, and the streets are drawn shifted back by it, so they show where
+// they'll sit against the image once the drag is released.
+
+const PREVIEW_STEP = 24;  // screen px between grid nodes
+
+// Affine from Mercator units to screen pixels (exact: no pitch).
+function mercToScreenAffine() {
+  const c = screenToMerc([0, 0]);
+  const e = 1e-6;
+  const [x0, y0] = mercToScreen(c);
+  const [x1, y1] = mercToScreen([c[0] + e, c[1]]);
+  const [x2, y2] = mercToScreen([c[0], c[1] + e]);
+  const a = (x1 - x0) / e, b = (x2 - x0) / e, d = (y1 - y0) / e, f = (y2 - y0) / e;
+  return [a, b, x0 - a * c[0] - b * c[1], d, f, y0 - d * c[0] - f * c[1]];
+}
+
+function startWorldDrag(index, token, offset) {
+  const canvas = map.getCanvas();
+  const nx = Math.ceil(canvas.clientWidth / PREVIEW_STEP) + 1;
+  const ny = Math.ceil(canvas.clientHeight / PREVIEW_STEP) + 1;
+  const A = mercToScreenAffine();
+  // The visible streets, as screen polylines.
+  const ids = streetLayerIds().filter(id => map.getLayer(id));
+  const streets = [];
+  for (const f of ids.length ? map.queryRenderedFeatures({ layers: ids }) : []) {
+    const g = f.geometry;
+    const lines = g.type === 'LineString' ? [g.coordinates] : g.type === 'MultiLineString' ? g.coordinates : [];
+    for (const line of lines) {
+      const pts = new Float64Array(line.length * 2);
+      line.forEach(([lng, lat], k) => {
+        const [mx, my] = toMerc({ lng, lat });
+        pts[k * 2] = A[0] * mx + A[1] * my + A[2];
+        pts[k * 2 + 1] = A[3] * mx + A[4] * my + A[5];
+      });
+      streets.push(pts);
+    }
   }
-  const m = screenToMerc([d.s0[0] + dx, d.s0[1] + dy]);
-  const uv = invertMesh(state.mesh, m[0], m[1]);
-  if (!uv) return;
-  const target = screenToMerc(d.s0);
-  state.points.push({ u: uv[0], v: uv[1], x: target[0], y: target[1] });
+  return {
+    kind: 'world', index, token, offset,
+    T0: state.T.slice(),
+    pts0: state.points.map(q => ({ ...q })),
+    mesh: state.mesh,
+    A, nx, ny,
+    under: sampleMesh(state.mesh, A, nx, ny, PREVIEW_STEP),
+    streets,
+    preview: null,
+    cursor: null,
+  };
+}
+
+function worldStep(d, cursor) {
+  d.cursor = cursor;
+  const m = screenToMerc(cursor);
+  const uv = invertMesh(d.mesh, m[0], m[1]);
+  if (!uv) return;  // Off the image: keep the last good preview.
+  const pts = d.pts0.map(q => ({ ...q }));
+  pts[d.index].u = uv[0];
+  pts[d.index].v = uv[1];
+  const warp = warpFor(d.T0, pts, state.nudge);
+  const { A, nx, ny, under } = d;
+  const off = new Float64Array(nx * ny * 2);
+  for (let k = 0; k < nx * ny; k++) {
+    const u = under[k * 2];
+    if (Number.isNaN(u)) continue;
+    const [x, y] = warp.map(u, under[k * 2 + 1]);
+    off[k * 2] = A[0] * x + A[1] * y + A[2] - (k % nx) * PREVIEW_STEP;
+    off[k * 2 + 1] = A[3] * x + A[4] * y + A[5] - Math.floor(k / nx) * PREVIEW_STEP;
+  }
+  d.preview = { pts, off };
+  drawOverlay();
+}
+
+// The streets bent by the preview: a street at screen v is drawn at q with
+// q + off(q) = v (the image pixel at q will move to v), found by iterating.
+function bentStreetsPath(d) {
+  const { nx, ny } = d, { off } = d.preview;
+  const at = (x, y) => {
+    const fx = Math.min(Math.max(x / PREVIEW_STEP, 0), nx - 1.000001);
+    const fy = Math.min(Math.max(y / PREVIEW_STEP, 0), ny - 1.000001);
+    const i = Math.floor(fx), j = Math.floor(fy), a = fx - i, b = fy - j;
+    const k = (j * nx + i) * 2, k2 = k + nx * 2;
+    const w = [(1 - a) * (1 - b), a * (1 - b), (1 - a) * b, a * b];
+    return [
+      w[0] * off[k] + w[1] * off[k + 2] + w[2] * off[k2] + w[3] * off[k2 + 2],
+      w[0] * off[k + 1] + w[1] * off[k + 3] + w[2] * off[k2 + 1] + w[3] * off[k2 + 3],
+    ];
+  };
+  const out = [];
+  for (const line of d.streets) {
+    for (let k = 0; k < line.length; k += 2) {
+      const vx = line[k], vy = line[k + 1];
+      let qx = vx, qy = vy;
+      for (let it = 0; it < 3; it++) {
+        const [ox, oy] = at(qx, qy);
+        qx = vx - ox;
+        qy = vy - oy;
+      }
+      out.push(`${k ? 'L' : 'M'}${qx.toFixed(1)},${qy.toFixed(1)}`);
+    }
+  }
+  return out.join('');
 }
 
 function endDrag(cancel) {
   const d = state.drag;
   swallowing = false;
   if (!d) return;
-  if (d.kind === 'streets') {
-    shiftStreets(0, 0);
-    if (!cancel) finishStreetsDrag(d);
+  if (d.kind === 'world') {
+    hideStreets(false);
+    // The image spot under the pointer goes to the anchor's place.
+    if (!cancel && d.preview) state.points = d.preview.pts;
   }
   if (cancel) {
     state.T = d.T0;
@@ -805,11 +918,6 @@ function endDrag(cancel) {
   state.drag = null;
   document.body.classList.remove('dragging');
   update();
-  // Pan along with the drag, so the streets stay where they were dropped and
-  // the newly pinned part of the image stays under the pointer.
-  if (d.kind === 'streets' && !cancel && (d.shift[0] || d.shift[1])) {
-    map.panBy([-d.shift[0], -d.shift[1]], { duration: 0 });
-  }
   if (lastPointer) setHover(hitTest(lastPointer), false);
 }
 
@@ -1061,7 +1169,7 @@ function placementFromMetadata(text, W, H) {
   const T = worldFileToAffine(meta.worldFile);
   const points = (meta.controlPoints || []).map(cp => {
     const [x, y] = toMerc({ lng: cp.lngLat[0], lat: cp.lngLat[1] });
-    return { u: cp.pixel[0], v: cp.pixel[1], x, y };
+    return { u: cp.pixel[0], v: cp.pixel[1], x, y, ...(cp.anchor === 'world' ? { world: true } : {}) };
   });
   return { T, points };
 }
@@ -1332,7 +1440,10 @@ function exportMetadata(crs, ow, oh, worldFile, bounds, toPixel) {
     source: { name, width: W, height: H },
     controlPoints: state.points.map(p => {
       const ll = toLngLat([p.x, p.y]);
-      return { pixel: toPixel(p.x, p.y), sourcePixel: [p.u, p.v], lngLat: [ll.lng, ll.lat] };
+      return {
+        pixel: toPixel(p.x, p.y), sourcePixel: [p.u, p.v], lngLat: [ll.lng, ll.lat],
+        ...(p.world ? { anchor: 'world' } : {}),
+      };
     }),
   };
 }
