@@ -78,6 +78,14 @@ There are no hand-placed points for this sheet, so there is no score. This is a 
 - **Spot checks:** after the full correction, modern railroads sit on the drawn ones at Brighton, Box Elder, Magnolia, Petersburg and the downtown yards.
 - **One visible miss:** Brighton's east–west road lies about 125 m north of the drawn one. It might be a mapping error on the old sheet or a road that has since moved.
 
+## Results: USGS Los Angeles 1894, 1:62,500
+
+There are no hand-placed points for this sheet, so there is no score. This is a double-width sheet (30′ × 15′, 9692 × 6254 px), run with TIGER roads for Los Angeles County plus rails.
+
+- **Global fit:** the drawing sits about 210 m west and 165 m south of where the original georeferencing puts its features, with essentially no rotation and a 0.14% scale change. That is the same direction as Haywards and Portland, a little larger.
+- **Spot checks:** after the full correction, railroads line up at Burbank, Pasadena, San Gabriel / Mission, Puente, Home Junction and along the Los Angeles River downtown. Major roads line up at Santa Monica and Hollywood.
+- **Gaps:** many 1894 lines, like Glendale's railroad, are gone from TIGER. OSM's abandoned-railway tags would add some of them back.
+
 ## Next steps
 
 - **Hydrography.** Extract the blue ink and match it against OSM waterways or NHD flowlines. That would cover marsh and bay margins like #14's, as long as the channel is natural and hasn't been rerouted since.
