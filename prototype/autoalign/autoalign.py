@@ -343,9 +343,84 @@ class Field:
         return sparse.csr_matrix((v, (r, c)), shape=(self.n, self.n))
 
 
-def field_fit(scorer, pts, w, spacing, smooth, log, sigmas=(6, 4, 2.5)):
+def cell_search(scorer, pts, w, cell, radius, sigma=4, min_points=300):
+    """Brute-force best translation in overlapping cells. Gradient steps
+    from the global fit can stall half a block out in a city grid; an
+    exhaustive search can't. Returns [(centre, offset, information)], where
+    information is the 2x2 curvature of the score at the peak, scaled by
+    the cell's weight: large across a lone straight road, small along it."""
+    scorer.set_sigma(sigma)
+    H, Wd = scorer.field.shape
+    half = cell // 2
+    out = []
+    for cv in range(half // 2, H, half):
+        for cu in range(half // 2, Wd, half):
+            m = (np.abs(pts[:, 0] - cu) < half) & (np.abs(pts[:, 1] - cv) < half)
+            if m.sum() < min_points:
+                continue
+            ts, surf = scorer.translation_surface(pts[m], radius, w=w[m])
+            a, b = np.unravel_index(np.argmax(surf), surf.shape)
+            if not (2 <= a < len(ts) - 2 and 2 <= b < len(ts) - 2):
+                continue  # Best at the edge of the search: no real peak.
+            win = surf[a - 2:a + 3, b - 2:b + 3].astype(float)
+            yy, xx = np.mgrid[-2:3, -2:3]
+            A = np.stack([np.ones(25), xx.ravel(), yy.ravel(), xx.ravel() ** 2,
+                          (xx * yy).ravel(), yy.ravel() ** 2], -1)
+            q, *_ = np.linalg.lstsq(A, win.ravel(), rcond=None)
+            info = -np.array([[2 * q[3], q[4]], [q[4], 2 * q[5]]])
+            ev, vec = np.linalg.eigh(info)
+            ev = np.maximum(ev, 0)
+            if ev.max() <= 0:
+                continue
+            sub = np.linalg.lstsq(info, q[1:3], rcond=None)[0] if ev.min() > 0 else np.zeros(2)
+            # Relative to the peak's height above the surface's floor, so a
+            # cell full of unrelated modern streets counts for less.
+            contrast = max(float(surf[a, b] - np.median(surf)), 0)
+            info = (vec * ev) @ vec.T * w[m].sum() * contrast / max(float(surf[a, b]), 1e-6)
+            out.append((np.array([cu, cv], float), np.array([ts[b], ts[a]], float) + np.clip(sub, -1, 1), info))
+    return out
+
+
+def field_from_cells(F, cells, smooth, ridge=0.05):
+    """Node offsets fitted to the cell offsets, weighted by each cell's
+    information matrix, with a Laplacian smoothness term, a weak pull toward
+    zero (the global fit) so the field fades out rather than extrapolating
+    across empty water or marsh, and a few rounds of reweighting so that
+    cells disagreeing with their neighbours (a wrong peak) lose their say."""
+    from scipy import sparse
+    from scipy.sparse.linalg import spsolve
+    if not cells:
+        return np.zeros(2 * F.n)
+    C = np.array([c for c, _, _ in cells])
+    O = np.array([o for _, o, _ in cells])
+    I = np.array([i for _, _, i in cells])
+    I = I / np.median(np.trace(I, axis1=1, axis2=2))
+    Bc = F.basis(C)
+    L = F.laplacian()
+    LtL = L.T @ L
+    robust = np.ones(len(cells))
+    for _ in range(5):
+        Iw = I * robust[:, None, None]
+        # Normal equations for x = [du; dv].
+        Duu, Duv, Dvv = (sparse.diags(Iw[:, 0, 0]), sparse.diags(Iw[:, 0, 1]), sparse.diags(Iw[:, 1, 1]))
+        Auu = Bc.T @ Duu @ Bc + smooth * LtL
+        Avv = Bc.T @ Dvv @ Bc + smooth * LtL
+        Auv = Bc.T @ Duv @ Bc
+        A = sparse.bmat([[Auu, Auv], [Auv, Avv]]).tocsc() + ridge * sparse.identity(2 * F.n)
+        rhs = np.concatenate([Bc.T @ (Iw[:, 0, 0] * O[:, 0] + Iw[:, 0, 1] * O[:, 1]),
+                              Bc.T @ (Iw[:, 0, 1] * O[:, 0] + Iw[:, 1, 1] * O[:, 1])])
+        x = spsolve(A, rhs)
+        r = O - np.stack([Bc @ x[:F.n], Bc @ x[F.n:]], -1)
+        # Residual along each cell's well-determined directions, in px.
+        rr = np.sqrt(np.einsum('ni,nij,nj->n', r, I, r) / np.maximum(np.trace(I, axis1=1, axis2=2), 1e-9) * 2)
+        robust = np.where(rr < 3, 1.0, 3 / np.maximum(rr, 1e-9)) ** 2  # Cauchy-ish
+    return x
+
+
+def field_fit(scorer, pts, w, spacing, smooth, log, sigmas=(4, 2.5), cell=None, radius=None, cell_smooth=1.0):
     """Offsets on a node grid that maximise the chamfer score of the points
-    plus `smooth` x the squared Laplacian of the offsets (per node, in px)."""
+    plus `smooth` x the squared Laplacian of the offsets (per node, in px).
+    Starts from per-cell brute-force offsets when `cell` is given."""
     H, Wd = scorer.field.shape
     F = Field(Wd, H, spacing)
     B = F.basis(pts)
@@ -353,6 +428,11 @@ def field_fit(scorer, pts, w, spacing, smooth, log, sigmas=(6, 4, 2.5)):
     LtL = (L.T @ L).tocsr()
     wn = w / w.sum()
     x = np.zeros(2 * F.n)
+    if cell:
+        cells = cell_search(scorer, pts, w, cell, radius)
+        x = field_from_cells(F, cells, cell_smooth)
+        m0 = np.hypot(x[:F.n], x[F.n:])
+        log(f'cells: {len(cells)} searched ({cell} px, +-{radius} px); initial field up to {m0.max():.1f} px')
     for sigma in sigmas:
         scorer.set_sigma(sigma)
         gy, gx = np.gradient(scorer.field)
@@ -557,6 +637,14 @@ def main():
                     help='match over the whole image, for maps that run past their neatline')
     ap.add_argument('--search', type=float, default=600, help='global search radius, metres')
     ap.add_argument('--spacing', type=float, default=1500, help='node spacing of the local offset field, metres')
+    ap.add_argument('--density-weight', action='store_true',
+                    help='weight vector samples down where vectors are dense (city grids)')
+    ap.add_argument('--cell', type=float, default=2500,
+                    help='cell size (metres) for the brute-force local search; 0 to skip it')
+    ap.add_argument('--cell-radius', type=float, default=200, help='local search radius, metres')
+    ap.add_argument('--cell-smooth', type=float, default=1.0, help='smoothness when fitting the field to the cells')
+    ap.add_argument('--sigmas', default='4,2.5',
+                    help='coarse-to-fine matching tolerances (px) for the local field')
     ap.add_argument('--smooth', type=float, default=0.01, help='weight of the local field\'s smoothness')
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -595,13 +683,27 @@ def main():
     pts, is_rail, ids = pts[m], is_rail[m], ids[m]
     # Railroads are the most persistent features; weight them up.
     w = np.where(is_rail, 3.0, 1.0)
+    if args.density_weight:
+        # Dense street grids match an old map's grids about equally well at
+        # many offsets; let a crowded neighbourhood count for about as much
+        # as a lone road through it.
+        b = 16
+        hist = np.zeros((geo.H // b + 1, geo.W // b + 1))
+        np.add.at(hist, (iv[m] // b, iu[m] // b), 1)
+        dens = ndi.gaussian_filter(hist, 2) * 2 * math.pi * 4  # samples within ~2 bins
+        local = dens[(pts[:, 1] // b).astype(int).clip(0, hist.shape[0] - 1),
+                     (pts[:, 0] // b).astype(int).clip(0, hist.shape[1] - 1)]
+        w = w / np.maximum(local / np.median(local), 1)
     log(f'vector samples: {len(pts)} ({is_rail.sum()} rail)')
 
     scorer = Scorer(ink, 4)
     params, centre = global_fit(scorer, pts, w, int(args.search / mpp), log)
     gpts = similarity_apply(params, pts, centre)
     log(f'support: {(scorer.dist < 2).mean() * 100:.2f}% of pixels within 2 px of ink')
-    warp_field, F, _ = field_fit(scorer, gpts, w, spacing=int(args.spacing / mpp), smooth=args.smooth, log=log)
+    warp_field, F, _ = field_fit(scorer, gpts, w, spacing=int(args.spacing / mpp), smooth=args.smooth, log=log,
+                                 sigmas=[float(x) for x in args.sigmas.split(',')],
+                                 cell=int(args.cell / mpp) if args.cell else None,
+                                 radius=int(args.cell_radius / mpp), cell_smooth=args.cell_smooth)
 
     # The full model takes original pixel p (where a feature's true location
     # falls under the original georeferencing) to map pixel q (where it's

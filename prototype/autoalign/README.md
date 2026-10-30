@@ -7,7 +7,11 @@ An experiment, not part of the site: does matching a georeferenced scan's black 
 1. It extracts the black linework (roads, railroads, town grids). These are pixels darker than the paper around them and redder than green after averaging over nearby ink. That leaves out brown contours, blue drainage, shorelines and marsh hatching. Lettering and dots are dropped as small connected components.
 2. It projects TIGER/Line or OpenStreetMap roads and railroads into the image using the file's own georeferencing (`georef.mjs` uses rubbersheet's TIFF reader and projections). It leaves out freeways, ramps, service roads and paths, which are almost always later additions. Railroads are weighted 3×.
 3. It fits a global similarity (shift, rotation, scale) that lays the vectors on the linework, by maximising a truncated chamfer score, mean exp(−d²/2σ²), where d is the distance to the nearest ink. Modern roads that aren't on the old map score near zero wherever they land, so they add noise but don't pull the fit. The search runs coarse to fine: a grid search over shifts within ±600 m, then Powell over all four parameters.
-4. It fits a smooth local offset field on a grid of nodes (1.5 km apart by default) to all vector points at once, with L-BFGS, plus a penalty on the field's curvature.
+4. It fits a smooth local offset field on a grid of nodes, 1.5 km apart by default, in two stages:
+   - **Brute force per cell.** It searches every shift within ±200 m for the best fit in overlapping 2.5 km cells. Each cell's result is weighted by how sharply the score peaks in each direction: a lone straight road pins the shift across it but not along it. The field is then fitted through those shifts with a smoothness penalty. It also has a weak pull back to the global fit, so it fades out over empty water instead of extrapolating. Cells that disagree with their neighbours lose weight over a few rounds.
+   - **Refinement.** It refines the field against all the vector points at once with L-BFGS, plus a penalty on the field's curvature.
+
+   The brute-force stage is needed for city grids. Starting gradient steps from the global fit can stall half a block out, because the grid lines still partly overlap there.
 5. It writes control points (`pixel` in the original image → true `lngLat`) on a grid wherever linework supports them, along with these diagnostics:
    - `ink.png`: the extracted linework
    - `before.jpg`, `global.jpg`, `local.jpg`: the vectors drawn over the map after each step
@@ -41,7 +45,7 @@ These are compared against 23 hand-placed control points, given as distance from
 | Original georeferencing | 225 m | 233 m | 277 m |
 | Global similarity (TIGER) | 44 m | 31 m | 124 m |
 | Similarity + smooth field (TIGER) | 42 m | 29 m | 122 m |
-| Similarity + smooth field (OSM) | 42 m | 26 m | 115 m |
+| Similarity + smooth field (OSM, before the per-cell search was added) | 42 m | 26 m | 115 m |
 | Hand points predicting each other (leave one out) | 42 m | 29 m | 133 m |
 
 - **Most of the error is global.** The original placement is off by a near-uniform ~220 m (120 m east, 183 m north) with a slight rotation. The automatic fit finds that without any human input: the coarse search lands within a few pixels of the final shift.
@@ -52,11 +56,19 @@ These are compared against 23 hand-placed control points, given as distance from
 
 ## Results: USGS Portland 1897, 1:62,500
 
-There are no hand-placed points for this sheet, so there is no score. The sheet runs west of its nominal 7.5′ frame to take in the Willamette–Columbia confluence. Run it with `--whole-image`, or the neatline guess crops off that strip. With TIGER (Multnomah, Clark, Washington and Clackamas roads, plus rails):
+The sheet runs west of its nominal 7.5′ frame to take in the Willamette–Columbia confluence. Run it with `--whole-image`, or the neatline guess crops off that strip. These results use TIGER (Multnomah, Clark, Washington and Clackamas roads, plus rails), compared against 119 hand-placed control points:
 
-- **Global fit:** the drawing sits about 180 m west and 125 m south of where the original georeferencing puts its features, with a 0.08° rotation and a 0.15% scale change. That is the same direction and size as the Haywards error.
-- **Robustness:** the result is the same to within a pixel or two whether or not the western strip is included.
-- **Spot checks:** the corrected railroads and major roads sit on the drawn ones.
+| | RMS | median | max |
+|---|---|---|---|
+| Original georeferencing | 226 m | 219 m | 322 m |
+| Global similarity | 42 m | 30 m | 126 m |
+| Similarity + gradient-only field (no per-cell search) | 40 m | 26 m | 130 m |
+| Similarity + per-cell search + field | 33 m | 24 m | 94 m |
+| Hand points predicting each other (leave one out) | 32 m | 25 m | 74 m |
+
+- **Global fit:** the drawing sits about 180 m west and 125 m south of where the original georeferencing puts its features. The hand points say 186 m and 122 m. That is the same direction and size as the Haywards error.
+- **Without the per-cell search:** downtown's small blocks were fine. The misses were in St. Johns and University Park. There the drawn grid is offset about 70 m (about one block) from the global fit, and the gradient-only field stopped half a block short.
+- **With it:** 14 hand points improve by more than 20 m and none get worse by that much. The worst remaining points, 13 and 14 near St. Johns, are also the ones the other hand points predict worst.
 
 ## Next steps
 
