@@ -48,6 +48,14 @@ These are compared against 23 hand-placed control points, given as distance from
 - **The worst point (#14)** is a slough junction in the San Mateo marshes, with no roads within kilometres. Only hydrography could pin it; see below.
 - **The next-worst (#8)** may be a misplaced hand point. It is also the one the other hand points predict worst.
 
+## Results: USGS Portland 1897, 1:62,500
+
+There are no hand-placed points for this sheet, so there is no score. The sheet runs west of its nominal 7.5′ frame to take in the Willamette–Columbia confluence. Run it with `--whole-image`, or the neatline guess crops off that strip. With TIGER (Multnomah, Clark, Washington and Clackamas roads, plus rails):
+
+- **Global fit:** the drawing sits about 180 m west and 125 m south of where the original georeferencing puts its features, with a 0.08° rotation and a 0.15% scale change. That is the same direction and size as the Haywards error.
+- **Robustness:** the result is the same to within a pixel or two whether or not the western strip is included.
+- **Spot checks:** the corrected railroads and major roads sit on the drawn ones.
+
 ## Next steps
 
 - **Hydrography.** Extract the blue ink and match it against OSM waterways or NHD flowlines. That would cover marsh and bay margins like #14's, as long as the channel is natural and hasn't been rerouted since.

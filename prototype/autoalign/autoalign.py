@@ -479,6 +479,8 @@ def main():
     ap.add_argument('--osm', help='OSM ways JSON from fetch_osm.py')
     ap.add_argument('--reference', help='rubbersheet export with hand-placed control points, to evaluate against')
     ap.add_argument('--out', default='out', help='output directory')
+    ap.add_argument('--whole-image', action='store_true',
+                    help='match over the whole image, for maps that run past their neatline')
     ap.add_argument('--search', type=float, default=600, help='global search radius, metres')
     ap.add_argument('--spacing', type=float, default=1500, help='node spacing of the local offset field, metres')
     ap.add_argument('--smooth', type=float, default=0.01, help='weight of the local field\'s smoothness')
@@ -495,8 +497,12 @@ def main():
     log(f'{os.path.basename(args.tif)}: {geo.W}x{geo.H}, {mpp:.2f} m/px')
 
     rgb = np.asarray(Image.open(args.tif).convert('RGB'))
-    inside, quad = neatline_mask(geo, rgb.shape[:2])
-    log(f'neatline (guessed): {quad}')
+    if args.whole_image:
+        inside = np.zeros(rgb.shape[:2], bool)
+        inside[40:-40, 40:-40] = True
+    else:
+        inside, quad = neatline_mask(geo, rgb.shape[:2])
+        log(f'neatline (guessed): {quad}')
     ink = extract_ink(rgb, min_extent=int(round(500 / mpp))) & inside
     log(f'ink: {ink.mean() * 100:.2f}% of pixels')
     Image.fromarray(np.where(ink, 0, 255).astype(np.uint8)).save(os.path.join(args.out, 'ink.png'))
