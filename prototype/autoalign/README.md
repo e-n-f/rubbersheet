@@ -70,6 +70,14 @@ The sheet runs west of its nominal 7.5′ frame to take in the Willamette–Colu
 - **Without the per-cell search:** downtown's small blocks were fine. The misses were in St. Johns and University Park. There the drawn grid is offset about 70 m (about one block) from the global fit, and the gradient-only field stopped half a block short.
 - **With it:** 14 hand points improve by more than 20 m and none get worse by that much. The worst remaining points, 13 and 14 near St. Johns, are also the ones the other hand points predict worst.
 
+## Results: USGS East Denver 1890, 1:125,000
+
+There are no hand-placed points for this sheet, so there is no score. This is a 30′ sheet at about 10.6 m per pixel. Run with `--search 1500` in case the error is larger at this scale, and with TIGER roads for the eight counties it touches, plus rails.
+
+- **Global fit:** the drawing sits about 370 m east and 120 m north of where the original georeferencing puts its features, with a 0.17° rotation. That is larger than the two West Coast sheets and in roughly the opposite direction.
+- **Spot checks:** after the full correction, modern railroads sit on the drawn ones at Brighton, Box Elder, Magnolia, Petersburg and the downtown yards.
+- **One visible miss:** Brighton's east–west road lies about 125 m north of the drawn one. It might be a mapping error on the old sheet or a road that has since moved.
+
 ## Next steps
 
 - **Hydrography.** Extract the blue ink and match it against OSM waterways or NHD flowlines. That would cover marsh and bay margins like #14's, as long as the channel is natural and hasn't been rerouted since.
