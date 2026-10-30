@@ -106,7 +106,7 @@ kbd {
   background: #f5f6f7;
 }
 
-.cp circle.ring { fill: #e5382b; stroke: #fff; stroke-width: 2; }
+.cp .ring { fill: #e5382b; stroke: #fff; stroke-width: 2; }
 .cp line { stroke: #fff; stroke-width: 1.5; }
 .cp text {
   font: 600 11px system-ui, sans-serif;
@@ -115,8 +115,16 @@ kbd {
   stroke: #000;
   stroke-width: 3px;
 }
-.cp.active circle.ring { fill: #ff9d00; }
-.cp.hover circle.ring { stroke: #ffe46b; }
+.cp.active .ring { fill: #ff9d00; }
+.cp.hover .ring { stroke: #ffe46b; }
+.cp.world .ring { fill: #1a62c4; }
+.cp.world.active .ring { fill: #ff9d00; }
+.bent-streets {
+  fill: none;
+  stroke: #ffe600;
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+}
 .outline {
   fill: none;
   stroke: #1a62c4;

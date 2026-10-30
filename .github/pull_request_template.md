@@ -1,2 +1,1 @@
-**Try it:** https://raw.githack.com/e-n-f/rubbersheet/BRANCH/index.html (replace BRANCH with this PR's branch name; if a change doesn't show up, use ⌘⇧R to reload)
-
+**Try it:** https://raw.githack.com/e-n-f/rubbersheet/SHA/index.html (replace SHA with this PR's head commit, for example from `git rev-parse --short HEAD`; links by commit don't serve stale cached files the way branch links can)

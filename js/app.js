@@ -2,6 +2,7 @@ import {
   applyAffine, affineScale, affineToWorldFile, buildMesh, invertMesh, makeWarp,
   meshBounds, meshCorners, meshOutline, meshTriangles, mercXToLng, mercYToLat,
   EARTH_CIRCUMFERENCE, mercToMeters, similarityAboutPivot, translateAffine, worldFileToAffine,
+  sampleMesh, refineMesh, invertDrawn, refinedSoup,
 } from './warp.js';
 import { addTextChunk, isPNG, readTextChunks } from './png-text.js';
 import { makeZip, readZip } from './zip.js';
@@ -44,10 +45,13 @@ const state = {
   points: [],       // [{u, v, x, y}] image px -> Mercator target
   warp: null,       // {map, S}
   mesh: null,       // display mesh
+  fine: null,       // finer patch of it over the part in view (refineMesh)
   origin: [0, 0],   // GPU rebasing origin for the display mesh
   drag: null,
   hover: null,
   opacity: 1,
+  streetsOnTop: false,
+  ease: null,       // a world anchor's release in progress (easeWorldRelease)
 };
 
 const $ = (id) => document.getElementById(id);
@@ -222,7 +226,7 @@ const imageLayer = {
       this.texDirty = false;
     }
     if (this.meshDirty) {
-      this.renderer.setTriangles(meshTriangles(state.mesh, state.origin));
+      this.renderer.setTriangles(meshTriangles(state.mesh, state.origin, state.fine));
       this.meshDirty = false;
     }
     gl.disable(gl.DEPTH_TEST);
@@ -230,14 +234,84 @@ const imageLayer = {
     gl.disable(gl.CULL_FACE);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    const opacity = state.drag ? Math.min(0.5, state.opacity) : state.opacity;
+    // Half see-through while dragging, except when the streets on top are what
+    // moves.
+    const see = state.drag && state.drag.kind !== 'world';
+    const opacity = see ? Math.min(0.5, state.opacity) : state.opacity;
     this.renderer.draw(rebaseMatrix(matrix, state.origin[0], state.origin[1]), opacity);
   },
 };
 
 map.on('style.load', () => {
   if (!map.getLayer(imageLayer.id)) map.addLayer(imageLayer);
+  raised = null;
+  applyStreets();
 });
+
+// ---------------------------------------------------------------------------
+// Streets on top: the vector base map's road and rail lines lifted above the
+// image as thin bright centrelines to align against. Yellow rather than
+// magenta, which many colour-blind eyes lose. Points added while they're on
+// are anchored to the world rather than the image (see the 'world' drag).
+
+const STREET_COLOUR = '#ffe600';
+const STREET_PAINT = ['line-color', 'line-width', 'line-opacity'];
+let raised = null;  // {order: [all layer ids], ids: [raised], paint: {id: [...]}}
+
+function applyStreets() {
+  if (!state.streetsOnTop) {
+    lowerStreets();
+    return;
+  }
+  if (raised || !raiseStreets()) return;
+  for (const id of raised.ids) {
+    map.setPaintProperty(id, 'line-color', STREET_COLOUR);
+    map.setPaintProperty(id, 'line-width', 1.5);
+    map.setPaintProperty(id, 'line-opacity', 1);
+  }
+}
+
+function streetsRaised() {
+  return !!raised;
+}
+
+// Roads and railways, not their casings, footpaths or ferry routes.
+function streetLayerIds() {
+  return (map.getStyle()?.layers || []).filter(l => l.type === 'line' &&
+    l['source-layer'] === 'transportation' && !/casing|path|pedestrian|ferry|aeroway|pier/.test(l.id)).map(l => l.id);
+}
+
+// Hide the raised lines while the overlay draws a bent copy of them.
+function hideStreets(hidden) {
+  if (!raised) return;
+  for (const id of raised.ids) map.setPaintProperty(id, 'line-opacity', hidden ? 0 : 1);
+}
+
+function raiseStreets() {
+  const layers = map.getStyle()?.layers || [];
+  const ids = streetLayerIds();
+  if (!ids.length) return false;
+  raised = { order: layers.map(l => l.id), ids, paint: {} };
+  for (const id of ids) {
+    raised.paint[id] = STREET_PAINT.map(k => map.getPaintProperty(id, k));
+    map.moveLayer(id);
+  }
+  return true;
+}
+
+function lowerStreets() {
+  if (!raised) return;
+  // Back where they were: each before the next layer of the original order.
+  const { order, ids, paint } = raised;
+  for (let i = order.length - 1; i >= 0; i--) {
+    const id = order[i];
+    if (!ids.includes(id)) continue;
+    const before = order.slice(i + 1).find(n => map.getLayer(n));
+    map.moveLayer(id, before);
+    STREET_PAINT.forEach((k, j) => map.setPaintProperty(id, k, paint[id][j]));
+  }
+  raised = null;
+}
 
 // ---------------------------------------------------------------------------
 // Coordinates
@@ -272,9 +346,11 @@ function update() {
   if (!state.image) return;
   const { W, H } = state.image;
   if (state.points.length === 1) {
-    // A single point just rides along with the placement.
+    // A single image anchor just rides along with the placement; a single
+    // world anchor moves the placement to keep its spot on its place.
     const p = state.points[0];
-    [p.x, p.y] = applyAffine(state.T, p.u, p.v);
+    state.T = placementFor(state.T, p);
+    if (!p.world) [p.x, p.y] = applyAffine(state.T, p.u, p.v);
   }
   state.warp = makeWarp(state.T, state.points);
   // Keep the placement in sync, so that removing points back down to one or
@@ -282,6 +358,7 @@ function update() {
   if (state.points.length >= 2) state.T = state.warp.S;
   const bent = state.points.length >= 3;
   state.mesh = buildMesh(state.warp.map, W, H, bent ? cellsAcross(W, H, DISPLAY_CELLS) : 1);
+  state.fine = refineView(state.mesh);
   const [minX, minY, maxX, maxY] = meshBounds(state.mesh);
   state.origin = [(minX + maxX) / 2, (minY + maxY) / 2];
   imageLayer.meshDirty = true;
@@ -290,9 +367,125 @@ function update() {
   updateUI();
 }
 
+// T, shifted if p is a world anchor so that p's spot lands on its place.
+function placementFor(T, p) {
+  if (!p.world) return T;
+  const [x, y] = applyAffine(T, p.u, p.v);
+  return translateAffine(T, p.x - x, p.y - y);
+}
+
+// The warp for a set of points, as update() would make it.
+function warpFor(T, points) {
+  if (points.length === 1) T = placementFor(T, points[0]);
+  return makeWarp(T, points);
+}
+
+// The warp bends sharply near a control point that was moved a long way,
+// more sharply than the display grid can follow, so at high zoom the cells
+// in view are split into pieces about FINE_PX on screen, evaluated exactly.
+// Rebuilt whenever the warp changes or the map stops moving.
+const FINE_PX = 16;
+const FINE_MAX_CELLS = 40000;
+
+function refineView(mesh) {
+  if (!mesh || mesh.nx < 2 || !state.warp) return null;
+  const canvas = map.getCanvas();
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const A = mercToScreenAffine();
+  const { nx, ny, pos } = mesh;
+  const sx = (n) => A[0] * pos[n * 2] + A[1] * pos[n * 2 + 1] + A[2];
+  const sy = (n) => A[3] * pos[n * 2] + A[4] * pos[n * 2 + 1] + A[5];
+  let i0 = Infinity, j0 = Infinity, i1 = -1, j1 = -1, size = 0;
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const c = [j * (nx + 1) + i, j * (nx + 1) + i + 1, (j + 1) * (nx + 1) + i, (j + 1) * (nx + 1) + i + 1];
+      const xs = c.map(sx), ys = c.map(sy);
+      if (Math.max(...xs) < 0 || Math.min(...xs) > w || Math.max(...ys) < 0 || Math.min(...ys) > h) continue;
+      i0 = Math.min(i0, i); i1 = Math.max(i1, i); j0 = Math.min(j0, j); j1 = Math.max(j1, j);
+      size = Math.max(size, Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+    }
+  }
+  if (i1 < 0) return null;
+  // One cell of margin, so the seam with the coarse cells is out of view.
+  i0 = Math.max(0, i0 - 1); j0 = Math.max(0, j0 - 1);
+  i1 = Math.min(nx, i1 + 2); j1 = Math.min(ny, j1 + 2);
+  let s = Math.min(32, Math.ceil(size / FINE_PX));
+  while (s > 1 && (i1 - i0) * (j1 - j0) * s * s > FINE_MAX_CELLS) s--;
+  if (s < 2) return null;
+  return refineMesh(state.warp.map, mesh, i0, j0, i1, j1, s);
+}
+
+map.on('moveend', () => {
+  if (!state.image || !state.mesh || state.drag || state.ease) return;
+  state.fine = refineView(state.mesh);
+  imageLayer.meshDirty = true;
+  map.triggerRepaint();
+});
+
 // Columns for a grid whose longer side has `cells` cells.
 function cellsAcross(W, H, cells) {
   return W >= H ? cells : Math.max(1, Math.round(cells * W / H));
+}
+
+// ---------------------------------------------------------------------------
+// Undo and redo: snapshots of the placement and points, taken before each
+// edit.
+
+const MAX_UNDO = 50;
+const edits = { undo: [], redo: [] };
+
+function snapshot() {
+  return { T: state.T.slice(), points: state.points.map(p => ({ ...p })) };
+}
+
+function restore(snap) {
+  state.T = snap.T.slice();
+  state.points = snap.points.map(p => ({ ...p }));
+  update();
+}
+
+function sameAsNow(snap) {
+  return snap.T.every((v, i) => v === state.T[i]) &&
+    snap.points.length === state.points.length &&
+    snap.points.every((p, i) => ['u', 'v', 'x', 'y'].every(k => p[k] === state.points[i][k]));
+}
+
+// Call before an edit. Returns a token for settle().
+function checkpoint() {
+  const token = { redo: edits.redo };
+  edits.undo.push(snapshot());
+  if (edits.undo.length > MAX_UNDO) edits.undo.shift();
+  edits.redo = [];
+  updateUI();
+  return token;
+}
+
+// After a drag: drop the checkpoint if the drag was cancelled or changed
+// nothing, so it doesn't leave an empty step (or lose the redo history).
+function settle(token, cancelled) {
+  const snap = edits.undo[edits.undo.length - 1];
+  if (snap && (cancelled || sameAsNow(snap))) {
+    edits.undo.pop();
+    edits.redo = token.redo;
+  }
+  updateUI();
+}
+
+function undo() {
+  if (state.drag || state.ease || !edits.undo.length) return;
+  edits.redo.push(snapshot());
+  restore(edits.undo.pop());
+}
+
+function redo() {
+  if (state.drag || state.ease || !edits.redo.length) return;
+  edits.undo.push(snapshot());
+  restore(edits.redo.pop());
+}
+
+function resetHistory() {
+  edits.undo = [];
+  edits.redo = [];
 }
 
 // ---------------------------------------------------------------------------
@@ -312,12 +505,23 @@ function drawOverlay() {
       parts.push(`<rect class="handle${hover ? ' hover' : ''}" x="${x - 5}" y="${y - 5}" width="10" height="10"/>`);
     });
   }
+  const d = state.drag;
+  if (d && d.kind === 'world' && d.preview) {
+    parts.push(`<path class="bent-streets" d="${polylinePath(bentStreets(d))}"/>`);
+  } else if (state.ease) {
+    parts.push(`<path class="bent-streets" d="${easedStreetsPath(state.ease)}"/>`);
+  }
   state.points.forEach((p, i) => {
-    const [x, y] = mercToScreen([p.x, p.y]);
-    const active = state.drag && state.drag.kind === 'point' && state.drag.index === i;
+    const active = d && ['point', 'world'].includes(d.kind) && d.index === i;
+    // A world anchor being dragged rides on its bent street, at the pointer.
+    const easing = state.ease && state.ease.index === i;
+    const [x, y] = active && d.kind === 'world' && d.cursor ? d.cursor
+      : easing ? state.ease.cursor : mercToScreen([p.x, p.y]);
     const hover = state.hover && state.hover.kind === 'point' && state.hover.index === i;
-    parts.push(`<g class="cp${active ? ' active' : ''}${hover ? ' hover' : ''}" transform="translate(${x},${y})">` +
-      `<circle class="ring" r="7"/>` +
+    // World anchors are squares, image anchors circles.
+    const ring = p.world ? '<rect class="ring" x="-6.5" y="-6.5" width="13" height="13"/>' : '<circle class="ring" r="7"/>';
+    parts.push(`<g class="cp${p.world ? ' world' : ''}${active ? ' active' : ''}${hover ? ' hover' : ''}" ` +
+      `transform="translate(${x},${y})">${ring}` +
       `<line x1="-4" y1="0" x2="4" y2="0"/><line x1="0" y1="-4" x2="0" y2="4"/>` +
       `<text x="10" y="-8">${i + 1}</text></g>`);
   });
@@ -342,7 +546,7 @@ function hitTest(p) {
     }
   }
   const m = screenToMerc(p);
-  const uv = invertMesh(state.mesh, m[0], m[1]);
+  const uv = invertDrawn(state.mesh, state.fine, m[0], m[1]);
   if (uv) return { kind: 'image', uv, merc: m };
   return null;
 }
@@ -393,7 +597,7 @@ function setHover(hit, cmd) {
 const container = map.getContainer();
 
 container.addEventListener('pointerdown', (e) => {
-  if (e.button !== 0 || !e.isPrimary || state.drag) return;
+  if (e.button !== 0 || !e.isPrimary || state.drag || state.ease) return;
   if (e.target.closest('.maplibregl-ctrl')) return;
   const p = localPoint(e);
   const hit = hitTest(p);
@@ -404,7 +608,32 @@ container.addEventListener('pointerdown', (e) => {
   e.stopPropagation();
   swallowing = true;
 
+  // World anchors: dragging one bends the streets, not the image, and
+  // ⌘-clicking the image with the streets on top adds one (and drags it).
+  const grabWorld = hit.kind === 'point' && !isCommand(e) && state.points[hit.index].world;
+  const addWorld = isCommand(e) && hit.kind === 'image' && streetsRaised();
+  if (grabWorld || addWorld) {
+    const token = checkpoint();
+    let index = hit.index, offset = [0, 0];
+    if (addWorld) {
+      state.points.push({ u: hit.uv[0], v: hit.uv[1], x: hit.merc[0], y: hit.merc[1], world: true });
+      index = state.points.length - 1;
+      update();
+    } else {
+      const q = state.points[index];
+      const [sx, sy] = mercToScreen([q.x, q.y]);
+      offset = [sx - p[0], sy - p[1]];
+    }
+    state.drag = startWorldDrag(index, token, offset);
+    document.body.classList.add('dragging');
+    map.getCanvas().style.cursor = 'grabbing';
+    hideStreets(true);
+    drawOverlay();
+    return;
+  }
+
   if (isCommand(e)) {
+    checkpoint();
     if (hit.kind === 'point') {
       state.points.splice(hit.index, 1);
     } else {
@@ -419,6 +648,7 @@ container.addEventListener('pointerdown', (e) => {
 
   const m0 = screenToMerc(p);
   const drag = {
+    token: checkpoint(),
     kind: hit.kind,
     index: hit.index,
     m0,
@@ -458,7 +688,12 @@ container.addEventListener('pointermove', (e) => {
 window.addEventListener('pointermove', (e) => {
   const d = state.drag;
   if (!d || !e.isPrimary) return;
-  const m = screenToMerc(localPoint(e));
+  lastPointer = localPoint(e);
+  const m = screenToMerc(lastPointer);
+  if (d.kind === 'world') {
+    worldStep(d, [lastPointer[0] + d.offset[0], lastPointer[1] + d.offset[1]]);
+    return;
+  }
   const dx = m[0] - d.m0[0], dy = m[1] - d.m0[1];
 
   if (d.kind === 'image') {
@@ -495,17 +730,243 @@ window.addEventListener('pointermove', (e) => {
   update();
 });
 
+// ---------------------------------------------------------------------------
+// World anchors. Dragging one keeps the image still and bends the streets:
+// a screen grid records which image pixel lies under each node; as the
+// anchor moves, each node's offset is how far the new warp would carry that
+// pixel, and the streets are drawn shifted back by it, so they show where
+// they'll sit against the image once the drag is released.
+
+const PREVIEW_STEP = 24;  // screen px between grid nodes
+
+// Affine from Mercator units to screen pixels (exact: no pitch).
+function mercToScreenAffine() {
+  const c = screenToMerc([0, 0]);
+  const e = 1e-6;
+  const [x0, y0] = mercToScreen(c);
+  const [x1, y1] = mercToScreen([c[0] + e, c[1]]);
+  const [x2, y2] = mercToScreen([c[0], c[1] + e]);
+  const a = (x1 - x0) / e, b = (x2 - x0) / e, d = (y1 - y0) / e, f = (y2 - y0) / e;
+  return [a, b, x0 - a * c[0] - b * c[1], d, f, y0 - d * c[0] - f * c[1]];
+}
+
+function startWorldDrag(index, token, offset) {
+  const canvas = map.getCanvas();
+  const nx = Math.ceil(canvas.clientWidth / PREVIEW_STEP) + 1;
+  const ny = Math.ceil(canvas.clientHeight / PREVIEW_STEP) + 1;
+  const A = mercToScreenAffine();
+  // The visible streets, as screen polylines.
+  const ids = streetLayerIds().filter(id => map.getLayer(id));
+  const streets = [];
+  for (const f of ids.length ? map.queryRenderedFeatures({ layers: ids }) : []) {
+    const g = f.geometry;
+    const lines = g.type === 'LineString' ? [g.coordinates] : g.type === 'MultiLineString' ? g.coordinates : [];
+    for (const line of lines) {
+      const pts = new Float64Array(line.length * 2);
+      line.forEach(([lng, lat], k) => {
+        const [mx, my] = toMerc({ lng, lat });
+        pts[k * 2] = A[0] * mx + A[1] * my + A[2];
+        pts[k * 2 + 1] = A[3] * mx + A[4] * my + A[5];
+      });
+      streets.push(pts);
+    }
+  }
+  return {
+    kind: 'world', index, token, offset,
+    T0: state.T.slice(),
+    pts0: state.points.map(q => ({ ...q })),
+    mesh: state.mesh,
+    fine: state.fine,
+    A, nx, ny,
+    under: sampleDrawn(A, nx, ny),
+    streets,
+    preview: null,
+    cursor: null,
+  };
+}
+
+// The image pixel under each grid node, as drawn: the fine patch where it
+// covers, the coarse mesh elsewhere.
+function sampleDrawn(A, nx, ny) {
+  const under = sampleMesh(state.mesh, A, nx, ny, PREVIEW_STEP);
+  const f = state.fine;
+  if (f) {
+    const fine = sampleMesh(f.mesh, A, nx, ny, PREVIEW_STEP);
+    for (let k = 0; k < fine.length; k += 2) {
+      if (Number.isNaN(fine[k])) continue;
+      under[k] = fine[k] + f.u0;
+      under[k + 1] = fine[k + 1] + f.v0;
+    }
+  }
+  return under;
+}
+
+function worldStep(d, cursor) {
+  d.cursor = cursor;
+  const m = screenToMerc(cursor);
+  const uv = invertDrawn(d.mesh, d.fine, m[0], m[1]);
+  if (!uv) return;  // Off the image: keep the last good preview.
+  const pts = d.pts0.map(q => ({ ...q }));
+  pts[d.index].u = uv[0];
+  pts[d.index].v = uv[1];
+  const warp = warpFor(d.T0, pts);
+  const { A, nx, ny, under } = d;
+  const off = new Float64Array(nx * ny * 2);
+  for (let k = 0; k < nx * ny; k++) {
+    const u = under[k * 2];
+    if (Number.isNaN(u)) continue;
+    const [x, y] = warp.map(u, under[k * 2 + 1]);
+    off[k * 2] = A[0] * x + A[1] * y + A[2] - (k % nx) * PREVIEW_STEP;
+    off[k * 2 + 1] = A[3] * x + A[4] * y + A[5] - Math.floor(k / nx) * PREVIEW_STEP;
+  }
+  d.preview = { pts, off, cursor };
+  drawOverlay();
+}
+
+// The streets bent by the preview: a street at screen v is drawn at q with
+// q + off(q) = v (the image pixel at q will move to v), found by iterating.
+// Returns polylines like d.streets.
+function bentStreets(d) {
+  const { nx, ny } = d, { off } = d.preview;
+  const at = (x, y) => {
+    const fx = Math.min(Math.max(x / PREVIEW_STEP, 0), nx - 1.000001);
+    const fy = Math.min(Math.max(y / PREVIEW_STEP, 0), ny - 1.000001);
+    const i = Math.floor(fx), j = Math.floor(fy), a = fx - i, b = fy - j;
+    const k = (j * nx + i) * 2, k2 = k + nx * 2;
+    const w = [(1 - a) * (1 - b), a * (1 - b), (1 - a) * b, a * b];
+    return [
+      w[0] * off[k] + w[1] * off[k + 2] + w[2] * off[k2] + w[3] * off[k2 + 2],
+      w[0] * off[k + 1] + w[1] * off[k + 3] + w[2] * off[k2 + 1] + w[3] * off[k2 + 3],
+    ];
+  };
+  return d.streets.map(line => {
+    const bent = new Float64Array(line.length);
+    for (let k = 0; k < line.length; k += 2) {
+      const vx = line[k], vy = line[k + 1];
+      let qx = vx, qy = vy;
+      for (let it = 0; it < 3; it++) {
+        const [ox, oy] = at(qx, qy);
+        qx = vx - ox;
+        qy = vy - oy;
+      }
+      bent[k] = qx;
+      bent[k + 1] = qy;
+    }
+    return bent;
+  });
+}
+
+function polylinePath(lines) {
+  const out = [];
+  for (const line of lines) {
+    for (let k = 0; k < line.length; k += 2) out.push(`${k ? 'L' : 'M'}${line[k].toFixed(1)},${line[k + 1].toFixed(1)}`);
+  }
+  return out.join('');
+}
+
+// After a world anchor is released, ease the map so the anchor stays where
+// it was let go, easing the image from the old warp to the new and the
+// streets from bent to true in step: with the camera moved a fraction e of
+// the way, the image blended e of the way and the streets likewise, the
+// anchor's spot stays put on screen throughout.
+const EASE = { ms: 250 };
+
+function easeWorldRelease(d) {
+  const q = state.points[d.index];
+  const [sx, sy] = mercToScreen([q.x, q.y]);
+  const [cx, cy] = d.preview.cursor;
+  const dx = sx - cx, dy = sy - cy;
+  if (!dx && !dy) return false;
+  const canvas = map.getCanvas();
+  const w = canvas.clientWidth / 2, h = canvas.clientHeight / 2;
+  const from = d.mesh, to = state.mesh, fineFrom = d.fine;
+  const same = (a, b) => a.nx === b.nx && a.ny === b.ny;
+  // The new warp's fine patch over the same cells as the old, to blend.
+  const fineTo = fineFrom && same(from, to)
+    ? refineMesh(state.warp.map, to, fineFrom.i0, fineFrom.j0, fineFrom.i1, fineFrom.j1, fineFrom.s)
+    : state.fine;
+  const ease = {
+    index: d.index, cursor: [cx, cy], dx, dy, e: 0,
+    c0: screenToMerc([w, h]), c1: screenToMerc([w + dx, h + dy]),
+    blend: same(from, to),
+    // The fine patches blend too when they cover the same cells.
+    blendFine: !!fineFrom && !!fineTo && same(fineFrom.mesh, fineTo.mesh) &&
+      fineFrom.i0 === fineTo.i0 && fineFrom.j0 === fineTo.j0,
+    streets: d.streets, bent: bentStreets(d),
+  };
+  state.ease = ease;
+  hideStreets(true);
+  const lerp = (a, b, e) => {
+    const pos = new Float64Array(b.length);
+    for (let k = 0; k < pos.length; k++) pos[k] = a[k] + (b[k] - a[k]) * e;
+    return pos;
+  };
+  const show = (e) => {
+    if (ease.blend) state.mesh = { ...to, pos: lerp(from.pos, to.pos, e) };
+    state.fine = ease.blendFine ? { ...fineTo, mesh: { ...fineTo.mesh, pos: lerp(fineFrom.mesh.pos, fineTo.mesh.pos, e) } }
+      : ease.blend ? null : fineTo;
+    imageLayer.meshDirty = true;
+  };
+  // Start from what was on screen: update() has already made the new mesh.
+  show(0);
+  let start = null;
+  const frame = (now) => {
+    // Time from the first frame's own timestamp, which can be earlier than
+    // performance.now() when this was scheduled.
+    start ??= now;
+    const t = Math.min(1, (now - start) / EASE.ms);
+    const e = ease.e = 1 - (1 - t) ** 3;
+    const { c0, c1 } = ease;
+    map.jumpTo({ center: toLngLat([c0[0] + (c1[0] - c0[0]) * e, c0[1] + (c1[1] - c0[1]) * e]) });
+    show(e);
+    if (t < 1) {
+      map.triggerRepaint();
+      requestAnimationFrame(frame);
+      return;
+    }
+    state.ease = null;
+    state.mesh = to;
+    state.fine = refineView(to);
+    imageLayer.meshDirty = true;
+    hideStreets(false);
+    map.triggerRepaint();
+    drawOverlay();
+  };
+  requestAnimationFrame(frame);
+  return true;
+}
+
+// The streets part way through the ease, at the current camera.
+function easedStreetsPath(ease) {
+  const { e, dx, dy, streets, bent } = ease;
+  return polylinePath(streets.map((line, i) => {
+    const b = bent[i], out = new Float64Array(line.length);
+    for (let k = 0; k < line.length; k += 2) {
+      out[k] = b[k] + (line[k] - b[k]) * e - dx * e;
+      out[k + 1] = b[k + 1] + (line[k + 1] - b[k + 1]) * e - dy * e;
+    }
+    return out;
+  }));
+}
+
 function endDrag(cancel) {
   const d = state.drag;
   swallowing = false;
   if (!d) return;
+  if (d.kind === 'world') {
+    hideStreets(false);
+    // The image spot under the pointer goes to the anchor's place.
+    if (!cancel && d.preview) state.points = d.preview.pts;
+  }
   if (cancel) {
     state.T = d.T0;
     state.points = d.pts0;
   }
+  settle(d.token, cancel);
   state.drag = null;
   document.body.classList.remove('dragging');
   update();
+  if (d.kind === 'world' && !cancel && d.preview) easeWorldRelease(d);
   if (lastPointer) setHover(hitTest(lastPointer), false);
 }
 
@@ -513,6 +974,15 @@ window.addEventListener('pointerup', (e) => { if (e.isPrimary) endDrag(false); }
 window.addEventListener('pointercancel', () => endDrag(true));
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') endDrag(true);
+  // ⌘Z / Ctrl-Z undoes, ⇧⌘Z / Ctrl-Shift-Z / Ctrl-Y redoes, outside text fields.
+  if (isCommand(e) && !e.target.closest('input[type=text], textarea')) {
+    const k = e.key.toLowerCase();
+    if (k === 'z' || k === 'y') {
+      e.preventDefault();
+      if (k === 'y' || e.shiftKey) redo();
+      else undo();
+    }
+  }
   if ((e.key === 'Meta' || e.key === 'Control') && lastPointer && !state.drag) {
     setHover(hitTest(lastPointer), true);
   }
@@ -652,6 +1122,7 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
   state.T = placement.T;
   state.points = placement.points;
   state.drag = null;
+  resetHistory();
   imageLayer.texDirty = true;
   update();
   if ((placement.points.length || how) && !keepView) zoomToImage();
@@ -731,7 +1202,7 @@ function placementFromMetadata(text, W, H) {
   const T = worldFileToAffine(meta.worldFile);
   const points = (meta.controlPoints || []).map(cp => {
     const [x, y] = toMerc({ lng: cp.lngLat[0], lat: cp.lngLat[1] });
-    return { u: cp.pixel[0], v: cp.pixel[1], x, y };
+    return { u: cp.pixel[0], v: cp.pixel[1], x, y, ...(cp.anchor === 'world' ? { world: true } : {}) };
   });
   return { T, points };
 }
@@ -980,11 +1451,17 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
   return { ...result, bytes: new Uint8Array(await blob.arrayBuffer()) };
 }
 
-// The export mesh: dense enough for the warp, and for reprojection.
+// The export mesh: dense enough for the warp, and for reprojection. A bent
+// warp gets cells split where it bends sharply (near a control point moved
+// out of line with its neighbours), to stay within a quarter of an output
+// pixel everywhere.
 function exportMesh(minCells) {
   const { W, H } = state.image;
-  const cells = state.points.length >= 3 ? EXPORT_CELLS : minCells;
-  return buildMesh(state.warp.map, W, H, cells ? cellsAcross(W, H, cells) : 1);
+  if (state.points.length < 3) {
+    return buildMesh(state.warp.map, W, H, minCells ? cellsAcross(W, H, minCells) : 1);
+  }
+  return refinedSoup(state.warp.map, W, H, cellsAcross(W, H, EXPORT_CELLS),
+    affineScale(state.warp.S) / 4, state.points.map(p => [p.u, p.v]));
 }
 
 // Metadata for an exported raster. `toPixel` maps Mercator units to its
@@ -1002,7 +1479,10 @@ function exportMetadata(crs, ow, oh, worldFile, bounds, toPixel) {
     source: { name, width: W, height: H },
     controlPoints: state.points.map(p => {
       const ll = toLngLat([p.x, p.y]);
-      return { pixel: toPixel(p.x, p.y), sourcePixel: [p.u, p.v], lngLat: [ll.lng, ll.lat] };
+      return {
+        pixel: toPixel(p.x, p.y), sourcePixel: [p.u, p.v], lngLat: [ll.lng, ll.lat],
+        ...(p.world ? { anchor: 'world' } : {}),
+      };
     }),
   };
 }
@@ -1135,6 +1615,8 @@ function updateUI() {
   $('zoom').disabled = !has;
   $('remove').disabled = !has;
   $('clear').disabled = !state.points.length;
+  $('undo').disabled = !has || !edits.undo.length;
+  $('redo').disabled = !has || !edits.redo.length;
   const n = state.points.length;
   const pts = has
     ? `<br>${n} control point${n === 1 ? '' : 's'}${n < 2 ? ' — ⌘/Ctrl-click the image to add one.' : '.'}`
@@ -1161,13 +1643,18 @@ $('format').addEventListener('change', (e) => {
 });
 $('zoom').addEventListener('click', zoomToImage);
 $('clear').addEventListener('click', () => {
+  checkpoint();
   state.points = [];
   update();
 });
+$('undo').addEventListener('click', undo);
+$('redo').addEventListener('click', redo);
 $('remove').addEventListener('click', () => {
   state.image = null;
   state.mesh = null;
+  state.fine = null;
   state.points = [];
+  resetHistory();
   state.hover = null;
   overlay.innerHTML = '';
   map.getCanvas().style.cursor = '';
@@ -1183,10 +1670,16 @@ $('opacity').addEventListener('input', (e) => {
 });
 $('basemap').addEventListener('change', (e) => {
   map.setStyle(STYLES[e.target.value], { diff: false });
+  // Only the vector street map has separate road layers to lift.
+  $('streets-on-top').disabled = e.target.value !== 'streets';
+});
+$('streets-on-top').addEventListener('change', (e) => {
+  state.streetsOnTop = e.target.checked;
+  applyStreets();
 });
 
 const imageParam = new URLSearchParams(window.location.search).get('image');
 if (imageParam) loadURL(imageParam, linkHasView);
 
 // Exposed for debugging and automated tests.
-window.rubbersheet = { map, state, update, loadFiles, loadURL, exportImage, exportGeoTIFF, exportKMZ, decodeJPEG };
+window.rubbersheet = { map, state, update, loadFiles, loadURL, exportImage, exportGeoTIFF, exportKMZ, decodeJPEG, invertDrawn, EASE };

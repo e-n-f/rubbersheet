@@ -10,7 +10,12 @@ Map rubbersheeting in the browser. Drop a scanned map or photo onto a MapLibre b
 - **Drag a corner handle** to scale and rotate around the image centre. Hold <kbd>Shift</kbd> to scale without rotating. (This works only before the first control point is added.)
 - **⌘-click** (Ctrl-click on Windows/Linux) the image to add a control point. ⌘-click a point to remove it.
 - **Drag a control point** to move that spot of the image to a new place on the map. The image goes half-transparent while you drag so you can see the map underneath.
+- **Streets on top of the image** draws the street base map's roads and railways over the image as thin bright yellow lines. It only works with the *Streets* base map, which has separate road layers. While it's on, ⌘-clicking the image adds a **world anchor**, drawn as a blue square. A world anchor is tied to that place on the map, not to the spot in the image.
+  - **Dragging a world anchor** keeps the image still and bends the streets around the anchor, as the new warp will. Drag the street onto the image's feature and let go. The image warps to bring the feature under the pointer to the anchor's place, and the map eases so the anchor stays where you let go. The image eases from the old warp to the new and the streets from bent to straight, in step with the map, so the anchor and its feature stay under the pointer the whole way.
+  - **Image anchors** are points added with the streets off, drawn as red circles. Dragging one moves the image as before.
+  - **Both kinds** are ordinary control points in the same warp. They differ only in which half a drag changes: the image spot for a world anchor, the map place for an image anchor.
 - <kbd>Esc</kbd> during a drag cancels it.
+- **Undo** with ⌘Z (Ctrl-Z) or the *Undo* button, and **redo** with ⇧⌘Z (Ctrl-Shift-Z or Ctrl-Y) or *Redo*. Each drag, added or removed point and *Clear points* is one step, up to 50 back. Loading or removing an image starts afresh.
 - **Export** saves the warped image, north-up, in the format chosen under *Format*:
   - **PNG**: Web Mercator (EPSG:3857), at about the source resolution.
   - **GeoTIFF**: the same image as a deflate-compressed RGBA GeoTIFF in EPSG:3857. QGIS, ArcGIS and GDAL open it directly, with no side files.
@@ -25,7 +30,7 @@ How the image is fitted depends on the number of control points:
 | 2 | The similarity transform (shift + scale + rotation) through both points |
 | 3+ | A least-squares similarity, then rigid Moving Least Squares (Schaefer et al. 2006) to bend the rest of the way. Every point lands exactly where you put it. |
 
-The warp is evaluated on a 64×64 grid and drawn as a textured mesh in a MapLibre custom WebGL layer, so it updates live while you drag. The export uses the same method on a 256×256 grid.
+The warp is evaluated on a 64×64 grid and drawn as a textured mesh in a MapLibre custom WebGL layer, so it updates live while you drag. When you're zoomed in, the cells in view are split into pieces about 16 screen pixels across, evaluated exactly, and rebuilt whenever the warp changes or the map stops moving. Without that, the image near a control point that was moved a long way could be drawn tens of pixels from the point's marker. The export uses the same method on a 256×256 grid. Each cell is checked against the exact warp at its centre, its edge midpoints and any control point inside it. Cells off by more than a quarter of an output pixel are split 16 × 16, along with their neighbours, so the export stays that accurate even right next to a point moved far out of line with its neighbours. A whole cell next to split ones shares their edge vertices, so no hairline gaps open between them.
 
 ## Georeferencing metadata
 
@@ -46,7 +51,7 @@ Exported PNGs carry a `tEXt` chunk with the keyword `rubbersheet` holding JSON (
 }
 ```
 
-`worldFile` uses the standard [world file](https://gdal.org/en/stable/drivers/raster/wld.html) parameters in the units of `crs`: EPSG:3857 metres for the PNG and GeoTIFF exports, and degrees (`"crs": "EPSG:4326"`) for the PNG inside a KMZ. `pixel` is the point's position in the exported image, and `sourcePixel` is its position in the original image. If you drop an exported PNG, GeoTIFF or KMZ (or the PNG from inside a KMZ) back on the map, it goes to the same place with its control points restored, so you can keep adjusting it. Images in any other projection are reprojected into Web Mercator when they are loaded, using the same mesh renderer as the export.
+`worldFile` uses the standard [world file](https://gdal.org/en/stable/drivers/raster/wld.html) parameters in the units of `crs`: EPSG:3857 metres for the PNG and GeoTIFF exports, and degrees (`"crs": "EPSG:4326"`) for the PNG inside a KMZ. `pixel` is the point's position in the exported image, and `sourcePixel` is its position in the original image. A world anchor also has `"anchor": "world"`. If you drop an exported PNG, GeoTIFF or KMZ (or the PNG from inside a KMZ) back on the map, it goes to the same place with its control points restored, so you can keep adjusting it. Images in any other projection are reprojected into Web Mercator when they are loaded, using the same mesh renderer as the export.
 
 Tick *Also download world file* to get `name.pgw` and `name.png.aux.xml` (the CRS) next to the PNG. GDAL and QGIS can open the result directly. You can also drop an image together with its world file (`.wld`, `.pgw`, `.jgw`, …) and an optional `.prj` or `.aux.xml`. Images in EPSG:3857 and EPSG:4326 are placed from the world file. A KMZ from elsewhere is placed from its first GroundOverlay's `LatLonBox`, including its rotation.
 

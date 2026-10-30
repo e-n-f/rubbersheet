@@ -4,6 +4,8 @@ import {
   applyAffine, fitSimilarity, makeWarp, buildMesh, invertMesh,
   worldFileToAffine, affineToWorldFile, similarityAboutPivot,
   lngToMercX, mercXToLng, latToMercY, mercYToLat,
+  sampleMesh,
+  refineMesh, invertDrawn, meshTriangles, refinedSoup,
 } from '../js/warp.js';
 import { addTextChunk, readTextChunks } from '../js/png-text.js';
 import { makeZip, readZip } from '../js/zip.js';
@@ -55,6 +57,103 @@ test('mesh inversion round-trips', () => {
   const uv = invertMesh(mesh, x, y);
   assert.ok(Math.hypot(uv[0] - 300, uv[1] - 200) < 1, `${uv}`);
   assert.equal(invertMesh(mesh, 0.9, 0.9), null);
+});
+
+test('sampling a mesh on a grid agrees with inverting it point by point', () => {
+  const T = [1e-6, 2e-7, 0.3, -2e-7, 1e-6, 0.4];
+  const pts = [[0, 0], [1000, 0], [0, 800], [600, 500]].map(([u, v], i) => {
+    const [x, y] = applyAffine(T, u, v);
+    return { u, v, x: x + i * 1e-5, y };
+  });
+  const mesh = buildMesh(makeWarp(T, pts).map, 1000, 800, 32);
+  // A screen-like plane: Mercator units scaled up and shifted.
+  const k = 2e6, A = [k, 0, -0.3 * k + 50, 0, k, -0.4 * k + 50];
+  const nx = 60, ny = 50, step = 40;
+  const out = sampleMesh(mesh, A, nx, ny, step);
+  let inside = 0;
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const x = (i * step - A[2]) / k, y = (j * step - A[5]) / k;
+      const want = invertMesh(mesh, x, y), u = out[(j * nx + i) * 2], v = out[(j * nx + i) * 2 + 1];
+      if (!want) {
+        assert.ok(Number.isNaN(u), `node ${i},${j} should be outside`);
+        continue;
+      }
+      inside++;
+      assert.ok(Math.hypot(u - want[0], v - want[1]) < 1e-6, `node ${i},${j}: ${u},${v} vs ${want}`);
+    }
+  }
+  assert.ok(inside > 100);
+});
+
+test('a refined patch follows the warp exactly and replaces the cells it covers', () => {
+  const T = [1e-6, 0, 0.3, 0, 1e-6, 0.4];
+  const pts = [[0, 0], [1000, 0], [0, 800], [1000, 800], [530, 420]].map(([u, v], i) => {
+    const [x, y] = applyAffine(T, u, v);
+    return { u, v, x: x + (i === 4 ? 1e-4 : 0), y };  // a 100 px re-pin, between coarse nodes
+  });
+  const w = makeWarp(T, pts);
+  const mesh = buildMesh(w.map, 1000, 800, 10);
+  const fine = refineMesh(w.map, mesh, 4, 3, 6, 5, 8);
+  assert.equal(fine.mesh.nx, 16); assert.equal(fine.mesh.ny, 16);
+  // Close at the re-pinned point (530, 420), where the coarse mesh alone is well off.
+  const uv = invertDrawn(mesh, fine, ...w.map(530, 420));
+  assert.ok(Math.hypot(uv[0] - 530, uv[1] - 420) < 0.5, `${uv}`);
+  const coarse = invertMesh(mesh, ...w.map(530, 420));
+  assert.ok(Math.hypot(coarse[0] - 530, coarse[1] - 420) > 2, `coarse ${coarse}`);
+  // Texture coordinates are for the whole image.
+  close(fine.mesh.uv[0], 0.4, 1e-7); close(fine.mesh.uv[1], 0.375, 1e-7);
+  const tris = meshTriangles(mesh, [0, 0], fine);
+  assert.equal(tris.count, (10 * 8 - 4 + 256) * 6);
+});
+
+test('the refined export mesh follows a sharp warp and leaves no gaps', () => {
+  const T = [1e-6, 0, 0.3, 0, 1e-6, 0.4];
+  // A point re-pinned 40 px out of line with close neighbours: a sharp spike.
+  const pts = [[0, 0], [1000, 0], [0, 800], [1000, 800], [530, 420],
+    [470, 420], [590, 420], [530, 360], [530, 480]].map(([u, v], i) => {
+    const [x, y] = applyAffine(T, u, v);
+    return { u, v, x: x + (i === 4 ? 4e-5 : 0), y };
+  });
+  const w = makeWarp(T, pts);
+  const tol = 0.25e-6;  // a quarter of a pixel
+  const soup = refinedSoup(w.map, 1000, 800, 40, tol, pts.map(p => [p.u, p.v]));
+  assert.ok(soup.refined > 0 && soup.refined < 1280 / 4, `${soup.refined} of 1280 cells split`);
+  // Where a soup puts image pixel (u, v).
+  const at = ({ pos, uv }, u, v) => {
+    for (let k = 0; k < uv.length; k += 6) {
+      const [ax, ay, bx, by, cx, cy] = [uv[k] * 1000, uv[k + 1] * 800, uv[k + 2] * 1000, uv[k + 3] * 800, uv[k + 4] * 1000, uv[k + 5] * 800];
+      const det = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
+      const l1 = ((by - cy) * (u - cx) + (cx - bx) * (v - cy)) / det;
+      const l2 = ((cy - ay) * (u - cx) + (ax - cx) * (v - cy)) / det;
+      const l3 = 1 - l1 - l2;
+      if (l1 < -1e-9 || l2 < -1e-9 || l3 < -1e-9) continue;
+      return [l1 * pos[k] + l2 * pos[k + 2] + l3 * pos[k + 4], l1 * pos[k + 1] + l2 * pos[k + 3] + l3 * pos[k + 5]];
+    }
+    return null;
+  };
+  const worstOff = (m) => {
+    let worst = 0;
+    for (let v = 5; v < 800; v += 13) {
+      for (let u = 3; u < 1000; u += 11) {
+        const [x, y] = at(m, u, v), [ex, ey] = w.map(u, v);
+        worst = Math.max(worst, Math.hypot(x - ex, y - ey));
+      }
+    }
+    return worst;
+  };
+  // No gaps or overlaps: the triangles tile the image exactly.
+  let area = 0;
+  for (let k = 0, uv = soup.uv; k < uv.length; k += 6) {
+    area += ((uv[k + 2] - uv[k]) * (uv[k + 5] - uv[k + 1]) - (uv[k + 4] - uv[k]) * (uv[k + 3] - uv[k + 1])) / 2;
+  }
+  close(Math.abs(area), 1, 1e-6);
+  // Close to the warp everywhere, where plain cells are well off.
+  const worst = worstOff(soup);
+  assert.ok(worst < 2 * tol, `worst ${worst / 1e-6} px`);
+  const plain = refinedSoup(w.map, 1000, 800, 40, Infinity);
+  assert.equal(plain.refined, 0);
+  assert.ok(worstOff(plain) > 10 * tol, `plain worst ${worstOff(plain) / 1e-6} px`);
 });
 
 test('world file conversion round-trips', () => {
