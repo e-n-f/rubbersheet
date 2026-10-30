@@ -453,6 +453,78 @@ def evaluate(name, predict, ref_px, ref_ll, geo, log):
 
 
 # ---------------------------------------------------------------------------
+# Export for rubbersheet
+
+MERC_R = 6378137.0
+
+
+def export_geotiff(path, source, rgb, geo, forward, inverse, cps, mpp, log):
+    """Resample the scan onto a north-up Web Mercator grid with the fitted
+    model and write it as a GeoTIFF carrying rubbersheet's metadata, control
+    points included, so the app opens it pinned and the points can be
+    dragged or removed."""
+    k = math.pi / 180
+    H, W = rgb.shape[:2]
+
+    def to_merc(lng, lat):
+        return MERC_R * lng * k, MERC_R * np.log(np.tan(math.pi / 4 + np.asarray(lat) * k / 2))
+
+    def from_merc(x, y):
+        return x / (MERC_R * k), (2 * np.arctan(np.exp(y / MERC_R)) - math.pi / 2) / k
+
+    # Bounds: the true places of the image's edge.
+    t = np.linspace(0, 1, 200)
+    edge = np.concatenate([np.stack([t * W, 0 * t], -1), np.stack([t * W, H + 0 * t], -1),
+                           np.stack([0 * t, t * H], -1), np.stack([W + 0 * t, t * H], -1)])
+    e = inverse(edge)
+    mx, my = to_merc(*geo.to_lnglat(e[:, 0], e[:, 1]))
+    ps = mpp / math.cos(geo.lat0 * k)
+    x0, y1 = mx.min(), my.max()
+    ow, oh = int(math.ceil((mx.max() - x0) / ps)), int(math.ceil((y1 - my.min()) / ps))
+
+    # Output pixel centre -> true lng/lat -> original pixel -> map pixel,
+    # exactly on a coarse grid and bilinear between.
+    step = 16
+    gi = np.arange(0, ow + step, step, dtype=float)
+    gj = np.arange(0, oh + step, step, dtype=float)
+    I, J = np.meshgrid(gi + 0.5, gj + 0.5)
+    lng, lat = from_merc(x0 + I * ps, y1 - J * ps)
+    p = np.stack(geo.from_lnglat(lng.ravel(), lat.ravel()), -1)
+    q = forward(p).reshape(len(gj), len(gi), 2)
+    out = np.zeros((oh, ow, 4), np.uint8)
+    for r0 in range(0, oh, 512):
+        rows = np.arange(r0, min(oh, r0 + 512))
+        jj, ii = np.meshgrid(rows / step, np.arange(ow) / step, indexing='ij')
+        qu = ndi.map_coordinates(q[..., 0], [jj, ii], order=1)
+        qv = ndi.map_coordinates(q[..., 1], [jj, ii], order=1)
+        # Pixel centres are at +0.5 in continuous coordinates.
+        c = [qv - 0.5, qu - 0.5]
+        for ch in range(3):
+            out[rows, :, ch] = np.clip(ndi.map_coordinates(rgb[..., ch], c, order=1), 0, 255)
+        out[rows, :, 3] = np.where((qu >= 0) & (qu <= W) & (qv >= 0) & (qv <= H), 255, 0)
+
+    ll_bounds = [*from_merc(x0, y1 - oh * ps), *from_merc(x0 + ow * ps, y1)]
+    points = []
+    for cp in cps:
+        cx, cy = to_merc(*cp['lngLat'])
+        points.append(dict(pixel=[(cx - x0) / ps, (y1 - cy) / ps], sourcePixel=cp['pixel'], lngLat=cp['lngLat']))
+    meta = dict(generator='rubbersheet', version=1, crs='EPSG:3857', width=ow, height=oh,
+                worldFile=[ps, 0, 0, -ps, x0 + ps / 2, y1 - ps / 2],
+                bounds=[ll_bounds[0], ll_bounds[1], ll_bounds[2], ll_bounds[3]],
+                source=dict(name=os.path.basename(source), width=W, height=H, generator='autoalign.py'),
+                controlPoints=points)
+    tmp = path + '.tmp'
+    out.tofile(tmp + '.rgba')
+    json.dump(dict(width=ow, height=oh, scale=[ps, ps], origin=[x0, y1], description=json.dumps(meta, separators=(',', ':'))),
+              open(tmp + '.json', 'w'))
+    subprocess.run(['node', os.path.join(HERE, 'writetiff.mjs'), tmp + '.json', tmp + '.rgba', path], check=True)
+    os.remove(tmp + '.rgba')
+    os.remove(tmp + '.json')
+    log(f'wrote {path} ({ow}x{oh}, {len(points)} control points)')
+
+
+
+# ---------------------------------------------------------------------------
 # Diagnostics
 
 
@@ -479,6 +551,8 @@ def main():
     ap.add_argument('--osm', help='OSM ways JSON from fetch_osm.py')
     ap.add_argument('--reference', help='rubbersheet export with hand-placed control points, to evaluate against')
     ap.add_argument('--out', default='out', help='output directory')
+    ap.add_argument('--export', help='write the corrected map as a GeoTIFF that rubbersheet opens with '
+                    'the control points in place')
     ap.add_argument('--whole-image', action='store_true',
                     help='match over the whole image, for maps that run past their neatline')
     ap.add_argument('--search', type=float, default=600, help='global search radius, metres')
@@ -558,6 +632,8 @@ def main():
                                          rotationDeg=math.degrees(params[3]), centrePx=centre.tolist()),
                    controlPoints=cps), open(os.path.join(args.out, 'controlpoints.json'), 'w'), indent=1)
     log(f'wrote {len(cps)} control points')
+    if args.export:
+        export_geotiff(args.export, args.tif, rgb, geo, forward, inverse, cps, mpp, log)
 
     # Diagnostics: vectors before (red), after the global fit (green) and
     # after the local field (blue), over the map; and the offsets.

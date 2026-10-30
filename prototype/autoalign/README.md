@@ -13,6 +13,8 @@ An experiment, not part of the site: does matching a georeferenced scan's black 
    - `before.jpg`, `global.jpg`, `local.jpg`: the vectors drawn over the map after each step
    - `offsets.jpg`: the correction at each control point, exaggerated 5×
 
+With `--export file.tif`, it also writes the corrected map as a Web Mercator GeoTIFF that carries rubbersheet's metadata. The app opens it already pinned, with the generated control points in place to drag or delete. `writetiff.mjs` writes the file with rubbersheet's own GeoTIFF writer.
+
 Given `--reference` (a rubbersheet export of the same map with hand-placed control points), it also scores itself against those points and draws `reference.jpg`. Each hand point appears there as a red ring, and the model's position for the same true location as a blue cross. `refpoints.mjs` maps the export's `sourcePixel`s back to the original file. rubbersheet reprojects a non-Mercator GeoTIFF before you place points on it, so this mapping is needed.
 
 ## Running it
