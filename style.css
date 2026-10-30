@@ -125,12 +125,6 @@ kbd {
   stroke-width: 1.5;
   stroke-linejoin: round;
 }
-.brush {
-  fill: rgba(42, 125, 225, 0.08);
-  stroke: #2a7de1;
-  stroke-width: 1.5;
-  stroke-dasharray: 4 3;
-}
 .outline {
   fill: none;
   stroke: #1a62c4;

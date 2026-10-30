@@ -45,7 +45,6 @@
       <button id="redo" disabled title="⇧⌘Z / Ctrl-Y">Redo</button>
       <button id="zoom" disabled>Zoom to image</button>
       <button id="clear" disabled>Clear points</button>
-      <button id="unnudge" disabled>Clear nudges</button>
       <button id="remove" disabled>Remove image</button>
     </div>
     <label class="check" id="worldfile-row"><input id="worldfile" type="checkbox"> Also download world file (.pgw + .aux.xml)</label>
@@ -57,9 +56,8 @@
         <li><b>Drag a corner</b> to scale and rotate. Hold <kbd>Shift</kbd> to scale without rotating. The corners lock once there's a control point.</li>
         <li><b><kbd>⌘</kbd>/<kbd>Ctrl</kbd>-click</b> the image to add a control point. Do it again on a point to remove it.</li>
         <li><b>Drag a control point</b> to pin that spot of the image to a new place on the map. The image warps to fit.</li>
-        <li><b><kbd>⌥</kbd>/<kbd>Alt</kbd>-drag</b> to nudge: everything inside the circle moves with the pointer, fading out toward the rim. <kbd>⌥</kbd>/<kbd>Alt</kbd>-scroll or <kbd>[</kbd> <kbd>]</kbd> sizes the circle. Control points under it move along.</li>
         <li><b>Streets on top of the image</b> draws the street map's roads and railways over the image as thin yellow lines. While it's on, <kbd>⌘</kbd>/<kbd>Ctrl</kbd>-clicking the image adds a <b>world anchor</b> (a blue square), which is tied to that place on the map rather than to the image. Dragging a world anchor bends the streets instead of the image: drag the street onto the image's feature and let go. The image warps to bring that feature to the anchor's place, and the map eases so the anchor stays where you let go. Points added with the streets off are image anchors (red circles); dragging one moves the image. (Streets base map only.)</li>
-        <li><b>Undo</b> with <kbd>⌘</kbd>/<kbd>Ctrl</kbd>-<kbd>Z</kbd>, <b>redo</b> with <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> or <kbd>Ctrl</kbd>-<kbd>Y</kbd>. Each drag, brush stroke, added or removed point and Clear is one step.</li>
+        <li><b>Undo</b> with <kbd>⌘</kbd>/<kbd>Ctrl</kbd>-<kbd>Z</kbd>, <b>redo</b> with <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> or <kbd>Ctrl</kbd>-<kbd>Y</kbd>. Each drag, added or removed point and Clear is one step.</li>
         <li><b>Export</b> saves the warped image, north-up. PNG and GeoTIFF are in Web Mercator; KMZ opens in Google Earth. The placement and control points are stored inside, so dropping the file back on the map puts it in the same place.</li>
       </ul>
     </details>

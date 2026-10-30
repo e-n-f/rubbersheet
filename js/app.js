@@ -2,7 +2,7 @@ import {
   applyAffine, affineScale, affineToWorldFile, buildMesh, invertMesh, makeWarp,
   meshBounds, meshCorners, meshOutline, meshTriangles, mercXToLng, mercYToLat,
   EARTH_CIRCUMFERENCE, mercToMeters, similarityAboutPivot, translateAffine, worldFileToAffine,
-  makeNudge, nudgeAt, nudgeIsZero, brushNudge, sampleMesh, refineMesh, invertDrawn, refinedSoup,
+  sampleMesh, refineMesh, invertDrawn, refinedSoup,
 } from './warp.js';
 import { addTextChunk, isPNG, readTextChunks } from './png-text.js';
 import { makeZip, readZip } from './zip.js';
@@ -12,8 +12,6 @@ import { crsFromGeoKeys } from './proj.js';
 const maplibregl = window.maplibregl;
 const META_KEY = 'rubbersheet';
 const DISPLAY_CELLS = 64;
-// Nudge resolution: fine enough to push a few blocks of a city map.
-const NUDGE_CELLS = 256;
 const EXPORT_CELLS = 256;
 const HIT_RADIUS = 11;
 
@@ -45,7 +43,6 @@ const state = {
   image: null,      // {name, img, W, H}
   T: null,          // affine placement, image px -> Mercator units
   points: [],       // [{u, v, x, y}] image px -> Mercator target
-  nudge: null,      // offsets brushed on top of the point warp (makeNudge)
   warp: null,       // {map, S}
   mesh: null,       // display mesh
   fine: null,       // finer patch of it over the part in view (refineMesh)
@@ -53,8 +50,6 @@ const state = {
   drag: null,
   hover: null,
   opacity: 1,
-  brushRadius: 100, // nudge brush radius, screen px
-  altHeld: false,
   streetsOnTop: false,
   ease: null,       // a world anchor's release in progress (easeWorldRelease)
 };
@@ -354,30 +349,16 @@ function update() {
     // A single image anchor just rides along with the placement; a single
     // world anchor moves the placement to keep its spot on its place.
     const p = state.points[0];
-    state.T = placementFor(state.T, p, state.nudge);
-    if (!p.world) [p.x, p.y] = placed(state.T, p, state.nudge);
+    state.T = placementFor(state.T, p);
+    if (!p.world) [p.x, p.y] = applyAffine(state.T, p.u, p.v);
   }
-  state.warp = makeWarp(state.T, state.points, state.nudge);
+  state.warp = makeWarp(state.T, state.points);
   // Keep the placement in sync, so that removing points back down to one or
   // zero leaves the image where it is.
   if (state.points.length >= 2) state.T = state.warp.S;
-  // A nudge field shares the display mesh's grid, so the brush can find its
-  // nodes on screen. While brushing, the point warp underneath doesn't
-  // change, so only the offsets need adding to it.
-  const n = state.nudge, d = state.drag;
-  if (n && d && d.kind === 'nudge' && d.base) {
-    const pos = new Float64Array(d.base.length);
-    for (let k = 0; k < n.dx.length; k++) {
-      pos[k * 2] = d.base[k * 2] + n.dx[k];
-      pos[k * 2 + 1] = d.base[k * 2 + 1] + n.dy[k];
-    }
-    state.mesh = { ...state.mesh, pos };
-    state.fine = null;  // Rebuilt when the stroke ends.
-  } else {
-    const cols = n ? n.nx : state.points.length >= 3 ? cellsAcross(W, H, DISPLAY_CELLS) : 1;
-    state.mesh = buildMesh(state.warp.map, W, H, cols);
-    state.fine = refineView(state.mesh);
-  }
+  const bent = state.points.length >= 3;
+  state.mesh = buildMesh(state.warp.map, W, H, bent ? cellsAcross(W, H, DISPLAY_CELLS) : 1);
+  state.fine = refineView(state.mesh);
   const [minX, minY, maxX, maxY] = meshBounds(state.mesh);
   state.origin = [(minX + maxX) / 2, (minY + maxY) / 2];
   imageLayer.meshDirty = true;
@@ -386,25 +367,17 @@ function update() {
   updateUI();
 }
 
-// Where point p's image spot is under placement T (plus any nudge).
-function placed(T, p, nudge) {
-  const [x, y] = applyAffine(T, p.u, p.v);
-  if (!nudge) return [x, y];
-  const [dx, dy] = nudgeAt(nudge, p.u, p.v);
-  return [x + dx, y + dy];
-}
-
 // T, shifted if p is a world anchor so that p's spot lands on its place.
-function placementFor(T, p, nudge) {
+function placementFor(T, p) {
   if (!p.world) return T;
-  const [x, y] = placed(T, p, nudge);
+  const [x, y] = applyAffine(T, p.u, p.v);
   return translateAffine(T, p.x - x, p.y - y);
 }
 
 // The warp for a set of points, as update() would make it.
-function warpFor(T, points, nudge) {
-  if (points.length === 1) T = placementFor(T, points[0], nudge);
-  return makeWarp(T, points, nudge);
+function warpFor(T, points) {
+  if (points.length === 1) T = placementFor(T, points[0]);
+  return makeWarp(T, points);
 }
 
 // The warp bends sharply near a control point that was moved a long way,
@@ -455,36 +428,26 @@ function cellsAcross(W, H, cells) {
 }
 
 // ---------------------------------------------------------------------------
-// Undo and redo: snapshots of the placement, points and nudges, taken before
-// each edit.
+// Undo and redo: snapshots of the placement and points, taken before each
+// edit.
 
 const MAX_UNDO = 50;
 const edits = { undo: [], redo: [] };
 
 function snapshot() {
-  const n = state.nudge;
-  return {
-    T: state.T.slice(),
-    points: state.points.map(p => ({ ...p })),
-    nudge: n && { ...n, dx: n.dx.slice(), dy: n.dy.slice() },
-  };
+  return { T: state.T.slice(), points: state.points.map(p => ({ ...p })) };
 }
 
 function restore(snap) {
-  const { T, points, nudge } = snap;
-  state.T = T.slice();
-  state.points = points.map(p => ({ ...p }));
-  state.nudge = nudge && { ...nudge, dx: nudge.dx.slice(), dy: nudge.dy.slice() };
+  state.T = snap.T.slice();
+  state.points = snap.points.map(p => ({ ...p }));
   update();
 }
 
 function sameAsNow(snap) {
-  const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
-  const n = state.nudge;
-  return same(snap.T, state.T) &&
+  return snap.T.every((v, i) => v === state.T[i]) &&
     snap.points.length === state.points.length &&
-    snap.points.every((p, i) => ['u', 'v', 'x', 'y'].every(k => p[k] === state.points[i][k])) &&
-    (snap.nudge ? !!n && same(snap.nudge.dx, n.dx) && same(snap.nudge.dy, n.dy) : !n);
+    snap.points.every((p, i) => ['u', 'v', 'x', 'y'].every(k => p[k] === state.points[i][k]));
 }
 
 // Call before an edit. Returns a token for settle().
@@ -562,11 +525,6 @@ function drawOverlay() {
       `<line x1="-4" y1="0" x2="4" y2="0"/><line x1="0" y1="-4" x2="0" y2="4"/>` +
       `<text x="10" y="-8">${i + 1}</text></g>`);
   });
-  const brushing = state.drag && state.drag.kind === 'nudge';
-  if (lastPointer && (brushing || (state.altHeld && !state.drag))) {
-    const [x, y] = lastPointer;
-    parts.push(`<circle class="brush" cx="${x}" cy="${y}" r="${state.brushRadius}"/>`);
-  }
   overlay.innerHTML = parts.join('');
 }
 
@@ -600,8 +558,7 @@ function cornerUV(i) {
 
 const isCommand = (e) => e.metaKey || e.ctrlKey;
 
-function cursorFor(hit, cmd, alt = state.altHeld) {
-  if (alt) return hit ? 'crosshair' : '';
+function cursorFor(hit, cmd) {
   if (!hit) return '';
   if (hit.kind === 'point') return cmd ? 'pointer' : 'grab';
   if (cmd) return 'copy';
@@ -645,35 +602,11 @@ container.addEventListener('pointerdown', (e) => {
   const p = localPoint(e);
   const hit = hitTest(p);
   if (!hit) return;
-  if (hit.kind === 'image' && !isCommand(e) && !e.altKey && !imageMovable()) return;
+  if (hit.kind === 'image' && !isCommand(e) && !imageMovable()) return;
   // Keep MapLibre from starting a pan/rotate for this gesture.
   e.preventDefault();
   e.stopPropagation();
   swallowing = true;
-
-  if (e.altKey) {
-    // Nudge brush: push the part of the image under the circle.
-    const { W, H } = state.image;
-    const token = checkpoint();
-    if (!state.nudge) {
-      state.nudge = makeNudge(W, H, cellsAcross(W, H, NUDGE_CELLS));
-      update();
-    }
-    state.drag = {
-      kind: 'nudge',
-      token,
-      base: buildMesh(state.warp.base, W, H, state.nudge.nx).pos,
-      last: screenToMerc(p),
-      T0: state.T.slice(),
-      pts0: state.points.map(q => ({ ...q })),
-      dx0: state.nudge.dx.slice(),
-      dy0: state.nudge.dy.slice(),
-    };
-    document.body.classList.add('dragging');
-    map.triggerRepaint();
-    drawOverlay();
-    return;
-  }
 
   // World anchors: dragging one bends the streets, not the image, and
   // ⌘-clicking the image with the streets on top adds one (and drags it).
@@ -749,38 +682,14 @@ for (const type of ['mousedown', 'touchstart', 'dblclick', 'contextmenu']) {
 
 container.addEventListener('pointermove', (e) => {
   lastPointer = localPoint(e);
-  state.altHeld = e.altKey && !!state.image;
   if (!state.drag) setHover(hitTest(lastPointer), isCommand(e));
-  if (state.altHeld) drawOverlay();
 });
-
-container.addEventListener('pointerleave', () => {
-  lastPointer = null;
-  if (!state.drag) drawOverlay();
-});
-
-// Option/Alt + scroll, or [ and ], sizes the brush.
-function setBrushRadius(r) {
-  state.brushRadius = Math.min(1000, Math.max(10, r));
-  drawOverlay();
-}
-
-container.addEventListener('wheel', (e) => {
-  if (!e.altKey || !state.image) return;
-  e.preventDefault();
-  e.stopPropagation();
-  setBrushRadius(state.brushRadius * Math.exp(-e.deltaY * 0.002));
-}, { capture: true, passive: false });
 
 window.addEventListener('pointermove', (e) => {
   const d = state.drag;
   if (!d || !e.isPrimary) return;
   lastPointer = localPoint(e);
   const m = screenToMerc(lastPointer);
-  if (d.kind === 'nudge') {
-    nudgeStep(d, m, lastPointer);
-    return;
-  }
   if (d.kind === 'world') {
     worldStep(d, [lastPointer[0] + d.offset[0], lastPointer[1] + d.offset[1]]);
     return;
@@ -820,24 +729,6 @@ window.addEventListener('pointermove', (e) => {
   }
   update();
 });
-
-// One step of the nudge brush, from the last pointer position to `m`.
-// Control points under the brush move with the image, so the point warp
-// underneath is unchanged and the edit stays local.
-function nudgeStep(d, m, screen) {
-  const n = state.nudge;
-  const edge = screenToMerc([screen[0] + state.brushRadius, screen[1]]);
-  const radius = Math.hypot(edge[0] - m[0], edge[1] - m[1]);
-  const before = state.points.map(q => nudgeAt(n, q.u, q.v));
-  brushNudge(n, state.mesh.pos, d.last[0], d.last[1], radius, m[0] - d.last[0], m[1] - d.last[1]);
-  state.points.forEach((q, i) => {
-    const [dx, dy] = nudgeAt(n, q.u, q.v);
-    q.x += dx - before[i][0];
-    q.y += dy - before[i][1];
-  });
-  d.last = m;
-  update();
-}
 
 // ---------------------------------------------------------------------------
 // World anchors. Dragging one keeps the image still and bends the streets:
@@ -918,7 +809,7 @@ function worldStep(d, cursor) {
   const pts = d.pts0.map(q => ({ ...q }));
   pts[d.index].u = uv[0];
   pts[d.index].v = uv[1];
-  const warp = warpFor(d.T0, pts, state.nudge);
+  const warp = warpFor(d.T0, pts);
   const { A, nx, ny, under } = d;
   const off = new Float64Array(nx * ny * 2);
   for (let k = 0; k < nx * ny; k++) {
@@ -1070,12 +961,7 @@ function endDrag(cancel) {
   if (cancel) {
     state.T = d.T0;
     state.points = d.pts0;
-    if (d.kind === 'nudge') {
-      state.nudge.dx.set(d.dx0);
-      state.nudge.dy.set(d.dy0);
-    }
   }
-  if (d.kind === 'nudge' && nudgeIsZero(state.nudge)) state.nudge = null;
   settle(d.token, cancel);
   state.drag = null;
   document.body.classList.remove('dragging');
@@ -1086,17 +972,10 @@ function endDrag(cancel) {
 
 window.addEventListener('pointerup', (e) => { if (e.isPrimary) endDrag(false); });
 window.addEventListener('pointercancel', () => endDrag(true));
-function setAlt(alt) {
-  if (alt === state.altHeld) return;
-  state.altHeld = alt && !!state.image;
-  if (lastPointer && !state.drag) setHover(hitTest(lastPointer), false);
-  drawOverlay();
-}
-
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') endDrag(true);
   // ⌘Z / Ctrl-Z undoes, ⇧⌘Z / Ctrl-Shift-Z / Ctrl-Y redoes, outside text fields.
-  if (isCommand(e) && !e.altKey && !e.target.closest('input[type=text], textarea')) {
+  if (isCommand(e) && !e.target.closest('input[type=text], textarea')) {
     const k = e.key.toLowerCase();
     if (k === 'z' || k === 'y') {
       e.preventDefault();
@@ -1104,24 +983,16 @@ window.addEventListener('keydown', (e) => {
       else undo();
     }
   }
-  if (e.key === 'Alt') setAlt(true);
-  if ((e.key === '[' || e.key === ']') && state.image && !e.target.closest('input, select, textarea')) {
-    setBrushRadius(state.brushRadius * (e.key === ']' ? 1.25 : 0.8));
-  }
   if ((e.key === 'Meta' || e.key === 'Control') && lastPointer && !state.drag) {
     setHover(hitTest(lastPointer), true);
   }
 });
 window.addEventListener('keyup', (e) => {
-  if (e.key === 'Alt') setAlt(false);
   if ((e.key === 'Meta' || e.key === 'Control') && lastPointer && !state.drag) {
     setHover(hitTest(lastPointer), false);
   }
 });
-window.addEventListener('blur', () => {
-  endDrag(false);
-  setAlt(false);
-});
+window.addEventListener('blur', () => endDrag(false));
 
 // ---------------------------------------------------------------------------
 // Loading images
@@ -1250,7 +1121,6 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
   state.image = { name: imageFile.name, img: source, W, H };
   state.T = placement.T;
   state.points = placement.points;
-  state.nudge = null;
   state.drag = null;
   resetHistory();
   imageLayer.texDirty = true;
@@ -1587,7 +1457,7 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
 // pixel everywhere.
 function exportMesh(minCells) {
   const { W, H } = state.image;
-  if (state.points.length < 3 && !state.nudge) {
+  if (state.points.length < 3) {
     return buildMesh(state.warp.map, W, H, minCells ? cellsAcross(W, H, minCells) : 1);
   }
   return refinedSoup(state.warp.map, W, H, cellsAcross(W, H, EXPORT_CELLS),
@@ -1745,7 +1615,6 @@ function updateUI() {
   $('zoom').disabled = !has;
   $('remove').disabled = !has;
   $('clear').disabled = !state.points.length;
-  $('unnudge').disabled = !state.nudge;
   $('undo').disabled = !has || !edits.undo.length;
   $('redo').disabled = !has || !edits.redo.length;
   const n = state.points.length;
@@ -1778,12 +1647,6 @@ $('clear').addEventListener('click', () => {
   state.points = [];
   update();
 });
-$('unnudge').addEventListener('click', () => {
-  // Undo the brushing but keep the control points where they are on the map.
-  checkpoint();
-  state.nudge = null;
-  update();
-});
 $('undo').addEventListener('click', undo);
 $('redo').addEventListener('click', redo);
 $('remove').addEventListener('click', () => {
@@ -1791,7 +1654,6 @@ $('remove').addEventListener('click', () => {
   state.mesh = null;
   state.fine = null;
   state.points = [];
-  state.nudge = null;
   resetHistory();
   state.hover = null;
   overlay.innerHTML = '';
