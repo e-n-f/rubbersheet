@@ -106,8 +106,30 @@ export function rigidMLS(P, Q) {
 }
 
 // points: [{u, v, x, y}]. Returns {map(u, v) -> [x, y], S} where S is the
-// global affine part (T itself when there are fewer than two points).
-export function makeWarp(T, points) {
+// global affine part (T itself when there are fewer than two points), and
+// with a nudge, base(u, v), the point warp alone.
+//
+// With a `nudge` field (see makeNudge), the result is the point warp plus the
+// nudge offset at (u, v). The point warp aims at each target minus the nudge
+// there, so control points still land exactly.
+export function makeWarp(T, points, nudge = null) {
+  if (!nudge) return pointWarp(T, points);
+  const base = pointWarp(T, points.map(p => {
+    const [dx, dy] = nudgeAt(nudge, p.u, p.v);
+    return { ...p, x: p.x - dx, y: p.y - dy };
+  }));
+  return {
+    S: base.S,
+    base: base.map,
+    map: (u, v) => {
+      const [x, y] = base.map(u, v);
+      const [dx, dy] = nudgeAt(nudge, u, v);
+      return [x + dx, y + dy];
+    },
+  };
+}
+
+function pointWarp(T, points) {
   if (points.length < 2) {
     return { S: T, map: (u, v) => applyAffine(T, u, v) };
   }
@@ -126,6 +148,49 @@ export function makeWarp(T, points) {
       return mls(x, y);
     },
   };
+}
+
+// A nudge field: offsets in Mercator units at the nodes of a grid over the
+// image, laid out like buildMesh's (cols across, rows to keep cells square),
+// so a mesh with the same cols has a vertex at every node.
+export function makeNudge(W, H, cols) {
+  const nx = Math.max(1, cols);
+  const ny = Math.max(1, Math.round(cols * H / W));
+  const n = (nx + 1) * (ny + 1);
+  return { W, H, nx, ny, dx: new Float64Array(n), dy: new Float64Array(n) };
+}
+
+// Bilinear offset at image pixel (u, v).
+export function nudgeAt(n, u, v) {
+  const fx = Math.min(Math.max(u / n.W * n.nx, 0), n.nx), fy = Math.min(Math.max(v / n.H * n.ny, 0), n.ny);
+  const i = Math.min(Math.floor(fx), n.nx - 1), j = Math.min(Math.floor(fy), n.ny - 1);
+  const a = fx - i, b = fy - j;
+  const k = j * (n.nx + 1) + i, k2 = k + n.nx + 1;
+  const w00 = (1 - a) * (1 - b), w10 = a * (1 - b), w01 = (1 - a) * b, w11 = a * b;
+  return [
+    w00 * n.dx[k] + w10 * n.dx[k + 1] + w01 * n.dx[k2] + w11 * n.dx[k2 + 1],
+    w00 * n.dy[k] + w10 * n.dy[k + 1] + w01 * n.dy[k2] + w11 * n.dy[k2 + 1],
+  ];
+}
+
+export function nudgeIsZero(n) {
+  return n.dx.every(v => v === 0) && n.dy.every(v => v === 0);
+}
+
+// Push the nodes whose current positions (`pos`, a mesh's vertex positions
+// on the same grid) lie within `radius` of (cx, cy) by (ddx, ddy), with a
+// smooth falloff: full at the centre, nothing at the rim.
+export function brushNudge(n, pos, cx, cy, radius, ddx, ddy) {
+  const r2 = radius * radius;
+  for (let k = 0; k < n.dx.length; k++) {
+    const ex = pos[k * 2] - cx, ey = pos[k * 2 + 1] - cy;
+    const d2 = ex * ex + ey * ey;
+    if (d2 >= r2) continue;
+    const t = 1 - d2 / r2;
+    const w = t * t;
+    n.dx[k] += w * ddx;
+    n.dy[k] += w * ddy;
+  }
 }
 
 // Evaluate the warp on a grid over the image. `cols` cells across; rows are

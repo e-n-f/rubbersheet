@@ -4,6 +4,7 @@ import {
   applyAffine, fitSimilarity, makeWarp, buildMesh, invertMesh,
   worldFileToAffine, affineToWorldFile, similarityAboutPivot,
   lngToMercX, mercXToLng, latToMercY, mercYToLat,
+  makeNudge, nudgeAt, nudgeIsZero, brushNudge,
 } from '../js/warp.js';
 import { addTextChunk, readTextChunks } from '../js/png-text.js';
 import { makeZip, readZip } from '../js/zip.js';
@@ -55,6 +56,55 @@ test('mesh inversion round-trips', () => {
   const uv = invertMesh(mesh, x, y);
   assert.ok(Math.hypot(uv[0] - 300, uv[1] - 200) < 1, `${uv}`);
   assert.equal(invertMesh(mesh, 0.9, 0.9), null);
+});
+
+test('nudge field: bilinear between nodes, exact at them', () => {
+  const n = makeNudge(1000, 500, 4);
+  assert.equal(n.ny, 2);
+  assert.ok(nudgeIsZero(n));
+  n.dx[6] = 2e-6;  // node (1, 1): u = 250, v = 250
+  close(nudgeAt(n, 250, 250)[0], 2e-6);
+  close(nudgeAt(n, 125, 250)[0], 1e-6);
+  close(nudgeAt(n, 500, 250)[0], 0);
+  assert.ok(!nudgeIsZero(n));
+});
+
+test('brush pushes nodes inside the radius only, fully at the centre', () => {
+  const W = 1000, H = 1000, T = [1e-6, 0, 0.3, 0, 1e-6, 0.4];
+  const mesh = buildMesh((u, v) => applyAffine(T, u, v), W, H, 10);
+  const n = makeNudge(W, H, 10);
+  const [cx, cy] = applyAffine(T, 500, 500);
+  brushNudge(n, mesh.pos, cx, cy, 2.5e-4, 1e-5, 0);
+  close(nudgeAt(n, 500, 500)[0], 1e-5);
+  close(nudgeAt(n, 600, 500)[0], 1e-5 * (1 - 0.16) ** 2);
+  close(nudgeAt(n, 800, 500)[0], 0);
+  close(nudgeAt(n, 500, 500)[1], 0);
+});
+
+test('a nudged warp still hits every control point exactly', () => {
+  const T = [1e-6, 0, 0.3, 0, 1e-6, 0.4];
+  const pts = [[0, 0], [1000, 0], [0, 800], [1000, 800], [500, 400]].map(([u, v], i) => {
+    const [x, y] = applyAffine(T, u, v);
+    return { u, v, x: x + (i % 2 ? 3e-5 : -2e-5), y };
+  });
+  const n = makeNudge(1000, 800, 8);
+  n.dx.fill(4e-6);
+  n.dy[20] = -7e-6;
+  for (const k of [1, 2, 5]) {
+    const w = makeWarp(T, pts.slice(0, k), n);
+    if (k >= 2) {
+      for (const p of pts.slice(0, k)) {
+        const [x, y] = w.map(p.u, p.v);
+        close(x, p.x, 1e-14); close(y, p.y, 1e-14);
+      }
+    } else {
+      // No pinning: the placement plus the nudge.
+      const [x, y] = w.map(300, 200);
+      const [ex, ey] = applyAffine(T, 300, 200);
+      const [dx, dy] = nudgeAt(n, 300, 200);
+      close(x, ex + dx, 1e-14); close(y, ey + dy, 1e-14);
+    }
+  }
 });
 
 test('world file conversion round-trips', () => {

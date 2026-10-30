@@ -2,6 +2,7 @@ import {
   applyAffine, affineScale, affineToWorldFile, buildMesh, invertMesh, makeWarp,
   meshBounds, meshCorners, meshOutline, meshTriangles, mercXToLng, mercYToLat,
   EARTH_CIRCUMFERENCE, mercToMeters, similarityAboutPivot, translateAffine, worldFileToAffine,
+  makeNudge, nudgeAt, nudgeIsZero, brushNudge,
 } from './warp.js';
 import { addTextChunk, isPNG, readTextChunks } from './png-text.js';
 import { makeZip, readZip } from './zip.js';
@@ -11,6 +12,8 @@ import { crsFromGeoKeys } from './proj.js';
 const maplibregl = window.maplibregl;
 const META_KEY = 'rubbersheet';
 const DISPLAY_CELLS = 64;
+// Nudge resolution: fine enough to push a few blocks of a city map.
+const NUDGE_CELLS = 256;
 const EXPORT_CELLS = 256;
 const HIT_RADIUS = 11;
 
@@ -42,12 +45,16 @@ const state = {
   image: null,      // {name, img, W, H}
   T: null,          // affine placement, image px -> Mercator units
   points: [],       // [{u, v, x, y}] image px -> Mercator target
+  nudge: null,      // offsets brushed on top of the point warp (makeNudge)
   warp: null,       // {map, S}
   mesh: null,       // display mesh
   origin: [0, 0],   // GPU rebasing origin for the display mesh
   drag: null,
   hover: null,
   opacity: 1,
+  brushRadius: 100, // nudge brush radius, screen px
+  altHeld: false,
+  streetsOnTop: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -237,7 +244,45 @@ const imageLayer = {
 
 map.on('style.load', () => {
   if (!map.getLayer(imageLayer.id)) map.addLayer(imageLayer);
+  raised = null;
+  if (state.streetsOnTop) setStreetsOnTop(true);
 });
+
+// ---------------------------------------------------------------------------
+// Streets on top: the vector base map's road and rail lines lifted above the
+// image as thin, brightly coloured centrelines, to judge the image against.
+
+const STREET_COLOUR = '#e0218a';
+let raised = null;  // {order: [layer ids], paint: {id: {color, width, opacity}}}
+
+function setStreetsOnTop(on) {
+  const layers = map.getStyle()?.layers || [];
+  if (on && !raised) {
+    // Roads and railways, not their casings, footpaths or ferry routes.
+    const ids = layers.filter(l => l.type === 'line' && l['source-layer'] === 'transportation' &&
+      !/casing|path|pedestrian|ferry|aeroway|pier/.test(l.id)).map(l => l.id);
+    if (!ids.length) return;
+    raised = { order: layers.map(l => l.id), ids, paint: {} };
+    for (const id of ids) {
+      raised.paint[id] = ['line-color', 'line-width', 'line-opacity'].map(k => map.getPaintProperty(id, k));
+      map.moveLayer(id);
+      map.setPaintProperty(id, 'line-color', STREET_COLOUR);
+      map.setPaintProperty(id, 'line-width', 1.25);
+      map.setPaintProperty(id, 'line-opacity', 0.85);
+    }
+  } else if (!on && raised) {
+    // Back where they were: each before the next layer of the original order.
+    const { order, ids, paint } = raised;
+    for (let i = order.length - 1; i >= 0; i--) {
+      const id = order[i];
+      if (!ids.includes(id)) continue;
+      const before = order.slice(i + 1).find(n => map.getLayer(n));
+      map.moveLayer(id, before);
+      ['line-color', 'line-width', 'line-opacity'].forEach((k, j) => map.setPaintProperty(id, k, paint[id][j]));
+    }
+    raised = null;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Coordinates
@@ -275,13 +320,31 @@ function update() {
     // A single point just rides along with the placement.
     const p = state.points[0];
     [p.x, p.y] = applyAffine(state.T, p.u, p.v);
+    if (state.nudge) {
+      const [dx, dy] = nudgeAt(state.nudge, p.u, p.v);
+      p.x += dx;
+      p.y += dy;
+    }
   }
-  state.warp = makeWarp(state.T, state.points);
+  state.warp = makeWarp(state.T, state.points, state.nudge);
   // Keep the placement in sync, so that removing points back down to one or
   // zero leaves the image where it is.
   if (state.points.length >= 2) state.T = state.warp.S;
-  const bent = state.points.length >= 3;
-  state.mesh = buildMesh(state.warp.map, W, H, bent ? cellsAcross(W, H, DISPLAY_CELLS) : 1);
+  // A nudge field shares the display mesh's grid, so the brush can find its
+  // nodes on screen. While brushing, the point warp underneath doesn't
+  // change, so only the offsets need adding to it.
+  const n = state.nudge, d = state.drag;
+  if (n && d && d.kind === 'nudge' && d.base) {
+    const pos = new Float64Array(d.base.length);
+    for (let k = 0; k < n.dx.length; k++) {
+      pos[k * 2] = d.base[k * 2] + n.dx[k];
+      pos[k * 2 + 1] = d.base[k * 2 + 1] + n.dy[k];
+    }
+    state.mesh = { ...state.mesh, pos };
+  } else {
+    const cols = n ? n.nx : state.points.length >= 3 ? cellsAcross(W, H, DISPLAY_CELLS) : 1;
+    state.mesh = buildMesh(state.warp.map, W, H, cols);
+  }
   const [minX, minY, maxX, maxY] = meshBounds(state.mesh);
   state.origin = [(minX + maxX) / 2, (minY + maxY) / 2];
   imageLayer.meshDirty = true;
@@ -321,6 +384,11 @@ function drawOverlay() {
       `<line x1="-4" y1="0" x2="4" y2="0"/><line x1="0" y1="-4" x2="0" y2="4"/>` +
       `<text x="10" y="-8">${i + 1}</text></g>`);
   });
+  const brushing = state.drag && state.drag.kind === 'nudge';
+  if (lastPointer && (brushing || (state.altHeld && !state.drag))) {
+    const [x, y] = lastPointer;
+    parts.push(`<circle class="brush" cx="${x}" cy="${y}" r="${state.brushRadius}"/>`);
+  }
   overlay.innerHTML = parts.join('');
 }
 
@@ -354,7 +422,8 @@ function cornerUV(i) {
 
 const isCommand = (e) => e.metaKey || e.ctrlKey;
 
-function cursorFor(hit, cmd) {
+function cursorFor(hit, cmd, alt = state.altHeld) {
+  if (alt) return hit ? 'crosshair' : '';
   if (!hit) return '';
   if (hit.kind === 'point') return cmd ? 'pointer' : 'grab';
   if (cmd) return 'copy';
@@ -398,11 +467,33 @@ container.addEventListener('pointerdown', (e) => {
   const p = localPoint(e);
   const hit = hitTest(p);
   if (!hit) return;
-  if (hit.kind === 'image' && !isCommand(e) && !imageMovable()) return;
+  if (hit.kind === 'image' && !isCommand(e) && !e.altKey && !imageMovable()) return;
   // Keep MapLibre from starting a pan/rotate for this gesture.
   e.preventDefault();
   e.stopPropagation();
   swallowing = true;
+
+  if (e.altKey) {
+    // Nudge brush: push the part of the image under the circle.
+    const { W, H } = state.image;
+    if (!state.nudge) {
+      state.nudge = makeNudge(W, H, cellsAcross(W, H, NUDGE_CELLS));
+      update();
+    }
+    state.drag = {
+      kind: 'nudge',
+      base: buildMesh(state.warp.base, W, H, state.nudge.nx).pos,
+      last: screenToMerc(p),
+      T0: state.T.slice(),
+      pts0: state.points.map(q => ({ ...q })),
+      dx0: state.nudge.dx.slice(),
+      dy0: state.nudge.dy.slice(),
+    };
+    document.body.classList.add('dragging');
+    map.triggerRepaint();
+    drawOverlay();
+    return;
+  }
 
   if (isCommand(e)) {
     if (hit.kind === 'point') {
@@ -452,13 +543,38 @@ for (const type of ['mousedown', 'touchstart', 'dblclick', 'contextmenu']) {
 
 container.addEventListener('pointermove', (e) => {
   lastPointer = localPoint(e);
+  state.altHeld = e.altKey && !!state.image;
   if (!state.drag) setHover(hitTest(lastPointer), isCommand(e));
+  if (state.altHeld) drawOverlay();
 });
+
+container.addEventListener('pointerleave', () => {
+  lastPointer = null;
+  if (!state.drag) drawOverlay();
+});
+
+// Option/Alt + scroll, or [ and ], sizes the brush.
+function setBrushRadius(r) {
+  state.brushRadius = Math.min(1000, Math.max(10, r));
+  drawOverlay();
+}
+
+container.addEventListener('wheel', (e) => {
+  if (!e.altKey || !state.image) return;
+  e.preventDefault();
+  e.stopPropagation();
+  setBrushRadius(state.brushRadius * Math.exp(-e.deltaY * 0.002));
+}, { capture: true, passive: false });
 
 window.addEventListener('pointermove', (e) => {
   const d = state.drag;
   if (!d || !e.isPrimary) return;
-  const m = screenToMerc(localPoint(e));
+  lastPointer = localPoint(e);
+  const m = screenToMerc(lastPointer);
+  if (d.kind === 'nudge') {
+    nudgeStep(d, m, lastPointer);
+    return;
+  }
   const dx = m[0] - d.m0[0], dy = m[1] - d.m0[1];
 
   if (d.kind === 'image') {
@@ -495,6 +611,24 @@ window.addEventListener('pointermove', (e) => {
   update();
 });
 
+// One step of the nudge brush, from the last pointer position to `m`.
+// Control points under the brush move with the image, so the point warp
+// underneath is unchanged and the edit stays local.
+function nudgeStep(d, m, screen) {
+  const n = state.nudge;
+  const edge = screenToMerc([screen[0] + state.brushRadius, screen[1]]);
+  const radius = Math.hypot(edge[0] - m[0], edge[1] - m[1]);
+  const before = state.points.map(q => nudgeAt(n, q.u, q.v));
+  brushNudge(n, state.mesh.pos, d.last[0], d.last[1], radius, m[0] - d.last[0], m[1] - d.last[1]);
+  state.points.forEach((q, i) => {
+    const [dx, dy] = nudgeAt(n, q.u, q.v);
+    q.x += dx - before[i][0];
+    q.y += dy - before[i][1];
+  });
+  d.last = m;
+  update();
+}
+
 function endDrag(cancel) {
   const d = state.drag;
   swallowing = false;
@@ -502,7 +636,12 @@ function endDrag(cancel) {
   if (cancel) {
     state.T = d.T0;
     state.points = d.pts0;
+    if (d.kind === 'nudge') {
+      state.nudge.dx.set(d.dx0);
+      state.nudge.dy.set(d.dy0);
+    }
   }
+  if (d.kind === 'nudge' && nudgeIsZero(state.nudge)) state.nudge = null;
   state.drag = null;
   document.body.classList.remove('dragging');
   update();
@@ -511,18 +650,33 @@ function endDrag(cancel) {
 
 window.addEventListener('pointerup', (e) => { if (e.isPrimary) endDrag(false); });
 window.addEventListener('pointercancel', () => endDrag(true));
+function setAlt(alt) {
+  if (alt === state.altHeld) return;
+  state.altHeld = alt && !!state.image;
+  if (lastPointer && !state.drag) setHover(hitTest(lastPointer), false);
+  drawOverlay();
+}
+
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') endDrag(true);
+  if (e.key === 'Alt') setAlt(true);
+  if ((e.key === '[' || e.key === ']') && state.image && !e.target.closest('input, select, textarea')) {
+    setBrushRadius(state.brushRadius * (e.key === ']' ? 1.25 : 0.8));
+  }
   if ((e.key === 'Meta' || e.key === 'Control') && lastPointer && !state.drag) {
     setHover(hitTest(lastPointer), true);
   }
 });
 window.addEventListener('keyup', (e) => {
+  if (e.key === 'Alt') setAlt(false);
   if ((e.key === 'Meta' || e.key === 'Control') && lastPointer && !state.drag) {
     setHover(hitTest(lastPointer), false);
   }
 });
-window.addEventListener('blur', () => endDrag(false));
+window.addEventListener('blur', () => {
+  endDrag(false);
+  setAlt(false);
+});
 
 // ---------------------------------------------------------------------------
 // Loading images
@@ -651,6 +805,7 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
   state.image = { name: imageFile.name, img: source, W, H };
   state.T = placement.T;
   state.points = placement.points;
+  state.nudge = null;
   state.drag = null;
   imageLayer.texDirty = true;
   update();
@@ -983,7 +1138,7 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
 // The export mesh: dense enough for the warp, and for reprojection.
 function exportMesh(minCells) {
   const { W, H } = state.image;
-  const cells = state.points.length >= 3 ? EXPORT_CELLS : minCells;
+  const cells = state.points.length >= 3 || state.nudge ? EXPORT_CELLS : minCells;
   return buildMesh(state.warp.map, W, H, cells ? cellsAcross(W, H, cells) : 1);
 }
 
@@ -1135,6 +1290,7 @@ function updateUI() {
   $('zoom').disabled = !has;
   $('remove').disabled = !has;
   $('clear').disabled = !state.points.length;
+  $('unnudge').disabled = !state.nudge;
   const n = state.points.length;
   const pts = has
     ? `<br>${n} control point${n === 1 ? '' : 's'}${n < 2 ? ' — ⌘/Ctrl-click the image to add one.' : '.'}`
@@ -1164,10 +1320,16 @@ $('clear').addEventListener('click', () => {
   state.points = [];
   update();
 });
+$('unnudge').addEventListener('click', () => {
+  // Undo the brushing but keep the control points where they are on the map.
+  state.nudge = null;
+  update();
+});
 $('remove').addEventListener('click', () => {
   state.image = null;
   state.mesh = null;
   state.points = [];
+  state.nudge = null;
   state.hover = null;
   overlay.innerHTML = '';
   map.getCanvas().style.cursor = '';
@@ -1183,6 +1345,12 @@ $('opacity').addEventListener('input', (e) => {
 });
 $('basemap').addEventListener('change', (e) => {
   map.setStyle(STYLES[e.target.value], { diff: false });
+  // Only the vector street map has separate road layers to lift.
+  $('streets-on-top').disabled = e.target.value !== 'streets';
+});
+$('streets-on-top').addEventListener('change', (e) => {
+  state.streetsOnTop = e.target.checked;
+  setStreetsOnTop(state.streetsOnTop);
 });
 
 const imageParam = new URLSearchParams(window.location.search).get('image');

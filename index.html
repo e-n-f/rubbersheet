@@ -29,6 +29,7 @@
         <option value="osm">OpenStreetMap</option>
       </select>
     </div>
+    <label class="check"><input id="streets-on-top" type="checkbox"> Streets on top of the image</label>
     <div class="row">
       <label for="format">Format</label>
       <select id="format">
@@ -42,6 +43,7 @@
       <button id="export" disabled>Export</button>
       <button id="zoom" disabled>Zoom to image</button>
       <button id="clear" disabled>Clear points</button>
+      <button id="unnudge" disabled>Clear nudges</button>
       <button id="remove" disabled>Remove image</button>
     </div>
     <label class="check" id="worldfile-row"><input id="worldfile" type="checkbox"> Also download world file (.pgw + .aux.xml)</label>
@@ -53,6 +55,8 @@
         <li><b>Drag a corner</b> to scale and rotate. Hold <kbd>Shift</kbd> to scale without rotating. The corners lock once there's a control point.</li>
         <li><b><kbd>⌘</kbd>/<kbd>Ctrl</kbd>-click</b> the image to add a control point. Do it again on a point to remove it.</li>
         <li><b>Drag a control point</b> to pin that spot of the image to a new place on the map. The image warps to fit.</li>
+        <li><b><kbd>⌥</kbd>/<kbd>Alt</kbd>-drag</b> to nudge: everything inside the circle moves with the pointer, fading out toward the rim. <kbd>⌥</kbd>/<kbd>Alt</kbd>-scroll or <kbd>[</kbd> <kbd>]</kbd> sizes the circle. Control points under it move along.</li>
+        <li><b>Streets on top</b> draws the street map's roads and railways over the image as thin lines, so you can see where the image is off. (Streets base map only.)</li>
         <li><b>Export</b> saves the warped image, north-up. PNG and GeoTIFF are in Web Mercator; KMZ opens in Google Earth. The placement and control points are stored inside, so dropping the file back on the map puts it in the same place.</li>
       </ul>
     </details>

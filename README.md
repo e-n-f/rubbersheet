@@ -10,6 +10,8 @@ Map rubbersheeting in the browser. Drop a scanned map or photo onto a MapLibre b
 - **Drag a corner handle** to scale and rotate around the image centre. Hold <kbd>Shift</kbd> to scale without rotating. (This works only before the first control point is added.)
 - **⌘-click** (Ctrl-click on Windows/Linux) the image to add a control point. ⌘-click a point to remove it.
 - **Drag a control point** to move that spot of the image to a new place on the map. The image goes half-transparent while you drag so you can see the map underneath.
+- **⌥-drag** (Alt-drag on Windows/Linux) to nudge. Everything inside the circle moves with the pointer, fully at the centre and fading to nothing at the rim. ⌥-scroll, or <kbd>[</kbd> and <kbd>]</kbd>, sizes the circle. Control points under the brush move along with the image, so a nudge only changes what's inside the circle. *Clear nudges* undoes all nudging and leaves the control points where they are on the map.
+- **Streets on top of the image** draws the street base map's roads and railways over the image as thin magenta lines, so you can see where the image is off. It only works with the *Streets* base map, which has separate road layers.
 - <kbd>Esc</kbd> during a drag cancels it.
 - **Export** saves the warped image, north-up, in the format chosen under *Format*:
   - **PNG**: Web Mercator (EPSG:3857), at about the source resolution.
@@ -24,6 +26,8 @@ How the image is fitted depends on the number of control points:
 | 1 | Dragging the point moves the whole image |
 | 2 | The similarity transform (shift + scale + rotation) through both points |
 | 3+ | A least-squares similarity, then rigid Moving Least Squares (Schaefer et al. 2006) to bend the rest of the way. Every point lands exactly where you put it. |
+
+Nudges are offsets on a 256-cell grid over the image, added on top of the points' warp. That warp aims each point at its target minus the nudge there, so points still land exactly.
 
 The warp is evaluated on a 64×64 grid and drawn as a textured mesh in a MapLibre custom WebGL layer, so it updates live while you drag. The export uses the same method on a 256×256 grid.
 
