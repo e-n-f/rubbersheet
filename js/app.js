@@ -54,7 +54,7 @@ const state = {
   opacity: 1,
   brushRadius: 100, // nudge brush radius, screen px
   altHeld: false,
-  streets: 'off',   // street lines over the image: 'off', 'lines' or 'mask'
+  streetsOnTop: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -237,7 +237,10 @@ const imageLayer = {
     gl.disable(gl.CULL_FACE);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    const opacity = state.drag ? Math.min(0.5, state.opacity) : state.opacity;
+    // Half see-through while dragging, except when the streets on top are what
+    // moves.
+    const see = state.drag && state.drag.kind !== 'streets';
+    const opacity = see ? Math.min(0.5, state.opacity) : state.opacity;
     this.renderer.draw(rebaseMatrix(matrix, state.origin[0], state.origin[1]), opacity);
   },
 };
@@ -249,53 +252,36 @@ map.on('style.load', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Streets over the image: the vector base map's road and rail lines lifted
-// above it, either as thin bright centrelines to align against ('lines'), or
-// as broad strokes in the image's paper colour ('mask') that hide the image's
-// streets where they line up, so the places that don't stand out. Yellow
-// rather than magenta, which many colour-blind eyes lose.
+// Streets on top: the vector base map's road and rail lines lifted above the
+// image as thin bright centrelines to align against. Yellow rather than
+// magenta, which many colour-blind eyes lose. While a control point is
+// dragged they shift with the pointer (see the 'streets' drag).
 
 const STREET_COLOUR = '#ffe600';
-const MASK_METRES = 150 * 0.3048;
-const STREET_PAINT = ['line-color', 'line-width', 'line-opacity', 'line-dasharray'];
-let raised = null;  // {order: [all layer ids], ids: [raised], paint: {id: [...]}, cap: {id}}
-
-// What to show now: the mask gives way to thin lines while a control point
-// is dragged, so you can see what you're aligning to.
-function streetMode() {
-  const mode = state.streets;
-  return mode === 'mask' && state.drag && state.drag.kind === 'point' ? 'lines' : mode;
-}
+const STREET_PAINT = ['line-color', 'line-width', 'line-opacity', 'line-translate'];
+let raised = null;  // {order: [all layer ids], ids: [raised], paint: {id: [...]}}
 
 function applyStreets() {
-  const mode = streetMode();
-  if (mode === 'off') {
+  if (!state.streetsOnTop) {
     lowerStreets();
     return;
   }
-  if (!raised && !raiseStreets()) return;
-  const mask = mode === 'mask';
-  const width = mask ? maskWidth() : 1.5;
+  if (raised || !raiseStreets()) return;
   for (const id of raised.ids) {
-    const orig = raised.paint[id];
-    map.setPaintProperty(id, 'line-color', mask ? state.image?.paper || '#f1e4c3' : STREET_COLOUR);
-    map.setPaintProperty(id, 'line-width', width);
+    map.setPaintProperty(id, 'line-color', STREET_COLOUR);
+    map.setPaintProperty(id, 'line-width', 1.5);
     map.setPaintProperty(id, 'line-opacity', 1);
-    map.setPaintProperty(id, 'line-dasharray', mask ? undefined : orig[3]);
-    map.setLayoutProperty(id, 'line-cap', mask ? 'round' : raised.cap[id]);
   }
 }
 
-// MASK_METRES on the ground at the image's latitude, at any zoom. MapLibre's
-// world is 512 px across at zoom 0.
-function maskWidth() {
-  let lat = map.getCenter().lat;
-  if (state.mesh) {
-    const [, minY, , maxY] = meshBounds(state.mesh);
-    lat = toLngLat([0.5, (minY + maxY) / 2]).lat;
-  }
-  const w0 = MASK_METRES * 512 / (EARTH_CIRCUMFERENCE * Math.cos(lat * Math.PI / 180));
-  return ['interpolate', ['exponential', 2], ['zoom'], 0, w0, 24, w0 * 2 ** 24];
+// Draw the raised lines shifted by [dx, dy] screen pixels.
+function shiftStreets(dx, dy) {
+  if (!raised) return;
+  for (const id of raised.ids) map.setPaintProperty(id, 'line-translate', [dx, dy]);
+}
+
+function streetsRaised() {
+  return !!raised;
 }
 
 function raiseStreets() {
@@ -304,10 +290,9 @@ function raiseStreets() {
   const ids = layers.filter(l => l.type === 'line' && l['source-layer'] === 'transportation' &&
     !/casing|path|pedestrian|ferry|aeroway|pier/.test(l.id)).map(l => l.id);
   if (!ids.length) return false;
-  raised = { order: layers.map(l => l.id), ids, paint: {}, cap: {} };
+  raised = { order: layers.map(l => l.id), ids, paint: {} };
   for (const id of ids) {
     raised.paint[id] = STREET_PAINT.map(k => map.getPaintProperty(id, k));
-    raised.cap[id] = map.getLayoutProperty(id, 'line-cap');
     map.moveLayer(id);
   }
   return true;
@@ -316,44 +301,15 @@ function raiseStreets() {
 function lowerStreets() {
   if (!raised) return;
   // Back where they were: each before the next layer of the original order.
-  const { order, ids, paint, cap } = raised;
+  const { order, ids, paint } = raised;
   for (let i = order.length - 1; i >= 0; i--) {
     const id = order[i];
     if (!ids.includes(id)) continue;
     const before = order.slice(i + 1).find(n => map.getLayer(n));
     map.moveLayer(id, before);
     STREET_PAINT.forEach((k, j) => map.setPaintProperty(id, k, paint[id][j]));
-    map.setLayoutProperty(id, 'line-cap', cap[id]);
   }
   raised = null;
-}
-
-// The image's paper colour: the commonest colour, in coarse bins, among its
-// opaque pixels.
-function paperColour(img) {
-  const W = img.naturalWidth || img.width, H = img.naturalHeight || img.height;
-  const k = Math.min(1, 256 / Math.max(W, H));
-  const c = document.createElement('canvas');
-  c.width = Math.max(1, Math.round(W * k));
-  c.height = Math.max(1, Math.round(H * k));
-  const ctx = c.getContext('2d');
-  ctx.drawImage(img, 0, 0, c.width, c.height);
-  const px = ctx.getImageData(0, 0, c.width, c.height).data;
-  const count = new Map();
-  for (let i = 0; i < px.length; i += 4) {
-    if (px[i + 3] < 128) continue;
-    const key = (px[i] >> 4) << 8 | (px[i + 1] >> 4) << 4 | px[i + 2] >> 4;
-    count.set(key, (count.get(key) || 0) + 1);
-  }
-  let best = -1, n = 0;
-  for (const [key, v] of count) if (v > n) [best, n] = [key, v];
-  if (best < 0) return null;
-  let r = 0, g = 0, b = 0, m = 0;
-  for (let i = 0; i < px.length; i += 4) {
-    if (px[i + 3] < 128 || ((px[i] >> 4) << 8 | (px[i + 1] >> 4) << 4 | px[i + 2] >> 4) !== best) continue;
-    r += px[i]; g += px[i + 1]; b += px[i + 2]; m++;
-  }
-  return `rgb(${Math.round(r / m)}, ${Math.round(g / m)}, ${Math.round(b / m)})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -520,13 +476,19 @@ function drawOverlay() {
   }
   state.points.forEach((p, i) => {
     const [x, y] = mercToScreen([p.x, p.y]);
-    const active = state.drag && state.drag.kind === 'point' && state.drag.index === i;
+    const active = state.drag && ['point', 'streets'].includes(state.drag.kind) && state.drag.index === i;
     const hover = state.hover && state.hover.kind === 'point' && state.hover.index === i;
     parts.push(`<g class="cp${active ? ' active' : ''}${hover ? ' hover' : ''}" transform="translate(${x},${y})">` +
       `<circle class="ring" r="7"/>` +
       `<line x1="-4" y1="0" x2="4" y2="0"/><line x1="0" y1="-4" x2="0" y2="4"/>` +
       `<text x="10" y="-8">${i + 1}</text></g>`);
   });
+  const d = state.drag;
+  if (d && d.kind === 'streets' && d.index < 0 && lastPointer) {
+    // The new point: the part of the image under the pointer.
+    parts.push(`<g class="cp active" transform="translate(${lastPointer[0]},${lastPointer[1]})">` +
+      `<circle class="ring" r="7"/><line x1="-4" y1="0" x2="4" y2="0"/><line x1="0" y1="-4" x2="0" y2="4"/></g>`);
+  }
   const brushing = state.drag && state.drag.kind === 'nudge';
   if (lastPointer && (brushing || (state.altHeld && !state.drag))) {
     const [x, y] = lastPointer;
@@ -640,6 +602,25 @@ container.addEventListener('pointerdown', (e) => {
     return;
   }
 
+  // With the streets on top, dragging a control point moves the streets
+  // rather than the image, and ⌘-dragging the image does that for a new
+  // point. A ⌘-click that doesn't move still just adds a point in place.
+  if (streetsRaised() && (isCommand(e) ? hit.kind === 'image' : hit.kind === 'point')) {
+    state.drag = {
+      kind: 'streets',
+      token: checkpoint(),
+      index: hit.kind === 'point' ? hit.index : -1,
+      s0: p,
+      shift: [0, 0],
+      T0: state.T.slice(),
+      pts0: state.points.map(q => ({ ...q })),
+    };
+    document.body.classList.add('dragging');
+    map.getCanvas().style.cursor = 'grabbing';
+    drawOverlay();
+    return;
+  }
+
   if (isCommand(e)) {
     checkpoint();
     if (hit.kind === 'point') {
@@ -671,7 +652,6 @@ container.addEventListener('pointerdown', (e) => {
     drag.pivot = state.warp.map(W / 2, H / 2);
   }
   state.drag = drag;
-  if (state.streets === 'mask' && hit.kind === 'point') applyStreets();
   document.body.classList.add('dragging');
   map.getCanvas().style.cursor = hit.kind === 'point' ? 'grabbing' : cursorFor(hit, false);
   map.triggerRepaint();
@@ -721,6 +701,12 @@ window.addEventListener('pointermove', (e) => {
   const m = screenToMerc(lastPointer);
   if (d.kind === 'nudge') {
     nudgeStep(d, m, lastPointer);
+    return;
+  }
+  if (d.kind === 'streets') {
+    d.shift = [lastPointer[0] - d.s0[0], lastPointer[1] - d.s0[1]];
+    shiftStreets(...d.shift);
+    drawOverlay();
     return;
   }
   const dx = m[0] - d.m0[0], dy = m[1] - d.m0[1];
@@ -777,10 +763,35 @@ function nudgeStep(d, m, screen) {
   update();
 }
 
+// The streets were drawn shifted by d.shift: pin the image under where a
+// street was dragged to that street's real place.
+function finishStreetsDrag(d) {
+  const [dx, dy] = d.shift;
+  if (d.index >= 0) {
+    const q = state.points[d.index];
+    const [sx, sy] = mercToScreen([q.x, q.y]);
+    const [nx, ny] = screenToMerc([sx - dx, sy - dy]);
+    // A lone point rides on the placement, so move that.
+    if (state.points.length === 1) state.T = translateAffine(state.T, nx - q.x, ny - q.y);
+    q.x = nx;
+    q.y = ny;
+    return;
+  }
+  const m = screenToMerc([d.s0[0] + dx, d.s0[1] + dy]);
+  const uv = invertMesh(state.mesh, m[0], m[1]);
+  if (!uv) return;
+  const target = screenToMerc(d.s0);
+  state.points.push({ u: uv[0], v: uv[1], x: target[0], y: target[1] });
+}
+
 function endDrag(cancel) {
   const d = state.drag;
   swallowing = false;
   if (!d) return;
+  if (d.kind === 'streets') {
+    shiftStreets(0, 0);
+    if (!cancel) finishStreetsDrag(d);
+  }
   if (cancel) {
     state.T = d.T0;
     state.points = d.pts0;
@@ -794,7 +805,11 @@ function endDrag(cancel) {
   state.drag = null;
   document.body.classList.remove('dragging');
   update();
-  if (state.streets === 'mask' && d.kind === 'point') applyStreets();
+  // Pan along with the drag, so the streets stay where they were dropped and
+  // the newly pinned part of the image stays under the pointer.
+  if (d.kind === 'streets' && !cancel && (d.shift[0] || d.shift[1])) {
+    map.panBy([-d.shift[0], -d.shift[1]], { duration: 0 });
+  }
   if (lastPointer) setHover(hitTest(lastPointer), false);
 }
 
@@ -961,7 +976,7 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
     placement = { T: dropPlacement(dropPoint, W, H), points: [] };
   }
 
-  state.image = { name: imageFile.name, img: source, W, H, paper: paperColour(source) };
+  state.image = { name: imageFile.name, img: source, W, H };
   state.T = placement.T;
   state.points = placement.points;
   state.nudge = null;
@@ -969,7 +984,6 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
   resetHistory();
   imageLayer.texDirty = true;
   update();
-  if (state.streets === 'mask') applyStreets();
   if ((placement.points.length || how) && !keepView) zoomToImage();
   if (!fromURL) clearImageParam();
   setStatus(`<b>${escapeHTML(imageFile.name)}</b> (${W}×${H})${how ? ', ' + how : ''}.` +
@@ -1514,10 +1528,10 @@ $('opacity').addEventListener('input', (e) => {
 $('basemap').addEventListener('change', (e) => {
   map.setStyle(STYLES[e.target.value], { diff: false });
   // Only the vector street map has separate road layers to lift.
-  $('streets').disabled = e.target.value !== 'streets';
+  $('streets-on-top').disabled = e.target.value !== 'streets';
 });
-$('streets').addEventListener('change', (e) => {
-  state.streets = e.target.value;
+$('streets-on-top').addEventListener('change', (e) => {
+  state.streetsOnTop = e.target.checked;
   applyStreets();
 });
 
