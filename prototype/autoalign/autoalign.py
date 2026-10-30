@@ -135,7 +135,9 @@ class ScaledGeoref:
 def extract_ink(rgb, min_extent, mode='usgs'):
     """Boolean mask of black linework."""
     if mode == 'relative':
-        return drop_small(relative_ink(rgb), min_extent)
+        # Hand-drawn lines break at many crossings; bridge small gaps when
+        # measuring them.
+        return drop_small(relative_ink(rgb), min_extent, bridge=2)
     a = rgb.astype(np.float32)
     r, g, b = a[..., 0], a[..., 1], a[..., 2]
     lum = a.mean(-1)
@@ -172,15 +174,16 @@ def relative_ink(rgb, dark=0.25):
     return ink & (np.abs(rg) < 0.25) & (rb > -0.6)
 
 
-def drop_small(ink, min_extent):
+def drop_small(ink, min_extent, bridge=0):
     """Drop lettering and dots: components smaller than min_extent pixels
-    in both directions."""
-    lab, n = ndi.label(ink, structure=np.ones((3, 3)))
+    in both directions, after closing gaps of up to 2 x bridge pixels."""
+    joined = ndi.binary_dilation(ink, iterations=bridge) if bridge else ink
+    lab, n = ndi.label(joined, structure=np.ones((3, 3)))
     keep = np.zeros(n + 1, bool)
     for i, sl in enumerate(ndi.find_objects(lab), 1):
         if sl is not None and max(sl[0].stop - sl[0].start, sl[1].stop - sl[1].start) >= min_extent:
             keep[i] = True
-    return keep[lab]
+    return keep[lab] & ink
 
 
 def neatline_mask(geo, shape, margin=15):

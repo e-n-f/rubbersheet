@@ -97,6 +97,14 @@ This is a photographed wall map with coloured parcels on orange-tan paper. It is
 
 With those, the global fit leaves the two-point placement almost alone: 0.2% scale, 0.2° rotation, about 40 m of shift. The local field adds up to ~100 m, growing toward Alameda, Fruitvale and East Oakland, where the two points give no control. Side-by-side crops show modern streets sitting on the drawn ones there after correction, and not before. Downtown, Berkeley and Emeryville were already about right.
 
+## Results: Wackenreuder, City and County of San Francisco, 1861
+
+This is a photographed map with fine brown-black street lines on yellow paper and colour washes. Like Oakland, the input was a two-point rubbersheet placement, run with `--whole-image --ink relative --highpass 200`.
+
+- **What went wrong first:** the paper-relative ink test found the streets, but the lettering filter threw almost all of them away. The hand-drawn lines break at nearly every crossing, so no single piece was 500 m long. Paper-relative ink now bridges 2-pixel gaps when measuring pieces, keeping only the original ink pixels. Before the fix, the fit locked onto noise and moved the map 600 m.
+- **After the fix:** the fit adds a 1.2% scale change and ~40 m of shift to the two-point placement, plus up to ~55 m of local correction.
+- **Spot checks:** in side-by-side crops, Potrero's grid moves onto the modern streets, and North Beach and the Western Addition improve. Downtown, near one of the two points, stays where it was. The Presidio and the southern ranchos have too little matching linework to judge.
+
 ## Next steps
 
 - **Hydrography.** Extract the blue ink and match it against OSM waterways or NHD flowlines. That would cover marsh and bay margins like #14's, as long as the channel is natural and hasn't been rerouted since.
