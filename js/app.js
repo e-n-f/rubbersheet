@@ -251,8 +251,9 @@ map.on('style.load', () => {
 // ---------------------------------------------------------------------------
 // Streets on top: the vector base map's road and rail lines lifted above the
 // image as thin, brightly coloured centrelines, to judge the image against.
+// Yellow rather than magenta, which many colour-blind eyes lose.
 
-const STREET_COLOUR = '#e0218a';
+const STREET_COLOUR = '#ffe600';
 let raised = null;  // {order: [layer ids], paint: {id: {color, width, opacity}}}
 
 function setStreetsOnTop(on) {
@@ -267,8 +268,8 @@ function setStreetsOnTop(on) {
       raised.paint[id] = ['line-color', 'line-width', 'line-opacity'].map(k => map.getPaintProperty(id, k));
       map.moveLayer(id);
       map.setPaintProperty(id, 'line-color', STREET_COLOUR);
-      map.setPaintProperty(id, 'line-width', 1.25);
-      map.setPaintProperty(id, 'line-opacity', 0.85);
+      map.setPaintProperty(id, 'line-width', 1.5);
+      map.setPaintProperty(id, 'line-opacity', 1);
     }
   } else if (!on && raised) {
     // Back where they were: each before the next layer of the original order.
@@ -356,6 +357,77 @@ function update() {
 // Columns for a grid whose longer side has `cells` cells.
 function cellsAcross(W, H, cells) {
   return W >= H ? cells : Math.max(1, Math.round(cells * W / H));
+}
+
+// ---------------------------------------------------------------------------
+// Undo and redo: snapshots of the placement, points and nudges, taken before
+// each edit.
+
+const MAX_UNDO = 50;
+const edits = { undo: [], redo: [] };
+
+function snapshot() {
+  const n = state.nudge;
+  return {
+    T: state.T.slice(),
+    points: state.points.map(p => ({ ...p })),
+    nudge: n && { ...n, dx: n.dx.slice(), dy: n.dy.slice() },
+  };
+}
+
+function restore(snap) {
+  const { T, points, nudge } = snap;
+  state.T = T.slice();
+  state.points = points.map(p => ({ ...p }));
+  state.nudge = nudge && { ...nudge, dx: nudge.dx.slice(), dy: nudge.dy.slice() };
+  update();
+}
+
+function sameAsNow(snap) {
+  const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+  const n = state.nudge;
+  return same(snap.T, state.T) &&
+    snap.points.length === state.points.length &&
+    snap.points.every((p, i) => ['u', 'v', 'x', 'y'].every(k => p[k] === state.points[i][k])) &&
+    (snap.nudge ? !!n && same(snap.nudge.dx, n.dx) && same(snap.nudge.dy, n.dy) : !n);
+}
+
+// Call before an edit. Returns a token for settle().
+function checkpoint() {
+  const token = { redo: edits.redo };
+  edits.undo.push(snapshot());
+  if (edits.undo.length > MAX_UNDO) edits.undo.shift();
+  edits.redo = [];
+  updateUI();
+  return token;
+}
+
+// After a drag: drop the checkpoint if the drag was cancelled or changed
+// nothing, so it doesn't leave an empty step (or lose the redo history).
+function settle(token, cancelled) {
+  const snap = edits.undo[edits.undo.length - 1];
+  if (snap && (cancelled || sameAsNow(snap))) {
+    edits.undo.pop();
+    edits.redo = token.redo;
+  }
+  updateUI();
+}
+
+function undo() {
+  if (state.drag || !edits.undo.length) return;
+  edits.redo.push(snapshot());
+  restore(edits.undo.pop());
+}
+
+function redo() {
+  if (state.drag || !edits.redo.length) return;
+  edits.undo.push(snapshot());
+  restore(edits.redo.pop());
+}
+
+function resetHistory() {
+  edits.undo = [];
+  edits.redo = [];
 }
 
 // ---------------------------------------------------------------------------
@@ -476,12 +548,14 @@ container.addEventListener('pointerdown', (e) => {
   if (e.altKey) {
     // Nudge brush: push the part of the image under the circle.
     const { W, H } = state.image;
+    const token = checkpoint();
     if (!state.nudge) {
       state.nudge = makeNudge(W, H, cellsAcross(W, H, NUDGE_CELLS));
       update();
     }
     state.drag = {
       kind: 'nudge',
+      token,
       base: buildMesh(state.warp.base, W, H, state.nudge.nx).pos,
       last: screenToMerc(p),
       T0: state.T.slice(),
@@ -496,6 +570,7 @@ container.addEventListener('pointerdown', (e) => {
   }
 
   if (isCommand(e)) {
+    checkpoint();
     if (hit.kind === 'point') {
       state.points.splice(hit.index, 1);
     } else {
@@ -510,6 +585,7 @@ container.addEventListener('pointerdown', (e) => {
 
   const m0 = screenToMerc(p);
   const drag = {
+    token: checkpoint(),
     kind: hit.kind,
     index: hit.index,
     m0,
@@ -642,6 +718,7 @@ function endDrag(cancel) {
     }
   }
   if (d.kind === 'nudge' && nudgeIsZero(state.nudge)) state.nudge = null;
+  settle(d.token, cancel);
   state.drag = null;
   document.body.classList.remove('dragging');
   update();
@@ -659,6 +736,15 @@ function setAlt(alt) {
 
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') endDrag(true);
+  // ⌘Z / Ctrl-Z undoes, ⇧⌘Z / Ctrl-Shift-Z / Ctrl-Y redoes, outside text fields.
+  if (isCommand(e) && !e.altKey && !e.target.closest('input[type=text], textarea')) {
+    const k = e.key.toLowerCase();
+    if (k === 'z' || k === 'y') {
+      e.preventDefault();
+      if (k === 'y' || e.shiftKey) redo();
+      else undo();
+    }
+  }
   if (e.key === 'Alt') setAlt(true);
   if ((e.key === '[' || e.key === ']') && state.image && !e.target.closest('input, select, textarea')) {
     setBrushRadius(state.brushRadius * (e.key === ']' ? 1.25 : 0.8));
@@ -807,6 +893,7 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
   state.points = placement.points;
   state.nudge = null;
   state.drag = null;
+  resetHistory();
   imageLayer.texDirty = true;
   update();
   if ((placement.points.length || how) && !keepView) zoomToImage();
@@ -1291,6 +1378,8 @@ function updateUI() {
   $('remove').disabled = !has;
   $('clear').disabled = !state.points.length;
   $('unnudge').disabled = !state.nudge;
+  $('undo').disabled = !has || !edits.undo.length;
+  $('redo').disabled = !has || !edits.redo.length;
   const n = state.points.length;
   const pts = has
     ? `<br>${n} control point${n === 1 ? '' : 's'}${n < 2 ? ' — ⌘/Ctrl-click the image to add one.' : '.'}`
@@ -1317,19 +1406,24 @@ $('format').addEventListener('change', (e) => {
 });
 $('zoom').addEventListener('click', zoomToImage);
 $('clear').addEventListener('click', () => {
+  checkpoint();
   state.points = [];
   update();
 });
 $('unnudge').addEventListener('click', () => {
   // Undo the brushing but keep the control points where they are on the map.
+  checkpoint();
   state.nudge = null;
   update();
 });
+$('undo').addEventListener('click', undo);
+$('redo').addEventListener('click', redo);
 $('remove').addEventListener('click', () => {
   state.image = null;
   state.mesh = null;
   state.points = [];
   state.nudge = null;
+  resetHistory();
   state.hover = null;
   overlay.innerHTML = '';
   map.getCanvas().style.cursor = '';

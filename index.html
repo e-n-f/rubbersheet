@@ -41,6 +41,8 @@
 
     <div class="buttons">
       <button id="export" disabled>Export</button>
+      <button id="undo" disabled title="⌘Z / Ctrl-Z">Undo</button>
+      <button id="redo" disabled title="⇧⌘Z / Ctrl-Y">Redo</button>
       <button id="zoom" disabled>Zoom to image</button>
       <button id="clear" disabled>Clear points</button>
       <button id="unnudge" disabled>Clear nudges</button>
@@ -57,6 +59,7 @@
         <li><b>Drag a control point</b> to pin that spot of the image to a new place on the map. The image warps to fit.</li>
         <li><b><kbd>⌥</kbd>/<kbd>Alt</kbd>-drag</b> to nudge: everything inside the circle moves with the pointer, fading out toward the rim. <kbd>⌥</kbd>/<kbd>Alt</kbd>-scroll or <kbd>[</kbd> <kbd>]</kbd> sizes the circle. Control points under it move along.</li>
         <li><b>Streets on top</b> draws the street map's roads and railways over the image as thin lines, so you can see where the image is off. (Streets base map only.)</li>
+        <li><b>Undo</b> with <kbd>⌘</kbd>/<kbd>Ctrl</kbd>-<kbd>Z</kbd>, <b>redo</b> with <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> or <kbd>Ctrl</kbd>-<kbd>Y</kbd>. Each drag, brush stroke, added or removed point and Clear is one step.</li>
         <li><b>Export</b> saves the warped image, north-up. PNG and GeoTIFF are in Web Mercator; KMZ opens in Google Earth. The placement and control points are stored inside, so dropping the file back on the map puts it in the same place.</li>
       </ul>
     </details>

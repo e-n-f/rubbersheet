@@ -11,8 +11,9 @@ Map rubbersheeting in the browser. Drop a scanned map or photo onto a MapLibre b
 - **⌘-click** (Ctrl-click on Windows/Linux) the image to add a control point. ⌘-click a point to remove it.
 - **Drag a control point** to move that spot of the image to a new place on the map. The image goes half-transparent while you drag so you can see the map underneath.
 - **⌥-drag** (Alt-drag on Windows/Linux) to nudge. Everything inside the circle moves with the pointer, fully at the centre and fading to nothing at the rim. ⌥-scroll, or <kbd>[</kbd> and <kbd>]</kbd>, sizes the circle. Control points under the brush move along with the image, so a nudge only changes what's inside the circle. *Clear nudges* undoes all nudging and leaves the control points where they are on the map.
-- **Streets on top of the image** draws the street base map's roads and railways over the image as thin magenta lines, so you can see where the image is off. It only works with the *Streets* base map, which has separate road layers.
+- **Streets on top of the image** draws the street base map's roads and railways over the image as thin bright yellow lines, so you can see where the image is off. It only works with the *Streets* base map, which has separate road layers.
 - <kbd>Esc</kbd> during a drag cancels it.
+- **Undo** with ⌘Z (Ctrl-Z) or the *Undo* button, and **redo** with ⇧⌘Z (Ctrl-Shift-Z or Ctrl-Y) or *Redo*. Each drag, brush stroke, added or removed point and *Clear* is one step, up to 50 back. Loading or removing an image starts afresh.
 - **Export** saves the warped image, north-up, in the format chosen under *Format*:
   - **PNG**: Web Mercator (EPSG:3857), at about the source resolution.
   - **GeoTIFF**: the same image as a deflate-compressed RGBA GeoTIFF in EPSG:3857. QGIS, ArcGIS and GDAL open it directly, with no side files.
