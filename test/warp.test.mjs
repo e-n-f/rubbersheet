@@ -316,8 +316,8 @@ function paperImage(w, h) {
 test('paper colour follows the lighting and ignores ink and washes', () => {
   const w = 320, h = 200;
   const p = estimatePaper(paperImage(w, h), w, h);
-  assert.equal(p.gw, 20);
-  assert.equal(p.gh, 13);
+  assert.equal(p.gw, 40);
+  assert.equal(p.gh, 25);
   for (let j = 0; j < p.gh; j++) {
     for (let i = 0; i < p.gw; i++) {
       const light = 1 - 0.3 * (i + 0.5) / p.gw;

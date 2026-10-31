@@ -31,6 +31,7 @@
       <label for="basemap">Base map</label>
       <select id="basemap">
         <option value="streets">Streets</option>
+        <option value="lines">Lines &amp; contours</option>
         <option value="satellite">Satellite</option>
         <option value="osm">OpenStreetMap</option>
       </select>
@@ -62,7 +63,7 @@
         <li><b>Drag a corner</b> to scale and rotate. Hold <kbd>Shift</kbd> to scale without rotating. The corners lock once there's a control point.</li>
         <li><b><kbd>⌘</kbd>/<kbd>Ctrl</kbd>-click</b> the image to add a control point. Do it again on a point to remove it.</li>
         <li><b>Drag a control point</b> to pin that spot of the image to a new place on the map. The image warps to fit.</li>
-        <li><b>Streets on top of the image</b> draws the street map's roads and railways over the image as thin yellow lines. While it's on, <kbd>⌘</kbd>/<kbd>Ctrl</kbd>-clicking the image adds a <b>world anchor</b> (a blue square), which is tied to that place on the map rather than to the image. Dragging a world anchor bends the streets instead of the image: drag the street onto the image's feature and let go. The image warps to bring that feature to the anchor's place, and the map eases so the anchor stays where you let go. Points added with the streets off are image anchors (red circles); dragging one moves the image. (Streets base map only.)</li>
+        <li><b>Streets on top of the image</b> draws the street map's roads and railways over the image as thin yellow lines. While it's on, <kbd>⌘</kbd>/<kbd>Ctrl</kbd>-clicking the image adds a <b>world anchor</b> (a blue square), which is tied to that place on the map rather than to the image. Dragging a world anchor bends the streets instead of the image: drag the street onto the image's feature and let go. The image warps to bring that feature to the anchor's place, and the map eases so the anchor stays where you let go. Points added with the streets off are image anchors (red circles); dragging one moves the image. (Streets base maps only.)</li>
         <li><b>Hide paper</b> makes the image's paper see-through, so the map shows between its lines. It finds the paper's colour itself (shown in the swatch), following uneven lighting across a photo. At the middle of the slider the paper alone is cleared; to the left it fades only partly, and to the right colours close to the paper's fade too. Like Opacity, it changes only the view, not exports.</li>
         <li><b>Undo</b> with <kbd>⌘</kbd>/<kbd>Ctrl</kbd>-<kbd>Z</kbd>, <b>redo</b> with <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> or <kbd>Ctrl</kbd>-<kbd>Y</kbd>. Each drag, added or removed point and Clear is one step.</li>
         <li><b>Export</b> saves the warped image, north-up. PNG and GeoTIFF are in Web Mercator; KMZ opens in Google Earth. The placement and control points are stored inside, so dropping the file back on the map puts it in the same place.</li>
@@ -71,6 +72,7 @@
   </aside>
 
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/maplibre-contour@0.1.1/dist/index.min.js"></script>
   <script type="module" src="js/app.js"></script>
 </body>
 </html>

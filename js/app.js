@@ -21,6 +21,7 @@ const HIT_RADIUS = 11;
 
 const STYLES = {
   streets: 'https://tiles.openfreemap.org/styles/liberty',
+  lines: linesStyle(),
   satellite: rasterStyle(
     'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     'Imagery &copy; Esri, Maxar, Earthstar Geographics, and the GIS User Community'),
@@ -28,6 +29,79 @@ const STYLES = {
     'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
     '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'),
 };
+
+// A plain base map to align old maps against: white land, pale water whose
+// edge is the coastline, roads and railways as thin centrelines with their
+// names, and elevation contours in feet, with nothing filled or extruded.
+function linesStyle() {
+  const font = ['Noto Sans Regular'];
+  const roads = ['motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'minor', 'service', 'track'];
+  const style = {
+    version: 8,
+    glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
+    sources: { openmaptiles: { type: 'vector', url: 'https://tiles.openfreemap.org/planet' } },
+    layers: [
+      { id: 'background', type: 'background', paint: { 'background-color': '#ffffff' } },
+      { id: 'water', type: 'fill', source: 'openmaptiles', 'source-layer': 'water',
+        filter: ['!=', ['get', 'brunnel'], 'tunnel'], paint: { 'fill-color': '#c6dcee' } },
+      { id: 'waterway', type: 'line', source: 'openmaptiles', 'source-layer': 'waterway',
+        filter: ['!=', ['get', 'brunnel'], 'tunnel'],
+        paint: { 'line-color': '#8fb6d8', 'line-width': ['interpolate', ['linear'], ['zoom'], 10, 0.5, 16, 1.5] } },
+    ],
+  };
+
+  // Contours, from the AWS terrain tiles (if the contour library loaded).
+  const mlcontour = window.mlcontour;
+  if (mlcontour) {
+    const dem = new mlcontour.DemSource({
+      url: 'https://elevation-tiles-prod.s3.amazonaws.com/terrarium/{z}/{x}/{y}.png',
+      encoding: 'terrarium',
+      maxzoom: 13,
+      worker: true,
+    });
+    dem.setupMaplibre(maplibregl);
+    style.sources.contours = {
+      type: 'vector',
+      tiles: [dem.contourProtocolUrl({
+        multiplier: 3.28084,  // feet
+        thresholds: { 10: [200, 1000], 12: [100, 500], 13: [50, 250], 14: [20, 100], 15: [10, 50] },
+        contourLayer: 'contours', elevationKey: 'ele', levelKey: 'level',
+      })],
+      minzoom: 10,
+      maxzoom: 15,
+      attribution: 'Elevation: <a href="https://github.com/tilezen/joerd/blob/master/docs/attribution.md">Mapzen terrain tiles</a>',
+    };
+    style.layers.push(
+      { id: 'contours', type: 'line', source: 'contours', 'source-layer': 'contours',
+        filter: ['>', ['get', 'ele'], 0],
+        paint: { 'line-color': '#c8a888', 'line-width': ['match', ['get', 'level'], 1, 1, 0.5] } },
+      { id: 'contour-labels', type: 'symbol', source: 'contours', 'source-layer': 'contours',
+        filter: ['all', ['>', ['get', 'level'], 0], ['>', ['get', 'ele'], 0]],
+        layout: { 'symbol-placement': 'line', 'text-size': 10, 'text-font': font,
+          'text-field': ['concat', ['number-format', ['get', 'ele'], {}], ' ft'] },
+        paint: { 'text-color': '#a07850', 'text-halo-color': '#ffffff', 'text-halo-width': 1.5 } });
+  }
+
+  style.layers.push(
+    { id: 'lines_road', type: 'line', source: 'openmaptiles', 'source-layer': 'transportation',
+      filter: ['match', ['get', 'class'], roads, true, false],
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: {
+        'line-color': ['match', ['get', 'brunnel'], 'tunnel', '#9a9a9a', '#3a3a3a'],
+        'line-width': ['interpolate', ['linear'], ['zoom'],
+          10, ['match', ['get', 'class'], ['motorway', 'trunk', 'primary'], 1, 0.4],
+          16, ['match', ['get', 'class'], ['motorway', 'trunk', 'primary'], 2, ['service', 'track'], 0.6, 1.2]],
+      } },
+    { id: 'lines_rail', type: 'line', source: 'openmaptiles', 'source-layer': 'transportation',
+      filter: ['==', ['get', 'class'], 'rail'],
+      paint: { 'line-color': '#7a5a8a', 'line-width': 1, 'line-dasharray': [4, 2] } },
+    { id: 'street_names', type: 'symbol', source: 'openmaptiles', 'source-layer': 'transportation_name',
+      filter: ['match', ['get', 'class'], roads, true, false],
+      layout: { 'symbol-placement': 'line', 'text-field': ['coalesce', ['get', 'name:en'], ['get', 'name']],
+        'text-font': font, 'text-size': ['interpolate', ['linear'], ['zoom'], 13, 10, 18, 13] },
+      paint: { 'text-color': '#222222', 'text-halo-color': '#ffffff', 'text-halo-width': 1.5 } });
+  return style;
+}
 
 function rasterStyle(url, attribution) {
   return {
@@ -1185,7 +1259,7 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
 
 // The paper's colour across an image (estimatePaper), found on a copy at most
 // PAPER_SIDE pixels across. Null if the browser won't share the pixels.
-const PAPER_SIDE = 320;
+const PAPER_SIDE = 1600;
 function findPaper(img) {
   const W = img.naturalWidth || img.width, H = img.naturalHeight || img.height;
   const s = Math.min(1, PAPER_SIDE / Math.max(W, H));
@@ -1750,8 +1824,8 @@ $('hide-paper').addEventListener('input', (e) => {
 });
 $('basemap').addEventListener('change', (e) => {
   map.setStyle(STYLES[e.target.value], { diff: false });
-  // Only the vector street map has separate road layers to lift.
-  $('streets-on-top').disabled = e.target.value !== 'streets';
+  // Only the vector maps have separate road layers to lift.
+  $('streets-on-top').disabled = !['streets', 'lines'].includes(e.target.value);
 });
 $('streets-on-top').addEventListener('change', (e) => {
   state.streetsOnTop = e.target.checked;

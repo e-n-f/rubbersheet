@@ -10,7 +10,7 @@ Map rubbersheeting in the browser. Drop a scanned map or photo onto a MapLibre b
 - **Drag a corner handle** to scale and rotate around the image centre. Hold <kbd>Shift</kbd> to scale without rotating. (This works only before the first control point is added.)
 - **⌘-click** (Ctrl-click on Windows/Linux) the image to add a control point. ⌘-click a point to remove it.
 - **Drag a control point** to move that spot of the image to a new place on the map. The image goes half-transparent while you drag so you can see the map underneath.
-- **Streets on top of the image** draws the street base map's roads and railways over the image as thin bright yellow lines. It only works with the *Streets* base map, which has separate road layers. While it's on, ⌘-clicking the image adds a **world anchor**, drawn as a blue square. A world anchor is tied to that place on the map, not to the spot in the image.
+- **Streets on top of the image** draws the street base map's roads and railways over the image as thin bright yellow lines. It only works with the *Streets* and *Lines & contours* base maps, which have separate road layers. While it's on, ⌘-clicking the image adds a **world anchor**, drawn as a blue square. A world anchor is tied to that place on the map, not to the spot in the image.
   - **Dragging a world anchor** keeps the image still and bends the streets around the anchor, as the new warp will. Drag the street onto the image's feature and let go. The image warps to bring the feature under the pointer to the anchor's place, and the map eases so the anchor stays where you let go. The image eases from the old warp to the new and the streets from bent to straight, in step with the map, so the anchor and its feature stay under the pointer the whole way.
   - **Image anchors** are points added with the streets off, drawn as red circles. Dragging one moves the image as before.
   - **Both kinds** are ordinary control points in the same warp. They differ only in which half a drag changes: the image spot for a world anchor, the map place for an image anchor.
@@ -85,5 +85,6 @@ These tests cover the warp math, the world-file conversions and the PNG metadata
 ## Base maps
 
 - Streets: [OpenFreeMap](https://openfreemap.org/) (OpenMapTiles schema, © OpenStreetMap contributors)
+- Lines & contours: a plain style for aligning old maps against, with no buildings, parks or fills. Roads and railways are thin centrelines with their names, water is a pale fill whose edge is the coastline, and elevation contours (in feet, from zoom 10) are drawn by [maplibre-contour](https://github.com/onthegomap/maplibre-contour) from the [Mapzen terrain tiles](https://github.com/tilezen/joerd/blob/master/docs/attribution.md) on AWS. Same OpenFreeMap vector tiles as Streets.
 - Satellite: Esri World Imagery
 - OpenStreetMap: the standard tile layer, for light interactive use under the [OSM tile usage policy](https://operations.osmfoundation.org/policies/tiles/)

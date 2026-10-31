@@ -1,16 +1,16 @@
 // Hide paper: find the colour of the paper an image is printed or drawn on,
 // and make it transparent in proportion to how close each pixel is to it.
 //
-// The paper's colour is found on a small copy of the image (a few hundred
-// pixels across, where averaging has already smoothed away most ink and
-// noise). The most common colour is taken as the paper overall. Then, block
-// by block, the brighter paper-coloured pixels give the local paper colour,
-// which follows uneven lighting and yellowing across a photographed map.
-// Blocks with too little paper (a large colour wash, a dark border) borrow
-// from their neighbours. The result is a coarse grid that the GPU stretches
-// smoothly over the image.
+// The paper's colour is found on a copy of the image at most 1600 pixels
+// across, where averaging has already smoothed away some noise. The most
+// common colour is taken as the paper overall. Then, in small blocks, the
+// paper-coloured pixels give the local paper colour, which follows uneven
+// lighting, yellowing and stains across an old or photographed map. Blocks
+// with too little paper (a large colour wash, a filled city block, a dark
+// border) borrow from their neighbours. The result is a grid, a couple of
+// hundred cells across, that the GPU stretches smoothly over the image.
 
-const GRID_BLOCK = 16;     // block size, in pixels of the small copy
+const GRID_BLOCK = 8;      // block size, in pixels of the copy
 const CHROMA_TOL = 0.035;  // how far a pixel's hue may stray from the paper's
 const LUM_MIN = 0.5;       // and how much darker it may be (uneven lighting)
 const LUM_MAX = 1.35;
@@ -89,11 +89,11 @@ export function estimatePaper(rgba, w, h, block = GRID_BLOCK) {
         }
       }
       if (!px.length || px.length < MIN_PAPER * total) continue;
-      // Ink, stains and shading are darker than the paper, glare brighter:
-      // average the paper pixels between the 50th and 90th percentiles of
+      // Faint ink and shading are darker than the paper, glare brighter:
+      // average the paper pixels between the 40th and 85th percentiles of
       // brightness.
       const order = ls.map((_, n) => n).sort((a, b) => ls[a] - ls[b]);
-      const lo = Math.floor(order.length * 0.5), hi = Math.max(lo + 1, Math.ceil(order.length * 0.9));
+      const lo = Math.floor(order.length * 0.4), hi = Math.max(lo + 1, Math.ceil(order.length * 0.85));
       let sr = 0, sg = 0, sb = 0;
       for (let n = lo; n < hi; n++) {
         const k = px[order[n]];
@@ -157,7 +157,7 @@ export function estimatePaper(rgba, w, h, block = GRID_BLOCK) {
 // [clear, solid, floor]: pixels less than `clear` from the paper become
 // transparent, those more than `solid` from it stay opaque, with a ramp
 // between, and no pixel is fainter than `floor`.
-const PAPER_NOISE = 0.04;  // JPEG noise and paper grain, cleared with the paper
+const PAPER_NOISE = 0.07;  // JPEG noise and paper grain, cleared with the paper
 const PAPER_RAMP = 0.08;   // antialiased edges between paper and ink
 export function paperThresholds(amount) {
   const more = Math.max(0, 2 * amount - 1);
