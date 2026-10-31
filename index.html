@@ -14,19 +14,10 @@
 
   <aside id="panel">
     <h1>Rubbersheet</h1>
-    <p id="status">Drag an image onto the map, or <label class="link" for="file">choose a file</label>.</p>
+    <p>Drag images onto the map, or <label class="link" for="file">choose files</label>.</p>
+    <p id="status" hidden></p>
     <input id="file" type="file" accept="image/png,image/jpeg,image/webp,image/tiff,.tif,.tiff,.kmz,.wld,.pgw,.jgw,.wpw,.prj,.xml" multiple hidden>
 
-    <div class="row">
-      <label for="opacity">Opacity</label>
-      <input id="opacity" type="range" min="0.1" max="1" step="0.05" value="1">
-    </div>
-    <div class="row">
-      <label for="hide-paper">Hide paper</label>
-      <input id="hide-paper" type="range" min="0" max="1" step="0.02" value="0" list="paper-ticks" disabled>
-      <datalist id="paper-ticks"><option value="0.5"></option></datalist>
-      <span id="paper-swatch" class="swatch"></span>
-    </div>
     <div class="row">
       <label for="basemap">Base map</label>
       <select id="basemap">
@@ -36,7 +27,7 @@
         <option value="osm">OpenStreetMap</option>
       </select>
     </div>
-    <label class="check"><input id="streets-on-top" type="checkbox"> Streets on top of the image</label>
+    <label class="check"><input id="streets-on-top" type="checkbox"> Streets on top of the images</label>
     <div class="row">
       <label for="format">Format</label>
       <select id="format">
@@ -45,28 +36,51 @@
         <option value="kmz">KMZ for Google Earth</option>
       </select>
     </div>
-
+    <label class="check" id="worldfile-row" hidden><input id="worldfile" type="checkbox"> Also download world file (.pgw + .aux.xml)</label>
     <div class="buttons">
-      <button id="export" disabled>Export</button>
       <button id="undo" disabled title="⌘Z / Ctrl-Z">Undo</button>
       <button id="redo" disabled title="⇧⌘Z / Ctrl-Y">Redo</button>
-      <button id="zoom" disabled>Zoom to image</button>
-      <button id="clear" disabled>Clear points</button>
-      <button id="remove" disabled>Remove image</button>
     </div>
-    <label class="check" id="worldfile-row" hidden><input id="worldfile" type="checkbox"> Also download world file (.pgw + .aux.xml)</label>
+
+    <ol id="layers" hidden></ol>
+    <datalist id="paper-ticks"><option value="0.5"></option></datalist>
+    <template id="layer-template">
+      <li class="layer">
+        <div class="layer-head">
+          <span class="grip" title="Drag to move this image up or down" aria-label="Drag to reorder">⠿</span>
+          <span class="name"></span>
+        </div>
+        <div class="info"></div>
+        <div class="row">
+          <label class="opacity-label">Opacity</label>
+          <input class="opacity" type="range" min="0.1" max="1" step="0.05" value="1">
+        </div>
+        <div class="row">
+          <label class="hide-paper-label">Hide paper</label>
+          <input class="hide-paper" type="range" min="0" max="1" step="0.02" value="0" list="paper-ticks">
+          <span class="swatch"></span>
+        </div>
+        <div class="buttons">
+          <button class="export">Export</button>
+          <button class="zoom">Zoom to image</button>
+          <button class="remove">Remove image</button>
+        </div>
+      </li>
+    </template>
 
     <details>
       <summary>How to use</summary>
       <ul>
+        <li>Each image you drop or choose is a <b>layer</b>, listed in this panel with the top one first. <b>Drag a layer by its grip</b> (<span class="grip-inline">⠿</span>) to move it up or down. The base map is under all the images and the streets on top over them all.</li>
+        <li>One layer at a time is <b>selected</b>: the one with the solid outline, its handles and its points. Click an image, or its entry in the list, to select it. Where images overlap, clicks go to the selected one, so you can lower the opacity of the image above to work through it.</li>
         <li><b>Drag</b> the image to move it. Once it has a control point, or when you're zoomed in so far that none of its corners are in view, dragging the image pans the map instead.</li>
         <li><b>Drag a corner</b> to scale and rotate. Hold <kbd>Shift</kbd> to scale without rotating. The corners lock once there's a control point.</li>
         <li><b><kbd>⌘</kbd>/<kbd>Ctrl</kbd>-click</b> the image to add a control point. Do it again on a point to remove it.</li>
         <li><b>Drag a control point</b> to pin that spot of the image to a new place on the map. The image warps to fit.</li>
         <li><b>Streets on top of the image</b> draws the street map's roads and railways over the image as thin yellow lines. While it's on, <kbd>⌘</kbd>/<kbd>Ctrl</kbd>-clicking the image adds a <b>world anchor</b> (a blue square), which is tied to that place on the map rather than to the image. Dragging a world anchor bends the streets instead of the image: drag the street onto the image's feature and let go. The image warps to bring that feature to the anchor's place, and the map eases so the anchor stays where you let go. Points added with the streets off are image anchors (red circles); dragging one moves the image. (Streets base maps only.)</li>
-        <li><b>Hide paper</b> makes the image's paper see-through, so the map shows between its lines. It finds the paper's colour itself (shown in the swatch), following uneven lighting across a photo. At the middle of the slider the paper alone is cleared; to the left it fades only partly, and to the right colours close to the paper's fade too. Like Opacity, it changes only the view, not exports.</li>
-        <li><b>Undo</b> with <kbd>⌘</kbd>/<kbd>Ctrl</kbd>-<kbd>Z</kbd>, <b>redo</b> with <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> or <kbd>Ctrl</kbd>-<kbd>Y</kbd>. Each drag, added or removed point and Clear is one step.</li>
-        <li><b>Export</b> saves the warped image, north-up. PNG and GeoTIFF are in Web Mercator; KMZ opens in Google Earth. The placement and control points are stored inside, so dropping the file back on the map puts it in the same place.</li>
+        <li><b>Hide paper</b> makes a layer's paper see-through, so the map shows between its lines. It finds the paper's colour itself (shown in the swatch), following uneven lighting across a photo. At the middle of the slider the paper alone is cleared; to the left it fades only partly, and to the right colours close to the paper's fade too. Like Opacity, it changes only the view, not exports.</li>
+        <li><b>Undo</b> with <kbd>⌘</kbd>/<kbd>Ctrl</kbd>-<kbd>Z</kbd>, <b>redo</b> with <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> or <kbd>Ctrl</kbd>-<kbd>Y</kbd>. Undo covers all the layers: each drag, each added or removed point, and each added, removed or moved image is one step.</li>
+        <li><b>Export</b> saves that layer's warped image, north-up. PNG and GeoTIFF are in Web Mercator; KMZ opens in Google Earth. The placement and control points are stored inside, so dropping the file back on the map puts it in the same place.</li>
       </ul>
     </details>
   </aside>

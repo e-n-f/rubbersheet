@@ -83,7 +83,55 @@ body.dragover #drop-hint { display: flex; }
   gap: 6px;
   margin: 10px 0 6px;
 }
-.buttons #export { grid-column: 1 / -1; }
+.layer .export { grid-column: 1 / -1; }
+#status[hidden], #layers[hidden] { display: none; }
+
+#layers {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+.layer {
+  margin: 0 0 8px;
+  padding: 6px 8px 2px;
+  border: 1px solid #d3d8de;
+  border-radius: 6px;
+  background: #fff;
+}
+.layer.selected {
+  border-color: #1a62c4;
+  box-shadow: 0 0 0 1px #1a62c4;
+}
+.layer.moving {
+  opacity: 0.85;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+.layer .buttons { margin: 6px 0; }
+.layer button { white-space: nowrap; padding: 4px 6px; font-size: 13px; }
+.layer-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+.layer-head .name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.grip {
+  cursor: grab;
+  color: #7a838c;
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px;
+  touch-action: none;
+  user-select: none;
+}
+.layer.moving .grip { cursor: grabbing; }
+.layer .info { font-size: 12.5px; color: #4a535c; }
 button {
   font: inherit;
   padding: 5px 8px;
@@ -94,14 +142,14 @@ button {
 }
 button:hover:not(:disabled) { background: #eef3f9; }
 button:disabled { opacity: 0.45; cursor: default; }
-#export:not(:disabled) {
+.export:not(:disabled) {
   background: #1a62c4;
   border-color: #1a62c4;
   color: #fff;
 }
 /* While exporting: a lighter blue fills in left to right as strips are drawn,
    or stripes slide along when the stage's length is unknown. */
-#export.busy {
+.export.busy {
   --progress: 0;
   opacity: 1;
   cursor: progress;
@@ -110,13 +158,13 @@ button:disabled { opacity: 0.45; cursor: default; }
   background: linear-gradient(to right, #1a62c4 calc(var(--progress) * 100%), #6f9bd8 0);
   font-variant-numeric: tabular-nums;
 }
-#export.busy.indeterminate {
+.export.busy.indeterminate {
   background: repeating-linear-gradient(-45deg, #1a62c4 0 10px, #3d7bd0 10px 20px) 0 0 / 28.28px 100%;
   animation: export-stripes 0.8s linear infinite;
 }
 @keyframes export-stripes { to { background-position: 28.28px 0; } }
 @media (prefers-reduced-motion: reduce) {
-  #export.busy.indeterminate { animation: none; }
+  .export.busy.indeterminate { animation: none; }
 }
 .check { display: block; font-size: 12.5px; color: #4a535c; }
 .check[hidden] { display: none; }
@@ -156,6 +204,11 @@ kbd {
   stroke: #1a62c4;
   stroke-width: 1.5;
   stroke-dasharray: 5 4;
+}
+.outline.other {
+  stroke-opacity: 0.45;
+  stroke-width: 1;
+  stroke-dasharray: 2 4;
 }
 .handle {
   fill: #fff;

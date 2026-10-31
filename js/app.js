@@ -115,21 +115,23 @@ function rasterStyle(url, attribution) {
 // ---------------------------------------------------------------------------
 // State
 
+// Each image is a layer: {id, image: {name, img, W, H, paper}, url, T (affine
+// placement, image px -> Mercator units), points ([{u, v, x, y, world?}],
+// image px -> Mercator target), warp ({map, S}), mesh (display mesh), fine
+// (finer patch of it over the part in view, refineMesh), origin (GPU rebasing
+// origin for the display mesh), opacity, hidePaper (0 for off to 1), gpu (its
+// textures and buffers, made when first drawn), texDirty, meshDirty, card
+// (its panel entry)}.
 const state = {
-  image: null,      // {name, img, W, H}
-  T: null,          // affine placement, image px -> Mercator units
-  points: [],       // [{u, v, x, y}] image px -> Mercator target
-  warp: null,       // {map, S}
-  mesh: null,       // display mesh
-  fine: null,       // finer patch of it over the part in view (refineMesh)
-  origin: [0, 0],   // GPU rebasing origin for the display mesh
-  drag: null,
+  layers: [],       // bottom to top
+  selected: null,   // the layer whose handles and points are shown
+  drag: null,       // carries its layer as drag.layer
   hover: null,
-  opacity: 1,
-  hidePaper: 0,     // Hide paper slider, 0 (off) to 1
   streetsOnTop: false,
   ease: null,       // a world anchor's release in progress (easeWorldRelease)
 };
+
+let nextLayerId = 1;
 
 const $ = (id) => document.getElementById(id);
 const overlay = $('overlay');
@@ -196,6 +198,8 @@ function compile(gl, type, src) {
   return s;
 }
 
+// One shader program, drawing any number of meshes. Each mesh's textures
+// and buffers are a separate object, from create().
 class MeshRenderer {
   constructor(gl) {
     this.gl = gl;
@@ -212,19 +216,19 @@ class MeshRenderer {
     this.uTex = gl.getUniformLocation(p, 'u_tex');
     this.uPaper = gl.getUniformLocation(p, 'u_paper');
     this.uHide = gl.getUniformLocation(p, 'u_hide');
-    this.paperTex = null;
-    this.posBuf = gl.createBuffer();
-    this.uvBuf = gl.createBuffer();
-    this.tex = null;
-    this.count = 0;
   }
 
-  setTexture(source) {
+  create() {
     const gl = this.gl;
-    if (this.tex) gl.deleteTexture(this.tex);
-    this.tex = gl.createTexture();
+    return { tex: null, paperTex: null, posBuf: gl.createBuffer(), uvBuf: gl.createBuffer(), count: 0 };
+  }
+
+  setTexture(m, source) {
+    const gl = this.gl;
+    if (m.tex) gl.deleteTexture(m.tex);
+    m.tex = gl.createTexture();
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    gl.bindTexture(gl.TEXTURE_2D, m.tex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
@@ -245,14 +249,14 @@ class MeshRenderer {
   }
 
   // The paper's colour across the image, from estimatePaper; null for none.
-  setPaper(paper) {
+  setPaper(m, paper) {
     const gl = this.gl;
-    if (this.paperTex) gl.deleteTexture(this.paperTex);
-    this.paperTex = null;
+    if (m.paperTex) gl.deleteTexture(m.paperTex);
+    m.paperTex = null;
     if (!paper) return;
-    this.paperTex = gl.createTexture();
+    m.paperTex = gl.createTexture();
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, this.paperTex);
+    gl.bindTexture(gl.TEXTURE_2D, m.paperTex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, paper.gw, paper.gh, 0, gl.RGBA, gl.UNSIGNED_BYTE, paper.grid);
@@ -264,47 +268,50 @@ class MeshRenderer {
     gl.activeTexture(gl.TEXTURE0);
   }
 
-  setTriangles({ positions, uvs, count }) {
+  setTriangles(m, { positions, uvs, count }) {
     const gl = this.gl;
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.posBuf);
+    gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf);
     gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.uvBuf);
+    gl.bindBuffer(gl.ARRAY_BUFFER, m.uvBuf);
     gl.bufferData(gl.ARRAY_BUFFER, uvs, gl.DYNAMIC_DRAW);
-    this.count = count;
+    m.count = count;
   }
 
   // `hide` is the Hide paper amount, 0 for off.
-  draw(matrix, opacity, hide = 0) {
+  draw(m, matrix, opacity, hide = 0) {
     const gl = this.gl;
-    if (!this.tex || !this.count) return;
+    if (!m.tex || !m.count) return;
     gl.useProgram(this.program);
     gl.uniformMatrix4fv(this.uMatrix, false, matrix);
     gl.uniform1f(this.uOpacity, opacity);
     gl.uniform1i(this.uTex, 0);
     gl.uniform1i(this.uPaper, 1);
-    gl.uniform3fv(this.uHide, hide > 0 && this.paperTex ? paperThresholds(hide) : [0, 0, 0]);
+    gl.uniform3fv(this.uHide, hide > 0 && m.paperTex ? paperThresholds(hide) : [0, 0, 0]);
     // The paper texture's unit is bound even when unused: an unbound sampler
     // reads black, but the map's own textures could be sitting there.
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, this.paperTex);
+    gl.bindTexture(gl.TEXTURE_2D, m.paperTex);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.tex);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.posBuf);
+    gl.bindTexture(gl.TEXTURE_2D, m.tex);
+    gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf);
     gl.enableVertexAttribArray(this.aPos);
     gl.vertexAttribPointer(this.aPos, 2, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.uvBuf);
+    gl.bindBuffer(gl.ARRAY_BUFFER, m.uvBuf);
     gl.enableVertexAttribArray(this.aUv);
     gl.vertexAttribPointer(this.aUv, 2, gl.FLOAT, false, 0, 0);
-    gl.drawArrays(gl.TRIANGLES, 0, this.count);
+    gl.drawArrays(gl.TRIANGLES, 0, m.count);
+  }
+
+  free(m) {
+    const gl = this.gl;
+    if (m.tex) gl.deleteTexture(m.tex);
+    if (m.paperTex) gl.deleteTexture(m.paperTex);
+    gl.deleteBuffer(m.posBuf);
+    gl.deleteBuffer(m.uvBuf);
   }
 
   destroy() {
-    const gl = this.gl;
-    if (this.tex) gl.deleteTexture(this.tex);
-    if (this.paperTex) gl.deleteTexture(this.paperTex);
-    gl.deleteBuffer(this.posBuf);
-    gl.deleteBuffer(this.uvBuf);
-    gl.deleteProgram(this.program);
+    this.gl.deleteProgram(this.program);
   }
 }
 
@@ -331,43 +338,60 @@ function rebaseMatrix(m, ox, oy) {
   return out;
 }
 
+// All the image layers, drawn bottom to top in one custom map layer, so that
+// the base map is under them all and the raised streets over them all.
 const imageLayer = {
   id: 'rubbersheet-image',
   type: 'custom',
   renderingMode: '2d',
   onAdd(_map, gl) {
     this.renderer = new MeshRenderer(gl);
-    this.texDirty = true;
-    this.meshDirty = true;
+    // Resources from before went with the old layer (and a removed layer's
+    // were freed when it was removed).
+    for (const L of state.layers) L.gpu = null;
   },
   onRemove() {
+    for (const L of state.layers) freeGPU(L);
     this.renderer.destroy();
     this.renderer = null;
   },
   render(gl, matrix) {
-    if (!state.image || !state.mesh || !this.renderer) return;
-    if (this.texDirty) {
-      this.renderer.setTexture(textureSource(state.image.img,
-        Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE))));
-      this.renderer.setPaper(state.image.paper);
-      this.texDirty = false;
-    }
-    if (this.meshDirty) {
-      this.renderer.setTriangles(meshTriangles(state.mesh, state.origin, state.fine));
-      this.meshDirty = false;
-    }
+    const r = this.renderer;
+    if (!r || !state.layers.length) return;
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.STENCIL_TEST);
     gl.disable(gl.CULL_FACE);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    // Half see-through while dragging, except when the streets on top are what
-    // moves.
-    const see = state.drag && state.drag.kind !== 'world';
-    const opacity = see ? Math.min(0.5, state.opacity) : state.opacity;
-    this.renderer.draw(rebaseMatrix(matrix, state.origin[0], state.origin[1]), opacity, state.hidePaper);
+    for (const L of state.layers) {
+      if (!L.mesh) continue;
+      if (!L.gpu) {
+        L.gpu = r.create();
+        L.texDirty = L.meshDirty = true;
+      }
+      if (L.texDirty) {
+        r.setTexture(L.gpu, textureSource(L.image.img, Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE))));
+        r.setPaper(L.gpu, L.image.paper);
+        L.texDirty = false;
+      }
+      if (L.meshDirty) {
+        r.setTriangles(L.gpu, meshTriangles(L.mesh, L.origin, L.fine));
+        L.meshDirty = false;
+      }
+      // Half see-through while dragging, except when the streets on top are
+      // what moves.
+      const d = state.drag;
+      const see = d && d.layer === L && d.kind !== 'world';
+      const opacity = see ? Math.min(0.5, L.opacity) : L.opacity;
+      r.draw(L.gpu, rebaseMatrix(matrix, L.origin[0], L.origin[1]), opacity, L.hidePaper);
+    }
   },
 };
+
+function freeGPU(L) {
+  if (L.gpu && imageLayer.renderer) imageLayer.renderer.free(L.gpu);
+  L.gpu = null;
+}
 
 map.on('style.load', () => {
   if (!map.getLayer(imageLayer.id)) map.addLayer(imageLayer);
@@ -469,26 +493,26 @@ function localPoint(e) {
 // ---------------------------------------------------------------------------
 // Warp state
 
-function update() {
-  if (!state.image) return;
-  const { W, H } = state.image;
-  if (state.points.length === 1) {
+function update(L) {
+  if (!L) return;
+  const { W, H } = L.image;
+  if (L.points.length === 1) {
     // A single image anchor just rides along with the placement; a single
     // world anchor moves the placement to keep its spot on its place.
-    const p = state.points[0];
-    state.T = placementFor(state.T, p);
-    if (!p.world) [p.x, p.y] = applyAffine(state.T, p.u, p.v);
+    const p = L.points[0];
+    L.T = placementFor(L.T, p);
+    if (!p.world) [p.x, p.y] = applyAffine(L.T, p.u, p.v);
   }
-  state.warp = makeWarp(state.T, state.points);
+  L.warp = makeWarp(L.T, L.points);
   // Keep the placement in sync, so that removing points back down to one or
   // zero leaves the image where it is.
-  if (state.points.length >= 2) state.T = state.warp.S;
-  const bent = state.points.length >= 3;
-  state.mesh = buildMesh(state.warp.map, W, H, bent ? cellsAcross(W, H, DISPLAY_CELLS) : 1);
-  state.fine = refineView(state.mesh);
-  const [minX, minY, maxX, maxY] = meshBounds(state.mesh);
-  state.origin = [(minX + maxX) / 2, (minY + maxY) / 2];
-  imageLayer.meshDirty = true;
+  if (L.points.length >= 2) L.T = L.warp.S;
+  const bent = L.points.length >= 3;
+  L.mesh = buildMesh(L.warp.map, W, H, bent ? cellsAcross(W, H, DISPLAY_CELLS) : 1);
+  L.fine = refineView(L, L.mesh);
+  const [minX, minY, maxX, maxY] = meshBounds(L.mesh);
+  L.origin = [(minX + maxX) / 2, (minY + maxY) / 2];
+  L.meshDirty = true;
   map.triggerRepaint();
   drawOverlay();
   updateUI();
@@ -514,8 +538,8 @@ function warpFor(T, points) {
 const FINE_PX = 16;
 const FINE_MAX_CELLS = 40000;
 
-function refineView(mesh) {
-  if (!mesh || mesh.nx < 2 || !state.warp) return null;
+function refineView(L, mesh) {
+  if (!mesh || mesh.nx < 2 || !L.warp) return null;
   const canvas = map.getCanvas();
   const w = canvas.clientWidth, h = canvas.clientHeight;
   const A = mercToScreenAffine();
@@ -539,13 +563,16 @@ function refineView(mesh) {
   let s = Math.min(32, Math.ceil(size / FINE_PX));
   while (s > 1 && (i1 - i0) * (j1 - j0) * s * s > FINE_MAX_CELLS) s--;
   if (s < 2) return null;
-  return refineMesh(state.warp.map, mesh, i0, j0, i1, j1, s);
+  return refineMesh(L.warp.map, mesh, i0, j0, i1, j1, s);
 }
 
 map.on('moveend', () => {
-  if (!state.image || !state.mesh || state.drag || state.ease) return;
-  state.fine = refineView(state.mesh);
-  imageLayer.meshDirty = true;
+  if (state.drag || state.ease) return;
+  for (const L of state.layers) {
+    if (!L.mesh) continue;
+    L.fine = refineView(L, L.mesh);
+    L.meshDirty = true;
+  }
   map.triggerRepaint();
 });
 
@@ -555,32 +582,49 @@ function cellsAcross(W, H, cells) {
 }
 
 // ---------------------------------------------------------------------------
-// Undo and redo: snapshots of the placement and points, taken before each
-// edit.
+// Undo and redo: one history for all the layers. A snapshot, taken before
+// each edit, holds the list of layers (so adding, removing and reordering
+// them can be undone) and, for an edit to one layer, its placement and
+// points.
 
 const MAX_UNDO = 50;
 const edits = { undo: [], redo: [] };
 
-function snapshot() {
-  return { T: state.T.slice(), points: state.points.map(p => ({ ...p })) };
+function snapshot(L = null) {
+  return {
+    order: state.layers.slice(),
+    selected: state.selected,
+    edit: L && { layer: L, T: L.T.slice(), points: L.points.map(p => ({ ...p })) },
+  };
 }
 
 function restore(snap) {
-  state.T = snap.T.slice();
-  state.points = snap.points.map(p => ({ ...p }));
-  update();
+  setLayers(snap.order);
+  if (snap.edit) {
+    const { layer: L, T, points } = snap.edit;
+    L.T = T.slice();
+    L.points = points.map(p => ({ ...p }));
+    update(L);
+    select(L);
+  } else {
+    select(state.layers.includes(snap.selected) ? snap.selected : null);
+  }
 }
 
 function sameAsNow(snap) {
-  return snap.T.every((v, i) => v === state.T[i]) &&
-    snap.points.length === state.points.length &&
-    snap.points.every((p, i) => ['u', 'v', 'x', 'y'].every(k => p[k] === state.points[i][k]));
+  const e = snap.edit;
+  if (!e) return false;
+  const L = e.layer;
+  return e.T.every((v, i) => v === L.T[i]) &&
+    e.points.length === L.points.length &&
+    e.points.every((p, i) => ['u', 'v', 'x', 'y'].every(k => p[k] === L.points[i][k]));
 }
 
-// Call before an edit. Returns a token for settle().
-function checkpoint() {
+// Call before an edit, to layer L or (with none) to the list of layers.
+// Returns a token for settle().
+function checkpoint(L = null) {
   const token = { redo: edits.redo };
-  edits.undo.push(snapshot());
+  edits.undo.push(snapshot(L));
   if (edits.undo.length > MAX_UNDO) edits.undo.shift();
   edits.redo = [];
   updateUI();
@@ -600,36 +644,40 @@ function settle(token, cancelled) {
 
 function undo() {
   if (state.drag || state.ease || !edits.undo.length) return;
-  edits.redo.push(snapshot());
-  restore(edits.undo.pop());
+  const snap = edits.undo.pop();
+  edits.redo.push(snapshot(snap.edit?.layer));
+  restore(snap);
 }
 
 function redo() {
   if (state.drag || state.ease || !edits.redo.length) return;
-  edits.undo.push(snapshot());
-  restore(edits.redo.pop());
-}
-
-function resetHistory() {
-  edits.undo = [];
-  edits.redo = [];
+  const snap = edits.redo.pop();
+  edits.undo.push(snapshot(snap.edit?.layer));
+  restore(snap);
 }
 
 // ---------------------------------------------------------------------------
 // Overlay: outline, corner handles, control points
 
+// The other layers get a faint outline, the selected one its full outline,
+// its corner handles while it has no points, and its points.
 function drawOverlay() {
-  if (!state.image || !state.mesh) {
-    overlay.innerHTML = '';
+  const L = state.selected;
+  const parts = [];
+  const outline = (layer, cls) => {
+    const pts = meshOutline(layer.mesh).map(mercToScreen);
+    parts.push(`<polygon class="${cls}" points="${pts.map(p => p.join(',')).join(' ')}"/>`);
+  };
+  for (const other of state.layers) if (other !== L && other.mesh) outline(other, 'outline other');
+  if (!L || !L.mesh) {
+    overlay.innerHTML = parts.join('');
     return;
   }
-  const parts = [];
-  const outline = meshOutline(state.mesh).map(mercToScreen);
-  parts.push(`<polygon class="outline" points="${outline.map(p => p.join(',')).join(' ')}"/>`);
-  if (imageDraggable() && (!state.drag || state.drag.kind === 'corner')) {
-    meshCorners(state.mesh).map(mercToScreen).forEach(([x, y], i) => {
-      const hover = state.hover && state.hover.kind === 'corner' && state.hover.index === i;
-      parts.push(`<rect class="handle${hover ? ' hover' : ''}" x="${x - 5}" y="${y - 5}" width="10" height="10"/>`);
+  outline(L, 'outline');
+  const hovered = (kind, i) => state.hover && state.hover.kind === kind && state.hover.index === i;
+  if (imageDraggable(L) && (!state.drag || state.drag.kind === 'corner')) {
+    meshCorners(L.mesh).map(mercToScreen).forEach(([x, y], i) => {
+      parts.push(`<rect class="handle${hovered('corner', i) ? ' hover' : ''}" x="${x - 5}" y="${y - 5}" width="10" height="10"/>`);
     });
   }
   const d = state.drag;
@@ -638,16 +686,15 @@ function drawOverlay() {
   } else if (state.ease) {
     parts.push(`<path class="bent-streets" d="${easedStreetsPath(state.ease)}"/>`);
   }
-  state.points.forEach((p, i) => {
+  L.points.forEach((p, i) => {
     const active = d && ['point', 'world'].includes(d.kind) && d.index === i;
     // A world anchor being dragged rides on its bent street, at the pointer.
     const easing = state.ease && state.ease.index === i;
     const [x, y] = active && d.kind === 'world' && d.cursor ? d.cursor
       : easing ? state.ease.cursor : mercToScreen([p.x, p.y]);
-    const hover = state.hover && state.hover.kind === 'point' && state.hover.index === i;
     // World anchors are squares, image anchors circles.
     const ring = p.world ? '<rect class="ring" x="-6.5" y="-6.5" width="13" height="13"/>' : '<circle class="ring" r="7"/>';
-    parts.push(`<g class="cp${p.world ? ' world' : ''}${active ? ' active' : ''}${hover ? ' hover' : ''}" ` +
+    parts.push(`<g class="cp${p.world ? ' world' : ''}${active ? ' active' : ''}${hovered('point', i) ? ' hover' : ''}" ` +
       `transform="translate(${x},${y})">${ring}` +
       `<line x1="-4" y1="0" x2="4" y2="0"/><line x1="0" y1="-4" x2="0" y2="4"/>` +
       `<text x="10" y="-8">${i + 1}</text></g>`);
@@ -660,26 +707,36 @@ map.on('render', drawOverlay);
 // ---------------------------------------------------------------------------
 // Hit testing and pointer interaction
 
+// The selected layer's points and corners come first. Then the image under
+// the pointer: the selected one if it's there, so that it can be worked on
+// through a layer above it, otherwise the topmost.
 function hitTest(p) {
-  if (!state.image || !state.mesh) return null;
   const near = (q) => Math.hypot(q[0] - p[0], q[1] - p[1]) <= HIT_RADIUS;
-  for (let i = state.points.length - 1; i >= 0; i--) {
-    if (near(mercToScreen([state.points[i].x, state.points[i].y]))) return { kind: 'point', index: i };
-  }
-  if (imageDraggable()) {
-    const corners = meshCorners(state.mesh);
-    for (let i = 0; i < 4; i++) {
-      if (near(mercToScreen(corners[i]))) return { kind: 'corner', index: i };
+  const S = state.selected;
+  if (S && S.mesh) {
+    for (let i = S.points.length - 1; i >= 0; i--) {
+      if (near(mercToScreen([S.points[i].x, S.points[i].y]))) return { kind: 'point', index: i, layer: S };
+    }
+    if (imageDraggable(S)) {
+      const corners = meshCorners(S.mesh);
+      for (let i = 0; i < 4; i++) {
+        if (near(mercToScreen(corners[i]))) return { kind: 'corner', index: i, layer: S };
+      }
     }
   }
   const m = screenToMerc(p);
-  const uv = invertDrawn(state.mesh, state.fine, m[0], m[1]);
-  if (uv) return { kind: 'image', uv, merc: m };
+  const order = state.layers.slice().reverse();
+  if (S) order.unshift(S);
+  for (const L of order) {
+    if (!L.mesh) continue;
+    const uv = invertDrawn(L.mesh, L.fine, m[0], m[1]);
+    if (uv) return { kind: 'image', uv, merc: m, layer: L };
+  }
   return null;
 }
 
-function cornerUV(i) {
-  const { W, H } = state.image;
+function cornerUV(L, i) {
+  const { W, H } = L.image;
   return [[0, 0], [W, 0], [W, H], [0, H]][i];
 }
 
@@ -687,25 +744,26 @@ const isCommand = (e) => e.metaKey || e.ctrlKey;
 
 function cursorFor(hit, cmd) {
   if (!hit) return '';
+  if (hit.layer !== state.selected) return 'pointer';
   if (hit.kind === 'point') return cmd ? 'pointer' : 'grab';
   if (cmd) return 'copy';
   if (hit.kind === 'corner') return hit.index % 2 === 0 ? 'nwse-resize' : 'nesw-resize';
-  return imageMovable() ? 'move' : '';
+  return imageMovable(hit.layer) ? 'move' : '';
 }
 
-// Once the image is pinned by a control point, its corner handles go away and
+// Once an image is pinned by a control point, its corner handles go away and
 // dragging its background pans the map instead of moving the image.
-const imageDraggable = () => state.points.length === 0;
+const imageDraggable = (L) => L.points.length === 0;
 
 // Dragging the image's background moves it only while a corner handle is in
 // view; zoomed in past all four, it pans the map instead.
-function imageMovable() {
-  if (!imageDraggable() || !state.mesh) return false;
+function imageMovable(L) {
+  if (!imageDraggable(L) || !L.mesh) return false;
   const canvas = map.getCanvas();
   const w = canvas.clientWidth, h = canvas.clientHeight;
   const box = map.getContainer().getBoundingClientRect();
   const pr = $('panel').getBoundingClientRect();
-  return meshCorners(state.mesh).map(mercToScreen).some(([x, y]) =>
+  return meshCorners(L.mesh).map(mercToScreen).some(([x, y]) =>
     x >= 0 && x <= w && y >= 0 && y <= h &&
     !(x + box.left >= pr.left && x + box.left <= pr.right && y + box.top >= pr.top && y + box.top <= pr.bottom));
 }
@@ -714,7 +772,7 @@ let lastPointer = null;
 let swallowing = false;
 
 function setHover(hit, cmd) {
-  const key = (h) => h ? h.kind + (h.index ?? '') : '';
+  const key = (h) => h ? `${h.layer.id}:${h.kind}${h.index ?? ''}` : '';
   const changed = key(hit) !== key(state.hover);
   state.hover = hit && hit.kind !== 'image' ? hit : null;
   map.getCanvas().style.cursor = cursorFor(hit, cmd);
@@ -729,7 +787,10 @@ container.addEventListener('pointerdown', (e) => {
   const p = localPoint(e);
   const hit = hitTest(p);
   if (!hit) return;
-  if (hit.kind === 'image' && !isCommand(e) && !imageMovable()) return;
+  const L = hit.layer;
+  // Clicking another image selects it, and goes on to act on it.
+  if (L !== state.selected) select(L);
+  if (hit.kind === 'image' && !isCommand(e) && !imageMovable(L)) return;
   // Keep MapLibre from starting a pan/rotate for this gesture.
   e.preventDefault();
   e.stopPropagation();
@@ -737,21 +798,21 @@ container.addEventListener('pointerdown', (e) => {
 
   // World anchors: dragging one bends the streets, not the image, and
   // ⌘-clicking the image with the streets on top adds one (and drags it).
-  const grabWorld = hit.kind === 'point' && !isCommand(e) && state.points[hit.index].world;
+  const grabWorld = hit.kind === 'point' && !isCommand(e) && L.points[hit.index].world;
   const addWorld = isCommand(e) && hit.kind === 'image' && streetsRaised();
   if (grabWorld || addWorld) {
-    const token = checkpoint();
+    const token = checkpoint(L);
     let index = hit.index, offset = [0, 0];
     if (addWorld) {
-      state.points.push({ u: hit.uv[0], v: hit.uv[1], x: hit.merc[0], y: hit.merc[1], world: true });
-      index = state.points.length - 1;
-      update();
+      L.points.push({ u: hit.uv[0], v: hit.uv[1], x: hit.merc[0], y: hit.merc[1], world: true });
+      index = L.points.length - 1;
+      update(L);
     } else {
-      const q = state.points[index];
+      const q = L.points[index];
       const [sx, sy] = mercToScreen([q.x, q.y]);
       offset = [sx - p[0], sy - p[1]];
     }
-    state.drag = startWorldDrag(index, token, offset);
+    state.drag = startWorldDrag(L, index, token, offset);
     document.body.classList.add('dragging');
     map.getCanvas().style.cursor = 'grabbing';
     hideStreets(true);
@@ -760,34 +821,35 @@ container.addEventListener('pointerdown', (e) => {
   }
 
   if (isCommand(e)) {
-    checkpoint();
+    checkpoint(L);
     if (hit.kind === 'point') {
-      state.points.splice(hit.index, 1);
+      L.points.splice(hit.index, 1);
     } else {
-      const uv = hit.kind === 'corner' ? cornerUV(hit.index) : hit.uv;
-      const target = hit.kind === 'corner' ? state.warp.map(uv[0], uv[1]) : hit.merc;
-      state.points.push({ u: uv[0], v: uv[1], x: target[0], y: target[1] });
+      const uv = hit.kind === 'corner' ? cornerUV(L, hit.index) : hit.uv;
+      const target = hit.kind === 'corner' ? L.warp.map(uv[0], uv[1]) : hit.merc;
+      L.points.push({ u: uv[0], v: uv[1], x: target[0], y: target[1] });
     }
     state.hover = null;
-    update();
+    update(L);
     return;
   }
 
   const m0 = screenToMerc(p);
   const drag = {
-    token: checkpoint(),
+    layer: L,
+    token: checkpoint(L),
     kind: hit.kind,
     index: hit.index,
     m0,
-    T0: state.T.slice(),
-    pts0: state.points.map(q => ({ ...q })),
+    T0: L.T.slice(),
+    pts0: L.points.map(q => ({ ...q })),
   };
   if (hit.kind === 'point') {
-    const q = state.points[hit.index];
+    const q = L.points[hit.index];
     drag.offset = [q.x - m0[0], q.y - m0[1]];
   } else if (hit.kind === 'corner') {
-    const { W, H } = state.image;
-    drag.pivot = state.warp.map(W / 2, H / 2);
+    const { W, H } = L.image;
+    drag.pivot = L.warp.map(W / 2, H / 2);
   }
   state.drag = drag;
   document.body.classList.add('dragging');
@@ -815,6 +877,7 @@ container.addEventListener('pointermove', (e) => {
 window.addEventListener('pointermove', (e) => {
   const d = state.drag;
   if (!d || !e.isPrimary) return;
+  const L = d.layer;
   lastPointer = localPoint(e);
   const m = screenToMerc(lastPointer);
   if (d.kind === 'world') {
@@ -824,17 +887,17 @@ window.addEventListener('pointermove', (e) => {
   const dx = m[0] - d.m0[0], dy = m[1] - d.m0[1];
 
   if (d.kind === 'image') {
-    state.T = translateAffine(d.T0, dx, dy);
-    state.points = d.pts0.map(q => ({ ...q, x: q.x + dx, y: q.y + dy }));
+    L.T = translateAffine(d.T0, dx, dy);
+    L.points = d.pts0.map(q => ({ ...q, x: q.x + dx, y: q.y + dy }));
   } else if (d.kind === 'point') {
     const nx = m[0] + d.offset[0], ny = m[1] + d.offset[1];
-    if (state.points.length === 1) {
+    if (L.points.length === 1) {
       const q = d.pts0[0];
-      state.T = translateAffine(d.T0, nx - q.x, ny - q.y);
+      L.T = translateAffine(d.T0, nx - q.x, ny - q.y);
     }
-    state.points = d.pts0.map(q => ({ ...q }));
-    state.points[d.index].x = nx;
-    state.points[d.index].y = ny;
+    L.points = d.pts0.map(q => ({ ...q }));
+    L.points[d.index].x = nx;
+    L.points[d.index].y = ny;
   } else if (d.kind === 'corner') {
     // Complex ratio of (pointer - pivot) to (start - pivot).
     const ax = d.m0[0] - d.pivot[0], ay = d.m0[1] - d.pivot[1];
@@ -848,13 +911,13 @@ window.addEventListener('pointermove', (e) => {
     }
     if (kr === 0 && ki === 0) return;
     const [px, py] = d.pivot;
-    state.T = similarityAboutPivot(d.T0, d.pivot, kr, ki);
-    state.points = d.pts0.map(q => {
+    L.T = similarityAboutPivot(d.T0, d.pivot, kr, ki);
+    L.points = d.pts0.map(q => {
       const rx = q.x - px, ry = q.y - py;
       return { ...q, x: px + kr * rx - ki * ry, y: py + ki * rx + kr * ry };
     });
   }
-  update();
+  update(L);
 });
 
 // ---------------------------------------------------------------------------
@@ -877,7 +940,7 @@ function mercToScreenAffine() {
   return [a, b, x0 - a * c[0] - b * c[1], d, f, y0 - d * c[0] - f * c[1]];
 }
 
-function startWorldDrag(index, token, offset) {
+function startWorldDrag(L, index, token, offset) {
   const canvas = map.getCanvas();
   const nx = Math.ceil(canvas.clientWidth / PREVIEW_STEP) + 1;
   const ny = Math.ceil(canvas.clientHeight / PREVIEW_STEP) + 1;
@@ -899,13 +962,13 @@ function startWorldDrag(index, token, offset) {
     }
   }
   return {
-    kind: 'world', index, token, offset,
-    T0: state.T.slice(),
-    pts0: state.points.map(q => ({ ...q })),
-    mesh: state.mesh,
-    fine: state.fine,
+    kind: 'world', layer: L, index, token, offset,
+    T0: L.T.slice(),
+    pts0: L.points.map(q => ({ ...q })),
+    mesh: L.mesh,
+    fine: L.fine,
     A, nx, ny,
-    under: sampleDrawn(A, nx, ny),
+    under: sampleDrawn(L, A, nx, ny),
     streets,
     preview: null,
     cursor: null,
@@ -914,9 +977,9 @@ function startWorldDrag(index, token, offset) {
 
 // The image pixel under each grid node, as drawn: the fine patch where it
 // covers, the coarse mesh elsewhere.
-function sampleDrawn(A, nx, ny) {
-  const under = sampleMesh(state.mesh, A, nx, ny, PREVIEW_STEP);
-  const f = state.fine;
+function sampleDrawn(L, A, nx, ny) {
+  const under = sampleMesh(L.mesh, A, nx, ny, PREVIEW_STEP);
+  const f = L.fine;
   if (f) {
     const fine = sampleMesh(f.mesh, A, nx, ny, PREVIEW_STEP);
     for (let k = 0; k < fine.length; k += 2) {
@@ -999,21 +1062,22 @@ function polylinePath(lines) {
 const EASE = { ms: 250 };
 
 function easeWorldRelease(d) {
-  const q = state.points[d.index];
+  const L = d.layer;
+  const q = L.points[d.index];
   const [sx, sy] = mercToScreen([q.x, q.y]);
   const [cx, cy] = d.preview.cursor;
   const dx = sx - cx, dy = sy - cy;
   if (!dx && !dy) return false;
   const canvas = map.getCanvas();
   const w = canvas.clientWidth / 2, h = canvas.clientHeight / 2;
-  const from = d.mesh, to = state.mesh, fineFrom = d.fine;
+  const from = d.mesh, to = L.mesh, fineFrom = d.fine;
   const same = (a, b) => a.nx === b.nx && a.ny === b.ny;
   // The new warp's fine patch over the same cells as the old, to blend.
   const fineTo = fineFrom && same(from, to)
-    ? refineMesh(state.warp.map, to, fineFrom.i0, fineFrom.j0, fineFrom.i1, fineFrom.j1, fineFrom.s)
-    : state.fine;
+    ? refineMesh(L.warp.map, to, fineFrom.i0, fineFrom.j0, fineFrom.i1, fineFrom.j1, fineFrom.s)
+    : L.fine;
   const ease = {
-    index: d.index, cursor: [cx, cy], dx, dy, e: 0,
+    layer: L, index: d.index, cursor: [cx, cy], dx, dy, e: 0,
     c0: screenToMerc([w, h]), c1: screenToMerc([w + dx, h + dy]),
     blend: same(from, to),
     // The fine patches blend too when they cover the same cells.
@@ -1029,10 +1093,10 @@ function easeWorldRelease(d) {
     return pos;
   };
   const show = (e) => {
-    if (ease.blend) state.mesh = { ...to, pos: lerp(from.pos, to.pos, e) };
-    state.fine = ease.blendFine ? { ...fineTo, mesh: { ...fineTo.mesh, pos: lerp(fineFrom.mesh.pos, fineTo.mesh.pos, e) } }
+    if (ease.blend) L.mesh = { ...to, pos: lerp(from.pos, to.pos, e) };
+    L.fine = ease.blendFine ? { ...fineTo, mesh: { ...fineTo.mesh, pos: lerp(fineFrom.mesh.pos, fineTo.mesh.pos, e) } }
       : ease.blend ? null : fineTo;
-    imageLayer.meshDirty = true;
+    L.meshDirty = true;
   };
   // Start from what was on screen: update() has already made the new mesh.
   show(0);
@@ -1052,9 +1116,9 @@ function easeWorldRelease(d) {
       return;
     }
     state.ease = null;
-    state.mesh = to;
-    state.fine = refineView(to);
-    imageLayer.meshDirty = true;
+    L.mesh = to;
+    L.fine = refineView(L, to);
+    L.meshDirty = true;
     hideStreets(false);
     map.triggerRepaint();
     drawOverlay();
@@ -1080,19 +1144,20 @@ function endDrag(cancel) {
   const d = state.drag;
   swallowing = false;
   if (!d) return;
+  const L = d.layer;
   if (d.kind === 'world') {
     hideStreets(false);
     // The image spot under the pointer goes to the anchor's place.
-    if (!cancel && d.preview) state.points = d.preview.pts;
+    if (!cancel && d.preview) L.points = d.preview.pts;
   }
   if (cancel) {
-    state.T = d.T0;
-    state.points = d.pts0;
+    L.T = d.T0;
+    L.points = d.pts0;
   }
   settle(d.token, cancel);
   state.drag = null;
   document.body.classList.remove('dragging');
-  update();
+  update(L);
   if (d.kind === 'world' && !cancel && d.preview) easeWorldRelease(d);
   if (lastPointer) setHover(hitTest(lastPointer), false);
 }
@@ -1166,7 +1231,46 @@ function decodeImage(file) {
   });
 }
 
-async function loadFiles(files, dropPoint, { keepView = false, fromURL = false } = {}) {
+// Each image dropped or chosen becomes a new layer on top, along with the
+// world file and CRS file named after it. (With a single image, any world
+// file and CRS file go with it.) `url` is where a single image came from.
+// Unless quiet, zooms to the new layers that were placed (unless keepView)
+// and reports on them in the status line. Returns {added, placed, messages,
+// failed}.
+async function loadFiles(files, dropPoint, { keepView = false, url = null, quiet = false } = {}) {
+  const images = files.filter(f => isImageFile(f) || KMZ_RE.test(f.name));
+  if (!images.length) {
+    const message = 'That doesn’t look like a JPEG, PNG, WebP, GeoTIFF or KMZ file.';
+    if (!quiet) setStatus(message, true);
+    return { added: [], placed: [], messages: [message], failed: true };
+  }
+  const sidecars = files.filter(f => !images.includes(f));
+  const stem = (name) => name.replace(/\.aux\.xml$/i, '').replace(/\.[^.]+$/, '');
+  const added = [], placed = [], messages = [];
+  let failed = false;
+  for (const image of images) {
+    const group = images.length === 1 ? files
+      : [image, ...sidecars.filter(f => [stem(image.name), image.name].includes(f.name.replace(/\.aux\.xml$/i, '')) ||
+        stem(f.name) === stem(image.name))];
+    const r = await loadImage(group, dropPoint);
+    messages.push(r.message);
+    failed ||= r.error;
+    if (!r.layer) continue;
+    r.layer.url = url;
+    addLayer(r.layer);
+    added.push(r.layer);
+    if (r.placed) placed.push(r.layer);
+  }
+  if (!quiet) {
+    if (placed.length && !keepView) zoomToLayers(placed);
+    setStatus(messages.join('<br>'), failed);
+  }
+  return { added, placed, messages, failed };
+}
+
+// One image and its sidecar files, as a layer: {layer, placed, message,
+// error}, with no layer if it couldn't be read.
+async function loadImage(files, dropPoint) {
   let imageFile = files.find(isImageFile);
   let kmlText = '';
   const kmzFile = files.find(f => KMZ_RE.test(f.name));
@@ -1175,14 +1279,10 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
       ({ imageFile, kmlText } = await unpackKMZ(kmzFile));
     } catch (err) {
       console.warn(err);
-      setStatus(`Could not read <b>${escapeHTML(kmzFile.name)}</b>: ${escapeHTML(err.message)}`, true);
-      return;
+      return { message: `Could not read <b>${escapeHTML(kmzFile.name)}</b>: ${escapeHTML(err.message)}`, error: true };
     }
   }
-  if (!imageFile) {
-    setStatus('That doesn’t look like a JPEG, PNG, WebP, GeoTIFF or KMZ file.', true);
-    return;
-  }
+  if (!imageFile) return { message: `There’s no image in <b>${escapeHTML(kmzFile.name)}</b>.`, error: true };
   const worldFile = files.find(f => WORLD_RE.test(f.name));
   const crsFile = files.find(f => /\.(prj|aux\.xml)$/i.test(f.name));
   const bytes = new Uint8Array(await imageFile.arrayBuffer());
@@ -1200,8 +1300,7 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
     }
   } catch (err) {
     console.warn(err);
-    setStatus(`Could not read <b>${escapeHTML(imageFile.name)}</b>: ${escapeHTML(err.message)}`, true);
-    return;
+    return { message: `Could not read <b>${escapeHTML(imageFile.name)}</b>: ${escapeHTML(err.message)}`, error: true };
   }
   let source = img;
   let W = img.naturalWidth || img.width, H = img.naturalHeight || img.height;
@@ -1245,17 +1344,25 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
     placement = { T: dropPlacement(dropPoint, W, H), points: [] };
   }
 
-  state.image = { name: imageFile.name, img: source, W, H, paper: findPaper(source) };
-  state.T = placement.T;
-  state.points = placement.points;
-  state.drag = null;
-  resetHistory();
-  imageLayer.texDirty = true;
-  update();
-  if ((placement.points.length || how) && !keepView) zoomToImage();
-  if (!fromURL) clearImageParam();
-  setStatus(`<b>${escapeHTML(imageFile.name)}</b> (${W}×${H})${how ? ', ' + how : ''}.` +
-    (problem ? ` ${escapeHTML(problem)}` : ''), !!problem);
+  const layer = {
+    id: nextLayerId++,
+    image: { name: imageFile.name, img: source, W, H, paper: findPaper(source) },
+    url: null,
+    T: placement.T,
+    points: placement.points,
+    warp: null, mesh: null, fine: null, origin: [0, 0],
+    opacity: 1,
+    hidePaper: 0,
+    gpu: null, texDirty: true, meshDirty: true,
+    card: null,
+  };
+  return {
+    layer,
+    placed: !!(placement.points.length || how),
+    message: `<b>${escapeHTML(imageFile.name)}</b> (${W}×${H})${how ? ', ' + how : ''}.` +
+      (problem ? ` ${escapeHTML(problem)}` : ''),
+    error: !!problem,
+  };
 }
 
 // The paper's colour across an image (estimatePaper), found on a copy at most
@@ -1278,17 +1385,24 @@ function findPaper(img) {
   }
 }
 
-// ?image=<url> loads an image from the web. The server has to allow
-// cross-origin requests.
-function clearImageParam() {
+// ?image=<url> loads an image from the web, and ?image=<url>&image=<url>…
+// several, bottom to top. The servers have to allow cross-origin requests.
+// The parameter follows the layers: it lists those loaded from URLs.
+let loadingURLs = false;
+function syncImageParam() {
+  // Left alone while loading them, and (so that a link survives a failed
+  // load) after a failure, until the layers next change.
+  if (loadingURLs) return;
   const u = new URL(window.location.href);
-  if (!u.searchParams.has('image')) return;
+  const urls = state.layers.map(L => L.url).filter(Boolean);
+  const now = u.searchParams.getAll('image');
+  if (urls.length === now.length && urls.every((x, i) => x === now[i])) return;
   u.searchParams.delete('image');
+  for (const x of urls) u.searchParams.append('image', x);
   history.replaceState(history.state, '', u);
 }
 
-async function loadURL(url, keepView = false) {
-  setStatus(`Loading <b>${escapeHTML(url)}</b>…`);
+async function fetchImage(url) {
   let blob;
   try {
     const res = await fetch(url);
@@ -1296,9 +1410,8 @@ async function loadURL(url, keepView = false) {
     blob = await res.blob();
   } catch (err) {
     console.warn(err);
-    setStatus(`Could not load <b>${escapeHTML(url)}</b> (${escapeHTML(err.message)}). ` +
-      'The server must allow cross-origin requests.', true);
-    return;
+    return { error: `Could not load <b>${escapeHTML(url)}</b> (${escapeHTML(err.message)}). ` +
+      'The server must allow cross-origin requests.' };
   }
   let name = '';
   try {
@@ -1309,8 +1422,35 @@ async function loadURL(url, keepView = false) {
       'application/vnd.google-earth.kmz': 'kmz' }[blob.type] || 'png';
     name = `image.${ext}`;
   }
-  await loadFiles([new File([blob], name, { type: blob.type })], null, { keepView, fromURL: true });
+  return { file: new File([blob], name, { type: blob.type }) };
 }
+
+// Load images from URLs, each as a layer, in order. Unless keepView, zoom to
+// those that were placed.
+async function loadURLs(urls, keepView = false) {
+  setStatus(urls.map(url => `Loading <b>${escapeHTML(url)}</b>…`).join('<br>'));
+  const fetched = await Promise.all(urls.map(fetchImage));
+  const placed = [], messages = [];
+  let failed = false;
+  loadingURLs = true;
+  for (let i = 0; i < urls.length; i++) {
+    if (fetched[i].error) {
+      messages.push(fetched[i].error);
+      failed = true;
+      continue;
+    }
+    const r = await loadFiles([fetched[i].file], null, { url: urls[i], quiet: true });
+    placed.push(...r.placed);
+    messages.push(...r.messages);
+    failed ||= r.failed;
+  }
+  loadingURLs = false;
+  if (!failed) syncImageParam();
+  if (placed.length && !keepView) zoomToLayers(placed);
+  setStatus(messages.join('<br>'), failed);
+}
+
+const loadURL = (url, keepView) => loadURLs([url], keepView);
 
 // Centre the image on the drop point, upright on screen, at 75% of the view.
 function dropPlacement(dropPoint, W, H) {
@@ -1507,7 +1647,7 @@ const MAX_KMZ_SIDE = 8192;
 //
 // Browsers cap a WebGL drawing buffer well below what a large scan needs
 // (Chrome at 2^25 pixels), so the raster is drawn in horizontal strips.
-async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', img = state.image.img) {
+async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', img) {
   const [minX, minY, maxX, maxY] = meshBounds({ pos });
   const canvas = document.createElement('canvas');
   canvas.width = canvas.height = 1;
@@ -1544,8 +1684,9 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
   const spanX = ow * px;
   const origin = [minX + spanX / 2, minY + oh * py / 2];
   const renderer = new MeshRenderer(gl);
-  renderer.setTexture(textureSource(img, gl.getParameter(gl.MAX_TEXTURE_SIZE)));
-  renderer.setTriangles(meshTriangles({ ...mesh, pos }, origin));
+  const gpu = renderer.create();
+  renderer.setTexture(gpu, textureSource(img, gl.getParameter(gl.MAX_TEXTURE_SIZE)));
+  renderer.setTriangles(gpu, meshTriangles({ ...mesh, pos }, origin));
   gl.viewport(0, 0, ow, sh);
   gl.clearColor(0, 0, 0, 0);
   gl.disable(gl.BLEND);
@@ -1567,7 +1708,7 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
     const centreY = minY + (y0 + sh / 2) * py - origin[1];
     const sy = -2 / (sh * py);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    renderer.draw(new Float32Array([2 / spanX, 0, 0, 0, 0, sy, 0, 0, 0, 0, 1, 0, 0, -sy * centreY, 0, 1]), 1);
+    renderer.draw(gpu, new Float32Array([2 / spanX, 0, 0, 0, 0, sy, 0, 0, 0, 0, 1, 0, 0, -sy * centreY, 0, 1]), 1);
     if (rgba) {
       gl.readPixels(0, 0, ow, sh, gl.RGBA, gl.UNSIGNED_BYTE, strip);
       // GL rows run bottom-up.
@@ -1577,6 +1718,7 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
     }
     await exportProgress('Drawing', (y0 + h) / oh);
   }
+  renderer.free(gpu);
   renderer.destroy();
   gl.getExtension('WEBGL_lose_context')?.loseContext();
 
@@ -1615,9 +1757,8 @@ function exportMesh(snap, minCells) {
 
 // What an export works from, copied when it starts: the export yields to the
 // browser to show its progress, and the image may be edited meanwhile.
-function exportSnapshot() {
-  if (!state.image) return null;
-  return { image: state.image, warp: state.warp, points: state.points.map(p => ({ ...p })) };
+function exportSnapshot(L) {
+  return { image: L.image, warp: L.warp, points: L.points.map(p => ({ ...p })) };
 }
 
 // Metadata for an exported raster. `toPixel` maps Mercator units to its
@@ -1647,8 +1788,7 @@ function exportBaseName(snap) {
   return snap.image.name.replace(/\.[^.]+$/, '').replace(/-georef$/, '') + '-georef';
 }
 
-async function exportImage(snap = exportSnapshot()) {
-  if (!snap) return;
+async function exportImage(snap) {
   await exportProgress('Preparing');
   const mesh = exportMesh(snap, 0);
   const r = await rasterize(mesh, mesh.pos, ...Array(2).fill(affineScale(snap.warp.S)), Infinity, 'png', snap.image.img);
@@ -1671,8 +1811,7 @@ async function exportImage(snap = exportSnapshot()) {
 }
 
 // A Web Mercator GeoTIFF. The rubbersheet metadata goes in ImageDescription.
-async function exportGeoTIFF(snap = exportSnapshot()) {
-  if (!snap) return;
+async function exportGeoTIFF(snap) {
   await exportProgress('Preparing');
   const mesh = exportMesh(snap, 0);
   const r = await rasterize(mesh, mesh.pos, ...Array(2).fill(affineScale(snap.warp.S)), Infinity, 'rgba', snap.image.img);
@@ -1696,8 +1835,7 @@ async function exportGeoTIFF(snap = exportSnapshot()) {
 
 // Google Earth stretches a GroundOverlay linearly in latitude, so the KMZ
 // image is resampled to EPSG:4326 (plate carrée) rather than Mercator.
-async function exportKMZ(snap = exportSnapshot()) {
-  if (!snap) return;
+async function exportKMZ(snap) {
   await exportProgress('Preparing');
   const mesh = exportMesh(snap, DISPLAY_CELLS);
   // Plot longitude right and latitude down (negated), so north is at the top.
@@ -1750,10 +1888,10 @@ async function exportKMZ(snap = exportSnapshot()) {
 // outside an export started from the button. Otherwise it relabels the button,
 // with a bar for `fraction` (0–1) or an indeterminate one without, and gives
 // the browser a chance to paint it, since most export work blocks the page.
-let exporting = false;
+let exporting = null;  // the layer being exported
 async function exportProgress(label, fraction = null) {
   if (!exporting) return;
-  const btn = $('export');
+  const btn = exporting.card.querySelector('.export');
   btn.textContent = fraction === null ? `${label}…` : `${label}… ${Math.floor(fraction * 100)}%`;
   btn.classList.toggle('indeterminate', fraction === null);
   btn.style.setProperty('--progress', fraction === null ? 1 : fraction);
@@ -1765,12 +1903,11 @@ async function exportProgress(label, fraction = null) {
   });
 }
 
-async function runExport() {
+async function runExport(L) {
   if (exporting) return;
-  const snap = exportSnapshot();
-  if (!snap) return;
-  exporting = true;
-  const btn = $('export');
+  const snap = exportSnapshot(L);
+  exporting = L;
+  const btn = L.card.querySelector('.export');
   btn.classList.add('busy');
   btn.setAttribute('aria-busy', 'true');
   updateUI();
@@ -1780,7 +1917,7 @@ async function runExport() {
     console.error(err);
     setStatus(`Export failed: ${escapeHTML(err.message)}`, true);
   } finally {
-    exporting = false;
+    exporting = null;
     btn.classList.remove('busy', 'indeterminate');
     btn.removeAttribute('aria-busy');
     btn.style.removeProperty('--progress');
@@ -1807,74 +1944,172 @@ function escapeHTML(s) {
 }
 
 let statusBase = '';
-const initialStatus = $('status').innerHTML;
 function setStatus(html, error) {
   statusBase = error ? `<span style="color:#c0261b">${html}</span>` : html;
   updateUI();
 }
 
-function updateUI() {
-  const has = !!state.image;
-  $('export').disabled = !has || exporting;
-  $('zoom').disabled = !has;
-  $('remove').disabled = !has;
-  const paper = state.image?.paper;
-  $('hide-paper').disabled = !paper;
-  $('paper-swatch').style.background = paper ? `rgb(${paper.colour.join(',')})` : 'transparent';
-  $('paper-swatch').title = paper ? `Paper colour: rgb(${paper.colour.join(', ')})` : '';
-  $('clear').disabled = !state.points.length;
-  $('undo').disabled = !has || !edits.undo.length;
-  $('redo').disabled = !has || !edits.redo.length;
-  const n = state.points.length;
-  const pts = has
-    ? `<br>${n} control point${n === 1 ? '' : 's'}${n < 2 ? ' — ⌘/Ctrl-click the image to add one.' : '.'}`
-    : '';
-  if (statusBase || has) $('status').innerHTML = statusBase + pts;
+// ---------------------------------------------------------------------------
+// Layers: the list in the panel, top layer first.
+
+// Show `order` (bottom to top) as the layers.
+function setLayers(order) {
+  for (const L of state.layers) if (!order.includes(L)) freeGPU(L);
+  state.layers = order.slice();
+  if (!state.layers.includes(state.selected)) state.selected = state.layers[state.layers.length - 1] ?? null;
+  state.hover = null;
+  const list = $('layers');
+  list.replaceChildren(...state.layers.slice().reverse().map(layerCard));
+  list.hidden = !state.layers.length;
+  if (!state.layers.length) {
+    statusBase = '';
+    map.getCanvas().style.cursor = '';
+  }
+  syncImageParam();
+  map.triggerRepaint();
+  drawOverlay();
+  updateUI();
 }
 
-function zoomToImage() {
-  if (!state.mesh) return;
-  const [minX, minY, maxX, maxY] = meshBounds(state.mesh);
+function select(L) {
+  state.selected = L;
+  state.hover = null;
+  drawOverlay();
+  updateUI();
+}
+
+// A new layer on top, selected.
+function addLayer(L) {
+  checkpoint();
+  update(L);
+  setLayers([...state.layers, L]);
+  select(L);
+}
+
+function removeLayer(L) {
+  if (state.drag || state.ease) return;
+  checkpoint();
+  statusBase = '';
+  setLayers(state.layers.filter(x => x !== L));
+}
+
+function layerCard(L) {
+  if (L.card) return L.card;
+  const card = $('layer-template').content.firstElementChild.cloneNode(true);
+  L.card = card;
+  const q = (sel) => card.querySelector(sel);
+  q('.name').textContent = L.image.name;
+  q('.name').title = L.image.name;
+  const opacity = q('.opacity'), hide = q('.hide-paper');
+  opacity.id = `opacity-${L.id}`;
+  hide.id = `hide-paper-${L.id}`;
+  q('.opacity-label').htmlFor = opacity.id;
+  q('.hide-paper-label').htmlFor = hide.id;
+  opacity.value = L.opacity;
+  hide.value = L.hidePaper;
+  opacity.addEventListener('input', () => {
+    L.opacity = Number(opacity.value);
+    map.triggerRepaint();
+  });
+  hide.addEventListener('input', () => {
+    L.hidePaper = Number(hide.value);
+    map.triggerRepaint();
+  });
+  const paper = L.image.paper;
+  hide.disabled = !paper;
+  q('.swatch').style.background = paper ? `rgb(${paper.colour.join(',')})` : 'transparent';
+  q('.swatch').title = paper ? `Paper colour: rgb(${paper.colour.join(', ')})` : '';
+  q('.export').addEventListener('click', () => runExport(L));
+  q('.zoom').addEventListener('click', () => zoomToLayers([L]));
+  q('.remove').addEventListener('click', () => removeLayer(L));
+  // On click, not pointerdown: selecting can change the card's height, which
+  // would move a button out from under the pointer before it's released.
+  card.addEventListener('click', () => {
+    if (state.selected !== L && state.layers.includes(L)) select(L);
+  });
+  q('.grip').addEventListener('pointerdown', (e) => dragCard(L, e));
+  return card;
+}
+
+// Drag a layer's card up or down the list by its grip, moving the layer in
+// the map as it goes.
+function dragCard(L, e) {
+  if (e.button !== 0 || state.drag || state.ease) return;
+  e.preventDefault();
+  // Listening on the window: moving the card in the list would lose a
+  // pointer capture.
+  const card = L.card, list = $('layers'), id = e.pointerId;
+  if (state.selected !== L) select(L);
+  card.classList.add('moving');
+  const start = state.layers.slice();
+  const orderFromList = () => [...list.children].reverse().map(c => state.layers.find(x => x.card === c));
+  const move = (ev) => {
+    if (ev.pointerId !== id) return;
+    const others = [...list.children].filter(c => c !== card);
+    const next = others.find(c => {
+      const r = c.getBoundingClientRect();
+      return ev.clientY < r.top + r.height / 2;
+    });
+    if (card.nextElementSibling === (next || null)) return;
+    list.insertBefore(card, next || null);
+    state.layers = orderFromList();
+    map.triggerRepaint();
+    drawOverlay();
+  };
+  const up = (ev) => {
+    if (ev.pointerId !== id) return;
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    window.removeEventListener('pointercancel', up);
+    card.classList.remove('moving');
+    const order = orderFromList();
+    state.layers = start;
+    if (order.some((x, i) => x !== start[i])) {
+      checkpoint();
+      setLayers(order);
+    }
+  };
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+  window.addEventListener('pointercancel', up);
+}
+
+function updateUI() {
+  $('undo').disabled = !edits.undo.length;
+  $('redo').disabled = !edits.redo.length;
+  const status = $('status');
+  status.innerHTML = statusBase;
+  status.hidden = !statusBase;
+  for (const L of state.layers) {
+    const card = layerCard(L);
+    const selected = L === state.selected;
+    card.classList.toggle('selected', selected);
+    card.querySelector('.export').disabled = !!exporting;
+    const n = L.points.length;
+    card.querySelector('.info').textContent = `${L.image.W}×${L.image.H}, ${n} control point${n === 1 ? '' : 's'}` +
+      (n < 2 && selected ? ' — ⌘/Ctrl-click the image to add one.' : '.');
+  }
+}
+
+function zoomToLayers(layers) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const L of layers) {
+    if (!L.mesh) continue;
+    const b = meshBounds(L.mesh);
+    minX = Math.min(minX, b[0]); minY = Math.min(minY, b[1]);
+    maxX = Math.max(maxX, b[2]); maxY = Math.max(maxY, b[3]);
+  }
+  if (!(minX < maxX)) return;
   const nw = toLngLat([minX, minY]), se = toLngLat([maxX, maxY]);
   map.fitBounds([[nw.lng, se.lat], [se.lng, nw.lat]], { padding: 60, duration: 600 });
 }
 
 const EXPORTERS = { png: exportImage, tiff: exportGeoTIFF, kmz: exportKMZ };
-$('export').addEventListener('click', runExport);
 $('format').addEventListener('change', (e) => {
   $('worldfile-row').hidden = e.target.value !== 'png';
 });
-$('zoom').addEventListener('click', zoomToImage);
-$('clear').addEventListener('click', () => {
-  checkpoint();
-  state.points = [];
-  update();
-});
 $('undo').addEventListener('click', undo);
 $('redo').addEventListener('click', redo);
-$('remove').addEventListener('click', () => {
-  state.image = null;
-  state.mesh = null;
-  state.fine = null;
-  state.points = [];
-  resetHistory();
-  state.hover = null;
-  overlay.innerHTML = '';
-  map.getCanvas().style.cursor = '';
-  map.triggerRepaint();
-  statusBase = '';
-  $('status').innerHTML = initialStatus;
-  clearImageParam();
-  updateUI();
-});
-$('opacity').addEventListener('input', (e) => {
-  state.opacity = Number(e.target.value);
-  map.triggerRepaint();
-});
-$('hide-paper').addEventListener('input', (e) => {
-  state.hidePaper = Number(e.target.value);
-  map.triggerRepaint();
-});
 $('basemap').addEventListener('change', (e) => {
   map.setStyle(STYLES[e.target.value], { diff: false });
   // Only the vector maps have separate road layers to lift.
@@ -1885,8 +2120,11 @@ $('streets-on-top').addEventListener('change', (e) => {
   applyStreets();
 });
 
-const imageParam = new URLSearchParams(window.location.search).get('image');
-if (imageParam) loadURL(imageParam, linkHasView);
+const imageParams = new URLSearchParams(window.location.search).getAll('image').filter(Boolean);
+if (imageParams.length) loadURLs(imageParams, linkHasView);
 
 // Exposed for debugging and automated tests.
-window.rubbersheet = { map, state, update, loadFiles, loadURL, exportImage, exportGeoTIFF, exportKMZ, decodeJPEG, invertDrawn, EASE };
+window.rubbersheet = {
+  map, state, update, loadFiles, loadURL, loadURLs, exportSnapshot, exportImage, exportGeoTIFF, exportKMZ,
+  decodeJPEG, invertDrawn, EASE, select, removeLayer, setLayers, undo, redo,
+};
