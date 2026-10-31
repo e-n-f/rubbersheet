@@ -99,6 +99,25 @@ button:disabled { opacity: 0.45; cursor: default; }
   border-color: #1a62c4;
   color: #fff;
 }
+/* While exporting: a lighter blue fills in left to right as strips are drawn,
+   or stripes slide along when the stage's length is unknown. */
+#export.busy {
+  --progress: 0;
+  opacity: 1;
+  cursor: progress;
+  color: #fff;
+  border-color: #1a62c4;
+  background: linear-gradient(to right, #1a62c4 calc(var(--progress) * 100%), #6f9bd8 0);
+  font-variant-numeric: tabular-nums;
+}
+#export.busy.indeterminate {
+  background: repeating-linear-gradient(-45deg, #1a62c4 0 10px, #3d7bd0 10px 20px) 0 0 / 28.28px 100%;
+  animation: export-stripes 0.8s linear infinite;
+}
+@keyframes export-stripes { to { background-position: 28.28px 0; } }
+@media (prefers-reduced-motion: reduce) {
+  #export.busy.indeterminate { animation: none; }
+}
 .check { display: block; font-size: 12.5px; color: #4a535c; }
 .check[hidden] { display: none; }
 details { margin-top: 10px; }

@@ -1575,6 +1575,7 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
     } else {
       ctx.drawImage(canvas, 0, 0, ow, h, 0, y0, ow, h);
     }
+    await exportProgress('Drawing', (y0 + h) / oh);
   }
   renderer.destroy();
   gl.getExtension('WEBGL_lose_context')?.loseContext();
@@ -1593,6 +1594,7 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
     }
     return { ...result, bytes: rgba };
   }
+  await exportProgress('Encoding PNG');
   const blob = await new Promise(resolve => out2d.toBlob(resolve, 'image/png'));
   if (!blob) throw new Error('the browser could not encode the image.');
   return { ...result, bytes: new Uint8Array(await blob.arrayBuffer()) };
@@ -1602,19 +1604,26 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
 // warp gets cells split where it bends sharply (near a control point moved
 // out of line with its neighbours), to stay within a quarter of an output
 // pixel everywhere.
-function exportMesh(minCells) {
-  const { W, H } = state.image;
-  if (state.points.length < 3) {
-    return buildMesh(state.warp.map, W, H, minCells ? cellsAcross(W, H, minCells) : 1);
+function exportMesh(snap, minCells) {
+  const { W, H } = snap.image;
+  if (snap.points.length < 3) {
+    return buildMesh(snap.warp.map, W, H, minCells ? cellsAcross(W, H, minCells) : 1);
   }
-  return refinedSoup(state.warp.map, W, H, cellsAcross(W, H, EXPORT_CELLS),
-    affineScale(state.warp.S) / 4, state.points.map(p => [p.u, p.v]));
+  return refinedSoup(snap.warp.map, W, H, cellsAcross(W, H, EXPORT_CELLS),
+    affineScale(snap.warp.S) / 4, snap.points.map(p => [p.u, p.v]));
+}
+
+// What an export works from, copied when it starts: the export yields to the
+// browser to show its progress, and the image may be edited meanwhile.
+function exportSnapshot() {
+  if (!state.image) return null;
+  return { image: state.image, warp: state.warp, points: state.points.map(p => ({ ...p })) };
 }
 
 // Metadata for an exported raster. `toPixel` maps Mercator units to its
 // pixel coordinates.
-function exportMetadata(crs, ow, oh, worldFile, bounds, toPixel) {
-  const { name, W, H } = state.image;
+function exportMetadata(snap, crs, ow, oh, worldFile, bounds, toPixel) {
+  const { name, W, H } = snap.image;
   return {
     generator: 'rubbersheet',
     version: 1,
@@ -1624,7 +1633,7 @@ function exportMetadata(crs, ow, oh, worldFile, bounds, toPixel) {
     worldFile,
     bounds,
     source: { name, width: W, height: H },
-    controlPoints: state.points.map(p => {
+    controlPoints: snap.points.map(p => {
       const ll = toLngLat([p.x, p.y]);
       return {
         pixel: toPixel(p.x, p.y), sourcePixel: [p.u, p.v], lngLat: [ll.lng, ll.lat],
@@ -1634,23 +1643,24 @@ function exportMetadata(crs, ow, oh, worldFile, bounds, toPixel) {
   };
 }
 
-function exportBaseName() {
-  return state.image.name.replace(/\.[^.]+$/, '').replace(/-georef$/, '') + '-georef';
+function exportBaseName(snap) {
+  return snap.image.name.replace(/\.[^.]+$/, '').replace(/-georef$/, '') + '-georef';
 }
 
-async function exportImage() {
-  if (!state.image) return;
-  const mesh = exportMesh(0);
-  const r = await rasterize(mesh, mesh.pos, ...Array(2).fill(affineScale(state.warp.S)));
+async function exportImage(snap = exportSnapshot()) {
+  if (!snap) return;
+  await exportProgress('Preparing');
+  const mesh = exportMesh(snap, 0);
+  const r = await rasterize(mesh, mesh.pos, ...Array(2).fill(affineScale(snap.warp.S)), Infinity, 'png', snap.image.img);
   const { ow, oh, px: ps, minX, minY } = r;
 
   // Output pixel (i, j) covers [minX + i*ps, minX + (i+1)*ps) etc.
   const worldFile = affineToWorldFile([ps, 0, minX, 0, ps, minY]);
   const nw = toLngLat([minX, minY]), se = toLngLat([minX + ow * ps, minY + oh * ps]);
-  const meta = exportMetadata('EPSG:3857', ow, oh, worldFile, [nw.lng, se.lat, se.lng, nw.lat],
+  const meta = exportMetadata(snap, 'EPSG:3857', ow, oh, worldFile, [nw.lng, se.lat, se.lng, nw.lat],
     (x, y) => [(x - minX) / ps, (y - minY) / ps]);
   const bytes = addTextChunk(r.bytes, META_KEY, JSON.stringify(meta));
-  const base = exportBaseName();
+  const base = exportBaseName(snap);
   download(new Blob([bytes], { type: 'image/png' }), `${base}.png`);
   if ($('worldfile').checked) {
     download(new Blob([worldFile.map(n => n.toPrecision(17)).join('\n') + '\n'], { type: 'text/plain' }), `${base}.pgw`);
@@ -1661,32 +1671,35 @@ async function exportImage() {
 }
 
 // A Web Mercator GeoTIFF. The rubbersheet metadata goes in ImageDescription.
-async function exportGeoTIFF() {
-  if (!state.image) return;
-  const mesh = exportMesh(0);
-  const r = await rasterize(mesh, mesh.pos, ...Array(2).fill(affineScale(state.warp.S)), Infinity, 'rgba');
+async function exportGeoTIFF(snap = exportSnapshot()) {
+  if (!snap) return;
+  await exportProgress('Preparing');
+  const mesh = exportMesh(snap, 0);
+  const r = await rasterize(mesh, mesh.pos, ...Array(2).fill(affineScale(snap.warp.S)), Infinity, 'rgba', snap.image.img);
   const { ow, oh, px: ps, minX, minY } = r;
   const worldFile = affineToWorldFile([ps, 0, minX, 0, ps, minY]);
   const nw = toLngLat([minX, minY]), se = toLngLat([minX + ow * ps, minY + oh * ps]);
-  const meta = exportMetadata('EPSG:3857', ow, oh, worldFile, [nw.lng, se.lat, se.lng, nw.lat],
+  const meta = exportMetadata(snap, 'EPSG:3857', ow, oh, worldFile, [nw.lng, se.lat, se.lng, nw.lat],
     (x, y) => [(x - minX) / ps, (y - minY) / ps]);
   const size = ps * EARTH_CIRCUMFERENCE;
+  await exportProgress('Compressing');
   const tiff = await writeGeoTIFF({
     width: ow, height: oh, rgba: r.bytes, epsg: 3857,
     scale: [size, size], origin: mercToMeters(minX, minY),
     description: JSON.stringify(meta).replace(/[^\x20-\x7e]/g,
       ch => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0')),
   });
-  const base = exportBaseName();
+  const base = exportBaseName(snap);
   download(new Blob([tiff], { type: 'image/tiff' }), `${base}.tif`);
   setStatus(`Exported <b>${escapeHTML(base)}.tif</b> (${ow}×${oh}).`);
 }
 
 // Google Earth stretches a GroundOverlay linearly in latitude, so the KMZ
 // image is resampled to EPSG:4326 (plate carrée) rather than Mercator.
-async function exportKMZ() {
-  if (!state.image) return;
-  const mesh = exportMesh(DISPLAY_CELLS);
+async function exportKMZ(snap = exportSnapshot()) {
+  if (!snap) return;
+  await exportProgress('Preparing');
+  const mesh = exportMesh(snap, DISPLAY_CELLS);
   // Plot longitude right and latitude down (negated), so north is at the top.
   const pos = new Float64Array(mesh.pos.length);
   for (let k = 0; k < pos.length; k += 2) {
@@ -1695,19 +1708,19 @@ async function exportKMZ() {
   }
   const [, minY, , maxY] = meshBounds({ pos });
   // Same ground resolution as the source, with square pixels at mid-latitude.
-  const px = affineScale(state.warp.S) * 360;
+  const px = affineScale(snap.warp.S) * 360;
   const py = px * Math.cos(-(minY + maxY) / 2 * Math.PI / 180);
-  const r = await rasterize(mesh, pos, px, py, MAX_KMZ_SIDE);
+  const r = await rasterize(mesh, pos, px, py, MAX_KMZ_SIDE, 'png', snap.image.img);
   const { ow, oh } = r;
   const west = r.minX, north = -r.minY, east = west + ow * r.px, south = north - oh * r.py;
 
   const worldFile = [r.px, 0, 0, -r.py, west + r.px / 2, north - r.py / 2];
-  const meta = exportMetadata('EPSG:4326', ow, oh, worldFile, [west, south, east, north], (x, y) => {
+  const meta = exportMetadata(snap, 'EPSG:4326', ow, oh, worldFile, [west, south, east, north], (x, y) => {
     const ll = toLngLat([x, y]);
     return [(ll.lng - west) / r.px, (north - ll.lat) / r.py];
   });
   const png = addTextChunk(r.bytes, META_KEY, JSON.stringify(meta));
-  const base = exportBaseName();
+  const base = exportBaseName(snap);
   const imageName = base.replace(/[^\w.-]+/g, '_') + '.png';
   const wrap = (lng) => (lng < -180 || lng > 180 ? ((lng + 180) % 360 + 360) % 360 - 180 : lng);
   const kml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -1724,12 +1737,56 @@ async function exportKMZ() {
   </GroundOverlay>
 </kml>
 `;
+  await exportProgress('Zipping');
   const zip = makeZip([
     { name: 'doc.kml', data: new TextEncoder().encode(kml) },
     { name: imageName, data: png },
   ]);
   download(new Blob([zip], { type: 'application/vnd.google-earth.kmz' }), `${base}.kmz`);
   setStatus(`Exported <b>${escapeHTML(base)}.kmz</b> (${ow}×${oh}).`);
+}
+
+// Export progress, shown on the Export button. `exportProgress` is a no-op
+// outside an export started from the button. Otherwise it relabels the button,
+// with a bar for `fraction` (0–1) or an indeterminate one without, and gives
+// the browser a chance to paint it, since most export work blocks the page.
+let exporting = false;
+async function exportProgress(label, fraction = null) {
+  if (!exporting) return;
+  const btn = $('export');
+  btn.textContent = fraction === null ? `${label}…` : `${label}… ${Math.floor(fraction * 100)}%`;
+  btn.classList.toggle('indeterminate', fraction === null);
+  btn.style.setProperty('--progress', fraction === null ? 1 : fraction);
+  // Wait for a frame to be painted; a timer covers background tabs, which
+  // get no animation frames.
+  await new Promise(resolve => {
+    const t = setTimeout(resolve, 100);
+    requestAnimationFrame(() => setTimeout(() => { clearTimeout(t); resolve(); }));
+  });
+}
+
+async function runExport() {
+  if (exporting) return;
+  const snap = exportSnapshot();
+  if (!snap) return;
+  exporting = true;
+  const btn = $('export');
+  btn.classList.add('busy');
+  btn.setAttribute('aria-busy', 'true');
+  updateUI();
+  try {
+    await EXPORTERS[$('format').value](snap);
+  } catch (err) {
+    console.error(err);
+    setStatus(`Export failed: ${escapeHTML(err.message)}`, true);
+  } finally {
+    exporting = false;
+    btn.classList.remove('busy', 'indeterminate');
+    btn.removeAttribute('aria-busy');
+    btn.style.removeProperty('--progress');
+    btn.textContent = 'Export';
+    updateUI();
+  }
 }
 
 function download(blob, filename) {
@@ -1758,7 +1815,7 @@ function setStatus(html, error) {
 
 function updateUI() {
   const has = !!state.image;
-  $('export').disabled = !has;
+  $('export').disabled = !has || exporting;
   $('zoom').disabled = !has;
   $('remove').disabled = !has;
   const paper = state.image?.paper;
@@ -1783,12 +1840,7 @@ function zoomToImage() {
 }
 
 const EXPORTERS = { png: exportImage, tiff: exportGeoTIFF, kmz: exportKMZ };
-$('export').addEventListener('click', () => {
-  EXPORTERS[$('format').value]().catch(err => {
-    console.error(err);
-    setStatus(`Export failed: ${escapeHTML(err.message)}`, true);
-  });
-});
+$('export').addEventListener('click', runExport);
 $('format').addEventListener('change', (e) => {
   $('worldfile-row').hidden = e.target.value !== 'png';
 });
