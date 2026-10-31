@@ -151,12 +151,18 @@ export function estimatePaper(rgba, w, h, block = GRID_BLOCK) {
   return { colour: colour.map(Math.round), grid, gw, gh };
 }
 
-// The thresholds behind the Hide paper slider, 0 (off) to 1: pixels less
-// than `clear` from the paper become transparent, those more than `solid`
-// from it stay opaque, with a ramp between.
+// The Hide paper slider runs from 0 (off) to 1. At the middle the paper
+// alone is cleared; below the middle it fades only partly, and above it
+// colours further and further from the paper fade too. Returns
+// [clear, solid, floor]: pixels less than `clear` from the paper become
+// transparent, those more than `solid` from it stay opaque, with a ramp
+// between, and no pixel is fainter than `floor`.
+const PAPER_NOISE = 0.04;  // JPEG noise and paper grain, cleared with the paper
+const PAPER_RAMP = 0.08;   // antialiased edges between paper and ink
 export function paperThresholds(amount) {
-  const clear = 0.5 * amount;
-  return [clear, clear + 0.2];
+  const more = Math.max(0, 2 * amount - 1);
+  const clear = PAPER_NOISE + 0.5 * more;
+  return [clear, clear + PAPER_RAMP + 0.12 * more, Math.max(0, 1 - 2 * amount)];
 }
 
 // Colour to alpha, in the manner of GIMP's: the opacity a pixel needs to be
@@ -165,7 +171,7 @@ export function paperThresholds(amount) {
 // shader in app.js does the same.
 export function paperToAlpha(c, p, amount) {
   if (!(amount > 0)) return [...c];
-  const [clear, solid] = paperThresholds(amount);
+  const [clear, solid, floor] = paperThresholds(amount);
   let need = 0;
   for (let n = 0; n < 3; n++) {
     // Darker than the paper: how far towards black. Brighter: towards white,
@@ -175,7 +181,7 @@ export function paperToAlpha(c, p, amount) {
     need = Math.max(need, d);
   }
   need = Math.min(need, 1);
-  const a = Math.min(1, Math.max(0, (need - clear) / (solid - clear)));
+  const a = Math.max(floor, Math.min(1, Math.max(0, (need - clear) / (solid - clear))));
   // Over the paper, colour c' at opacity a looks like c when
   // c' = p + (c - p) / a. Below `need` that leaves the gamut, so a pixel
   // the thresholds make fainter than that takes the fully unmixed colour.

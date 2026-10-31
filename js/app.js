@@ -94,7 +94,7 @@ precision mediump float;
 uniform sampler2D u_tex;
 uniform sampler2D u_paper;
 uniform float u_opacity;
-uniform vec2 u_hide;  // the clear and solid thresholds, or 0 for off
+uniform vec3 u_hide;  // paperThresholds, or 0 for off
 varying vec2 v_uv;
 void main() {
   vec4 t = texture2D(u_tex, v_uv);
@@ -105,7 +105,7 @@ void main() {
     vec3 light = (c - p) / max(1.0 - p, 0.5);
     vec3 d = mix(light, dark, step(c, p));
     float need = min(max(max(d.r, d.g), d.b), 1.0);
-    float a = clamp((need - u_hide.x) / (u_hide.y - u_hide.x), 0.0, 1.0);
+    float a = max(u_hide.z, clamp((need - u_hide.x) / (u_hide.y - u_hide.x), 0.0, 1.0));
     float div = max(a, need);
     vec3 col = div > 0.0 ? clamp(p + (c - p) / div, 0.0, 1.0) : p;
     t = vec4(col, 1.0) * (a * t.a);
@@ -207,7 +207,7 @@ class MeshRenderer {
     gl.uniform1f(this.uOpacity, opacity);
     gl.uniform1i(this.uTex, 0);
     gl.uniform1i(this.uPaper, 1);
-    gl.uniform2fv(this.uHide, hide > 0 && this.paperTex ? paperThresholds(hide) : [0, 0]);
+    gl.uniform3fv(this.uHide, hide > 0 && this.paperTex ? paperThresholds(hide) : [0, 0, 0]);
     // The paper texture's unit is bound even when unused: an unbound sampler
     // reads black, but the map's own textures could be sitting there.
     gl.activeTexture(gl.TEXTURE1);
@@ -1432,8 +1432,7 @@ const MAX_KMZ_SIDE = 8192;
 //
 // Browsers cap a WebGL drawing buffer well below what a large scan needs
 // (Chrome at 2^25 pixels), so the raster is drawn in horizontal strips.
-// `hide` applies Hide paper with the current image's paper.
-async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', img = state.image.img, hide = 0) {
+async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', img = state.image.img) {
   const [minX, minY, maxX, maxY] = meshBounds({ pos });
   const canvas = document.createElement('canvas');
   canvas.width = canvas.height = 1;
@@ -1471,7 +1470,6 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
   const origin = [minX + spanX / 2, minY + oh * py / 2];
   const renderer = new MeshRenderer(gl);
   renderer.setTexture(textureSource(img, gl.getParameter(gl.MAX_TEXTURE_SIZE)));
-  if (hide) renderer.setPaper(state.image.paper);
   renderer.setTriangles(meshTriangles({ ...mesh, pos }, origin));
   gl.viewport(0, 0, ow, sh);
   gl.clearColor(0, 0, 0, 0);
@@ -1494,7 +1492,7 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
     const centreY = minY + (y0 + sh / 2) * py - origin[1];
     const sy = -2 / (sh * py);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    renderer.draw(new Float32Array([2 / spanX, 0, 0, 0, 0, sy, 0, 0, 0, 0, 1, 0, 0, -sy * centreY, 0, 1]), 1, hide);
+    renderer.draw(new Float32Array([2 / spanX, 0, 0, 0, 0, sy, 0, 0, 0, 0, 1, 0, 0, -sy * centreY, 0, 1]), 1);
     if (rgba) {
       gl.readPixels(0, 0, ow, sh, gl.RGBA, gl.UNSIGNED_BYTE, strip);
       // GL rows run bottom-up.
@@ -1568,8 +1566,7 @@ function exportBaseName() {
 async function exportImage() {
   if (!state.image) return;
   const mesh = exportMesh(0);
-  const r = await rasterize(mesh, mesh.pos, ...Array(2).fill(affineScale(state.warp.S)),
-    Infinity, 'png', state.image.img, state.hidePaper);
+  const r = await rasterize(mesh, mesh.pos, ...Array(2).fill(affineScale(state.warp.S)));
   const { ow, oh, px: ps, minX, minY } = r;
 
   // Output pixel (i, j) covers [minX + i*ps, minX + (i+1)*ps) etc.
@@ -1592,8 +1589,7 @@ async function exportImage() {
 async function exportGeoTIFF() {
   if (!state.image) return;
   const mesh = exportMesh(0);
-  const r = await rasterize(mesh, mesh.pos, ...Array(2).fill(affineScale(state.warp.S)),
-    Infinity, 'rgba', state.image.img, state.hidePaper);
+  const r = await rasterize(mesh, mesh.pos, ...Array(2).fill(affineScale(state.warp.S)), Infinity, 'rgba');
   const { ow, oh, px: ps, minX, minY } = r;
   const worldFile = affineToWorldFile([ps, 0, minX, 0, ps, minY]);
   const nw = toLngLat([minX, minY]), se = toLngLat([minX + ow * ps, minY + oh * ps]);
@@ -1626,7 +1622,7 @@ async function exportKMZ() {
   // Same ground resolution as the source, with square pixels at mid-latitude.
   const px = affineScale(state.warp.S) * 360;
   const py = px * Math.cos(-(minY + maxY) / 2 * Math.PI / 180);
-  const r = await rasterize(mesh, pos, px, py, MAX_KMZ_SIDE, 'png', state.image.img, state.hidePaper);
+  const r = await rasterize(mesh, pos, px, py, MAX_KMZ_SIDE);
   const { ow, oh } = r;
   const west = r.minX, north = -r.minY, east = west + ow * r.px, south = north - oh * r.py;
 

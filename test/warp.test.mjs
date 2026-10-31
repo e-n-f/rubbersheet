@@ -333,22 +333,31 @@ test('an image with no opaque pixels has no paper', () => {
   assert.equal(estimatePaper(new Uint8Array(16), 2, 2), null);
 });
 
-test('paper to alpha clears the paper and keeps ink true', () => {
+test('paper to alpha: the middle of the slider clears the paper alone', () => {
   const p = [0.9, 0.8, 0.6];
+  const pale = [0.75, 0.66, 0.48, 1];
+  const ink = [0.1, 0.1, 0.1, 1];
+  // Off.
   assert.deepEqual(paperToAlpha([...p, 1], p, 0), [...p, 1]);
-  assert.equal(paperToAlpha([...p, 1], p, 0.2)[3], 0);
-  // Slight noise and glare clear too.
-  assert.equal(paperToAlpha([0.92, 0.79, 0.61, 1], p, 0.2)[3], 0);
-  // Ink stays opaque and keeps its colour.
-  const ink = paperToAlpha([0.1, 0.1, 0.1, 1], p, 0.2);
-  assert.equal(ink[3], 1);
-  for (let n = 0; n < 3; n++) close(ink[n], 0.1);
-  // A pale line between comes out partly transparent and, over the paper,
-  // looks as it did.
-  const c = [0.75, 0.66, 0.48];
-  const o = paperToAlpha([...c, 1], p, 0.25);
+  // The middle: the paper, with a little noise and glare, clears; ink and a
+  // pale line stay as they were.
+  assert.equal(paperToAlpha([...p, 1], p, 0.5)[3], 0);
+  close(paperToAlpha([0.92, 0.79, 0.61, 1], p, 0.5)[3], 0, 1e-9);
+  for (const c of [ink, pale]) {
+    const o = paperToAlpha(c, p, 0.5);
+    for (let n = 0; n < 4; n++) close(o[n], c[n], 1e-9);
+  }
+  // Below the middle, the paper only partly fades.
+  const half = paperToAlpha([...p, 1], p, 0.25);
+  close(half[3], 0.5);
+  for (let n = 0; n < 3; n++) close(half[n], p[n]);
+  assert.equal(paperToAlpha(pale, p, 0.25)[3], 1);
+  // Above it, the pale line fades too, and over the paper looks as it did,
+  // while ink stays.
+  const o = paperToAlpha(pale, p, 0.6);
   assert.ok(o[3] > 0 && o[3] < 1);
-  for (let n = 0; n < 3; n++) close(o[n] * o[3] + p[n] * (1 - o[3]), c[n], 1e-9);
-  // More hiding, fainter.
-  assert.ok(paperToAlpha([...c, 1], p, 0.35)[3] < o[3]);
+  for (let n = 0; n < 3; n++) close(o[n] * o[3] + p[n] * (1 - o[3]), pale[n], 1e-9);
+  assert.ok(paperToAlpha(pale, p, 0.65)[3] < o[3]);
+  assert.equal(paperToAlpha(pale, p, 1)[3], 0);
+  assert.equal(paperToAlpha(ink, p, 1)[3], 1);
 });
