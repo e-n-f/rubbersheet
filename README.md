@@ -10,15 +10,16 @@ Map rubbersheeting in the browser. Drop a scanned map or photo onto a MapLibre b
 - **Drag a corner handle** to scale and rotate around the image centre. Hold <kbd>Shift</kbd> to scale without rotating. (This works only before the first control point is added.)
 - **⌘-click** (Ctrl-click on Windows/Linux) the image to add a control point. ⌘-click a point to remove it.
 - **Drag a control point** to move that spot of the image to a new place on the map. The image goes half-transparent while you drag so you can see the map underneath.
-- **Streets on top of the image** draws the street base map's roads and railways over the image as thin bright yellow lines. It only works with the *Streets* base map, which has separate road layers. While it's on, ⌘-clicking the image adds a **world anchor**, drawn as a blue square. A world anchor is tied to that place on the map, not to the spot in the image.
+- **Streets on top of the image** draws the street base map's roads and railways over the image as thin bright yellow lines. It only works with the *Streets* and *Lines & contours* base maps, which have separate road layers. While it's on, ⌘-clicking the image adds a **world anchor**, drawn as a blue square. A world anchor is tied to that place on the map, not to the spot in the image.
   - **Dragging a world anchor** keeps the image still and bends the streets around the anchor, as the new warp will. Drag the street onto the image's feature and let go. The image warps to bring the feature under the pointer to the anchor's place, and the map eases so the anchor stays where you let go. The image eases from the old warp to the new and the streets from bent to straight, in step with the map, so the anchor and its feature stay under the pointer the whole way.
   - **Image anchors** are points added with the streets off, drawn as red circles. Dragging one moves the image as before.
   - **Both kinds** are ordinary control points in the same warp. They differ only in which half a drag changes: the image spot for a world anchor, the map place for an image anchor.
 - <kbd>Esc</kbd> during a drag cancels it.
+- **Hide paper** makes the image's paper transparent, so the map shows through between its lines. Rubbersheet finds the paper's colour itself, block by block, so it follows uneven lighting and yellowing across a photographed map (the swatch shows the most common paper colour). Each pixel turns transparent in proportion to how close it is to the paper, and keeps its true colour over the map. At the middle of the slider the paper alone is cleared. To the left, the paper only partly fades; to the right, colours close to the paper, such as pale washes, fade too. Like *Opacity*, it changes only the view, not exports.
 - **Undo** with ⌘Z (Ctrl-Z) or the *Undo* button, and **redo** with ⇧⌘Z (Ctrl-Shift-Z or Ctrl-Y) or *Redo*. Each drag, added or removed point and *Clear points* is one step, up to 50 back. Loading or removing an image starts afresh.
 - **Export** saves the warped image, north-up, in the format chosen under *Format*:
-  - **PNG**: Web Mercator (EPSG:3857), at about the source resolution.
-  - **GeoTIFF**: the same image as a deflate-compressed RGBA GeoTIFF in EPSG:3857. QGIS, ArcGIS and GDAL open it directly, with no side files.
+  - **GeoTIFF** (the default): a deflate-compressed RGBA GeoTIFF in Web Mercator (EPSG:3857), at about the source resolution. QGIS, ArcGIS and GDAL open it directly, with no side files.
+  - **PNG**: the same image as a PNG, also in EPSG:3857.
   - **KMZ for Google Earth**: a KMZ you can open in, or drag into, Google Earth. Google Earth stretches an overlay evenly in latitude, so the image inside is in EPSG:4326 (plate carrée), not Mercator, with square pixels at its middle latitude. It is capped at 8192 pixels a side.
 
 How the image is fitted depends on the number of control points:
@@ -84,5 +85,6 @@ These tests cover the warp math, the world-file conversions and the PNG metadata
 ## Base maps
 
 - Streets: [OpenFreeMap](https://openfreemap.org/) (OpenMapTiles schema, © OpenStreetMap contributors)
+- Lines & contours (the default): a plain style for aligning old maps against, with no buildings, parks or fills. Roads are blue centrelines and railways dashed lines, with their names, water is a pale fill whose edge is the coastline, and elevation contours (in feet, from zoom 10) are drawn by [maplibre-contour](https://github.com/onthegomap/maplibre-contour) from the [Mapzen terrain tiles](https://github.com/tilezen/joerd/blob/master/docs/attribution.md) on AWS. Same OpenFreeMap vector tiles as Streets.
 - Satellite: Esri World Imagery
 - OpenStreetMap: the standard tile layer, for light interactive use under the [OSM tile usage policy](https://operations.osmfoundation.org/policies/tiles/)

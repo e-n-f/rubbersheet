@@ -8,6 +8,7 @@ import { addTextChunk, isPNG, readTextChunks } from './png-text.js';
 import { makeZip, readZip } from './zip.js';
 import { isTIFF, readGeoTIFF, writeGeoTIFF } from './tiff.js';
 import { crsFromGeoKeys } from './proj.js';
+import { estimatePaper, paperThresholds } from './paper.js';
 
 const maplibregl = window.maplibregl;
 const META_KEY = 'rubbersheet';
@@ -20,6 +21,7 @@ const HIT_RADIUS = 11;
 
 const STYLES = {
   streets: 'https://tiles.openfreemap.org/styles/liberty',
+  lines: linesStyle(),
   satellite: rasterStyle(
     'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     'Imagery &copy; Esri, Maxar, Earthstar Geographics, and the GIS User Community'),
@@ -27,6 +29,80 @@ const STYLES = {
     'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
     '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'),
 };
+
+// A plain base map to align old maps against: white land, pale water whose
+// edge is the coastline, roads as blue centrelines and railways as dashed
+// lines, with their names, and elevation contours in feet, with nothing filled or extruded.
+function linesStyle() {
+  const font = ['Noto Sans Regular'];
+  const roads = ['motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'minor', 'service', 'track'];
+  const style = {
+    version: 8,
+    glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
+    sources: { openmaptiles: { type: 'vector', url: 'https://tiles.openfreemap.org/planet' } },
+    layers: [
+      { id: 'background', type: 'background', paint: { 'background-color': '#ffffff' } },
+      { id: 'water', type: 'fill', source: 'openmaptiles', 'source-layer': 'water',
+        filter: ['!=', ['get', 'brunnel'], 'tunnel'], paint: { 'fill-color': '#c6dcee' } },
+      { id: 'waterway', type: 'line', source: 'openmaptiles', 'source-layer': 'waterway',
+        filter: ['!=', ['get', 'brunnel'], 'tunnel'],
+        paint: { 'line-color': '#8fb6d8', 'line-width': ['interpolate', ['linear'], ['zoom'], 10, 0.5, 16, 1.5] } },
+    ],
+  };
+
+  // Contours, from the AWS terrain tiles (if the contour library loaded).
+  const mlcontour = window.mlcontour;
+  if (mlcontour) {
+    const dem = new mlcontour.DemSource({
+      url: 'https://elevation-tiles-prod.s3.amazonaws.com/terrarium/{z}/{x}/{y}.png',
+      encoding: 'terrarium',
+      maxzoom: 13,
+      worker: true,
+    });
+    dem.setupMaplibre(maplibregl);
+    style.sources.contours = {
+      type: 'vector',
+      tiles: [dem.contourProtocolUrl({
+        multiplier: 3.28084,  // feet
+        thresholds: { 10: [200, 1000], 12: [100, 500], 13: [50, 250], 14: [20, 100], 15: [10, 50] },
+        contourLayer: 'contours', elevationKey: 'ele', levelKey: 'level',
+      })],
+      minzoom: 10,
+      maxzoom: 15,
+      attribution: 'Elevation: <a href="https://github.com/tilezen/joerd/blob/master/docs/attribution.md">Mapzen terrain tiles</a>',
+    };
+    style.layers.push(
+      { id: 'contours', type: 'line', source: 'contours', 'source-layer': 'contours',
+        filter: ['>', ['get', 'ele'], 0],
+        paint: { 'line-color': '#c8a888', 'line-width': ['match', ['get', 'level'], 1, 1, 0.5] } },
+      { id: 'contour-labels', type: 'symbol', source: 'contours', 'source-layer': 'contours',
+        filter: ['all', ['>', ['get', 'level'], 0], ['>', ['get', 'ele'], 0]],
+        layout: { 'symbol-placement': 'line', 'text-size': 10, 'text-font': font,
+          'text-field': ['concat', ['number-format', ['get', 'ele'], {}], ' ft'] },
+        paint: { 'text-color': '#a07850', 'text-halo-color': '#ffffff', 'text-halo-width': 1.5 } });
+  }
+
+  style.layers.push(
+    { id: 'lines_road', type: 'line', source: 'openmaptiles', 'source-layer': 'transportation',
+      filter: ['match', ['get', 'class'], roads, true, false],
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: {
+        'line-color': ['match', ['get', 'brunnel'], 'tunnel', '#9fbbe6', '#1458c8'],
+        'line-width': ['interpolate', ['linear'], ['zoom'],
+          10, ['match', ['get', 'class'], ['motorway', 'trunk', 'primary'], 1.5, 0.7],
+          16, ['match', ['get', 'class'], ['motorway', 'trunk', 'primary'], 3.5, ['service', 'track'], 1.2, 2.2],
+          19, ['match', ['get', 'class'], ['motorway', 'trunk', 'primary'], 6, ['service', 'track'], 2, 4]],
+      } },
+    { id: 'lines_rail', type: 'line', source: 'openmaptiles', 'source-layer': 'transportation',
+      filter: ['==', ['get', 'class'], 'rail'],
+      paint: { 'line-color': '#7a5a8a', 'line-width': 1, 'line-dasharray': [4, 2] } },
+    { id: 'street_names', type: 'symbol', source: 'openmaptiles', 'source-layer': 'transportation_name',
+      filter: ['match', ['get', 'class'], roads, true, false],
+      layout: { 'symbol-placement': 'line', 'text-field': ['coalesce', ['get', 'name:en'], ['get', 'name']],
+        'text-font': font, 'text-size': ['interpolate', ['linear'], ['zoom'], 13, 10, 18, 13] },
+      paint: { 'text-color': '#222222', 'text-halo-color': '#ffffff', 'text-halo-width': 1.5 } });
+  return style;
+}
 
 function rasterStyle(url, attribution) {
   return {
@@ -50,6 +126,7 @@ const state = {
   drag: null,
   hover: null,
   opacity: 1,
+  hidePaper: 0,     // Hide paper slider, 0 (off) to 1
   streetsOnTop: false,
   ease: null,       // a world anchor's release in progress (easeWorldRelease)
 };
@@ -62,7 +139,7 @@ const linkHasView = !!window.location.hash;
 
 const map = new maplibregl.Map({
   container: 'map',
-  style: STYLES.streets,
+  style: STYLES.lines,
   center: [0, 20],
   zoom: 1.5,
   maxPitch: 0,
@@ -84,13 +161,31 @@ void main() {
   gl_Position = u_matrix * vec4(a_pos, 0.0, 1.0);
 }`;
 
+// With u_hide > 0, the paper (u_paper, a coarse grid of its colour across
+// the image) turns transparent: paperToAlpha in paper.js, which has the
+// details.
 const FRAGMENT_SHADER = `
 precision mediump float;
 uniform sampler2D u_tex;
+uniform sampler2D u_paper;
 uniform float u_opacity;
+uniform vec3 u_hide;  // paperThresholds, or 0 for off
 varying vec2 v_uv;
 void main() {
-  gl_FragColor = texture2D(u_tex, v_uv) * u_opacity;
+  vec4 t = texture2D(u_tex, v_uv);
+  if (u_hide.y > 0.0 && t.a > 0.0) {
+    vec3 c = t.rgb / t.a;
+    vec3 p = texture2D(u_paper, v_uv).rgb;
+    vec3 dark = (p - c) / max(p, 1e-3);
+    vec3 light = (c - p) / max(1.0 - p, 0.5);
+    vec3 d = mix(light, dark, step(c, p));
+    float need = min(max(max(d.r, d.g), d.b), 1.0);
+    float a = max(u_hide.z, clamp((need - u_hide.x) / (u_hide.y - u_hide.x), 0.0, 1.0));
+    float div = max(a, need);
+    vec3 col = div > 0.0 ? clamp(p + (c - p) / div, 0.0, 1.0) : p;
+    t = vec4(col, 1.0) * (a * t.a);
+  }
+  gl_FragColor = t * u_opacity;
 }`;
 
 function compile(gl, type, src) {
@@ -115,6 +210,9 @@ class MeshRenderer {
     this.uMatrix = gl.getUniformLocation(p, 'u_matrix');
     this.uOpacity = gl.getUniformLocation(p, 'u_opacity');
     this.uTex = gl.getUniformLocation(p, 'u_tex');
+    this.uPaper = gl.getUniformLocation(p, 'u_paper');
+    this.uHide = gl.getUniformLocation(p, 'u_hide');
+    this.paperTex = null;
     this.posBuf = gl.createBuffer();
     this.uvBuf = gl.createBuffer();
     this.tex = null;
@@ -146,6 +244,26 @@ class MeshRenderer {
     }
   }
 
+  // The paper's colour across the image, from estimatePaper; null for none.
+  setPaper(paper) {
+    const gl = this.gl;
+    if (this.paperTex) gl.deleteTexture(this.paperTex);
+    this.paperTex = null;
+    if (!paper) return;
+    this.paperTex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.paperTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, paper.gw, paper.gh, 0, gl.RGBA, gl.UNSIGNED_BYTE, paper.grid);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.activeTexture(gl.TEXTURE0);
+  }
+
   setTriangles({ positions, uvs, count }) {
     const gl = this.gl;
     gl.bindBuffer(gl.ARRAY_BUFFER, this.posBuf);
@@ -155,13 +273,20 @@ class MeshRenderer {
     this.count = count;
   }
 
-  draw(matrix, opacity) {
+  // `hide` is the Hide paper amount, 0 for off.
+  draw(matrix, opacity, hide = 0) {
     const gl = this.gl;
     if (!this.tex || !this.count) return;
     gl.useProgram(this.program);
     gl.uniformMatrix4fv(this.uMatrix, false, matrix);
     gl.uniform1f(this.uOpacity, opacity);
     gl.uniform1i(this.uTex, 0);
+    gl.uniform1i(this.uPaper, 1);
+    gl.uniform3fv(this.uHide, hide > 0 && this.paperTex ? paperThresholds(hide) : [0, 0, 0]);
+    // The paper texture's unit is bound even when unused: an unbound sampler
+    // reads black, but the map's own textures could be sitting there.
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.paperTex);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.posBuf);
@@ -176,6 +301,7 @@ class MeshRenderer {
   destroy() {
     const gl = this.gl;
     if (this.tex) gl.deleteTexture(this.tex);
+    if (this.paperTex) gl.deleteTexture(this.paperTex);
     gl.deleteBuffer(this.posBuf);
     gl.deleteBuffer(this.uvBuf);
     gl.deleteProgram(this.program);
@@ -223,6 +349,7 @@ const imageLayer = {
     if (this.texDirty) {
       this.renderer.setTexture(textureSource(state.image.img,
         Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE))));
+      this.renderer.setPaper(state.image.paper);
       this.texDirty = false;
     }
     if (this.meshDirty) {
@@ -238,7 +365,7 @@ const imageLayer = {
     // moves.
     const see = state.drag && state.drag.kind !== 'world';
     const opacity = see ? Math.min(0.5, state.opacity) : state.opacity;
-    this.renderer.draw(rebaseMatrix(matrix, state.origin[0], state.origin[1]), opacity);
+    this.renderer.draw(rebaseMatrix(matrix, state.origin[0], state.origin[1]), opacity, state.hidePaper);
   },
 };
 
@@ -1118,7 +1245,7 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
     placement = { T: dropPlacement(dropPoint, W, H), points: [] };
   }
 
-  state.image = { name: imageFile.name, img: source, W, H };
+  state.image = { name: imageFile.name, img: source, W, H, paper: findPaper(source) };
   state.T = placement.T;
   state.points = placement.points;
   state.drag = null;
@@ -1129,6 +1256,26 @@ async function loadFiles(files, dropPoint, { keepView = false, fromURL = false }
   if (!fromURL) clearImageParam();
   setStatus(`<b>${escapeHTML(imageFile.name)}</b> (${W}×${H})${how ? ', ' + how : ''}.` +
     (problem ? ` ${escapeHTML(problem)}` : ''), !!problem);
+}
+
+// The paper's colour across an image (estimatePaper), found on a copy at most
+// PAPER_SIDE pixels across. Null if the browser won't share the pixels.
+const PAPER_SIDE = 1600;
+function findPaper(img) {
+  const W = img.naturalWidth || img.width, H = img.naturalHeight || img.height;
+  const s = Math.min(1, PAPER_SIDE / Math.max(W, H));
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(W * s));
+  c.height = Math.max(1, Math.round(H * s));
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, 0, 0, c.width, c.height);
+  try {
+    return estimatePaper(ctx.getImageData(0, 0, c.width, c.height).data, c.width, c.height);
+  } catch (err) {
+    console.warn(err);
+    return null;
+  }
 }
 
 // ?image=<url> loads an image from the web. The server has to allow
@@ -1614,6 +1761,10 @@ function updateUI() {
   $('export').disabled = !has;
   $('zoom').disabled = !has;
   $('remove').disabled = !has;
+  const paper = state.image?.paper;
+  $('hide-paper').disabled = !paper;
+  $('paper-swatch').style.background = paper ? `rgb(${paper.colour.join(',')})` : 'transparent';
+  $('paper-swatch').title = paper ? `Paper colour: rgb(${paper.colour.join(', ')})` : '';
   $('clear').disabled = !state.points.length;
   $('undo').disabled = !has || !edits.undo.length;
   $('redo').disabled = !has || !edits.redo.length;
@@ -1668,10 +1819,14 @@ $('opacity').addEventListener('input', (e) => {
   state.opacity = Number(e.target.value);
   map.triggerRepaint();
 });
+$('hide-paper').addEventListener('input', (e) => {
+  state.hidePaper = Number(e.target.value);
+  map.triggerRepaint();
+});
 $('basemap').addEventListener('change', (e) => {
   map.setStyle(STYLES[e.target.value], { diff: false });
-  // Only the vector street map has separate road layers to lift.
-  $('streets-on-top').disabled = e.target.value !== 'streets';
+  // Only the vector maps have separate road layers to lift.
+  $('streets-on-top').disabled = !['streets', 'lines'].includes(e.target.value);
 });
 $('streets-on-top').addEventListener('change', (e) => {
   state.streetsOnTop = e.target.checked;
