@@ -68,8 +68,15 @@ body.dragover #drop-hint { display: flex; }
   gap: 8px;
   margin: 6px 0;
 }
-.row label { width: 70px; }
+.row label { width: 74px; white-space: nowrap; }
 .row input, .row select { flex: 1; min-width: 0; }
+.swatch {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border: 1px solid #b5bcc4;
+  border-radius: 3px;
+}
 .buttons {
   display: grid;
   grid-template-columns: 1fr 1fr;

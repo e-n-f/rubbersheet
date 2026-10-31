@@ -291,3 +291,64 @@ test('GeoKeys: EPSG UTM, Lambert in US feet, Mercator, unsupported', () => {
   assert.equal(crsFromGeoKeys({ 1024: 2, 2048: 4326 }).toLngLat(-120, 40).join(), '-120,40');
   assert.throws(() => crsFromGeoKeys({ 1024: 1, 3072: 2227 }), /EPSG:2227 isn’t supported/);
 });
+
+// ---------------------------------------------------------------------------
+// Hide paper
+
+import { estimatePaper, paperToAlpha } from '../js/paper.js';
+
+// Tan paper lit unevenly from left to right, with black lines and a red wash.
+function paperImage(w, h) {
+  const rgba = new Uint8Array(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const light = 1 - 0.3 * x / w;
+      let c = [230 * light, 205 * light, 160 * light];
+      if (x % 20 < 2 || y % 25 < 2) c = [30, 28, 25];
+      else if (x > w / 2 && x < w / 2 + 60 && y > 20 && y < 120) c = [200, 90, 80];
+      const k = (y * w + x) * 4;
+      rgba.set([...c.map(Math.round), 255], k);
+    }
+  }
+  return rgba;
+}
+
+test('paper colour follows the lighting and ignores ink and washes', () => {
+  const w = 320, h = 200;
+  const p = estimatePaper(paperImage(w, h), w, h);
+  assert.equal(p.gw, 20);
+  assert.equal(p.gh, 13);
+  for (let j = 0; j < p.gh; j++) {
+    for (let i = 0; i < p.gw; i++) {
+      const light = 1 - 0.3 * (i + 0.5) / p.gw;
+      const k = (j * p.gw + i) * 4;
+      assert.ok(Math.abs(p.grid[k] - 230 * light) < 8, `cell ${i},${j}: ${p.grid[k]} vs ${230 * light}`);
+      assert.ok(Math.abs(p.grid[k + 1] - 205 * light) < 8);
+      assert.ok(Math.abs(p.grid[k + 2] - 160 * light) < 8);
+    }
+  }
+});
+
+test('an image with no opaque pixels has no paper', () => {
+  assert.equal(estimatePaper(new Uint8Array(16), 2, 2), null);
+});
+
+test('paper to alpha clears the paper and keeps ink true', () => {
+  const p = [0.9, 0.8, 0.6];
+  assert.deepEqual(paperToAlpha([...p, 1], p, 0), [...p, 1]);
+  assert.equal(paperToAlpha([...p, 1], p, 0.2)[3], 0);
+  // Slight noise and glare clear too.
+  assert.equal(paperToAlpha([0.92, 0.79, 0.61, 1], p, 0.2)[3], 0);
+  // Ink stays opaque and keeps its colour.
+  const ink = paperToAlpha([0.1, 0.1, 0.1, 1], p, 0.2);
+  assert.equal(ink[3], 1);
+  for (let n = 0; n < 3; n++) close(ink[n], 0.1);
+  // A pale line between comes out partly transparent and, over the paper,
+  // looks as it did.
+  const c = [0.75, 0.66, 0.48];
+  const o = paperToAlpha([...c, 1], p, 0.25);
+  assert.ok(o[3] > 0 && o[3] < 1);
+  for (let n = 0; n < 3; n++) close(o[n] * o[3] + p[n] * (1 - o[3]), c[n], 1e-9);
+  // More hiding, fainter.
+  assert.ok(paperToAlpha([...c, 1], p, 0.35)[3] < o[3]);
+});
