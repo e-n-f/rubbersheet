@@ -30,8 +30,8 @@
     <div class="row">
       <label for="basemap">Base map</label>
       <select id="basemap">
-        <option value="streets">Streets</option>
         <option value="lines">Lines &amp; contours</option>
+        <option value="streets">Streets</option>
         <option value="satellite">Satellite</option>
         <option value="osm">OpenStreetMap</option>
       </select>
@@ -40,8 +40,8 @@
     <div class="row">
       <label for="format">Format</label>
       <select id="format">
-        <option value="png">PNG</option>
         <option value="tiff">GeoTIFF</option>
+        <option value="png">PNG</option>
         <option value="kmz">KMZ for Google Earth</option>
       </select>
     </div>
@@ -54,7 +54,7 @@
       <button id="clear" disabled>Clear points</button>
       <button id="remove" disabled>Remove image</button>
     </div>
-    <label class="check" id="worldfile-row"><input id="worldfile" type="checkbox"> Also download world file (.pgw + .aux.xml)</label>
+    <label class="check" id="worldfile-row" hidden><input id="worldfile" type="checkbox"> Also download world file (.pgw + .aux.xml)</label>
 
     <details>
       <summary>How to use</summary>

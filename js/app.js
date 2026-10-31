@@ -31,8 +31,8 @@ const STYLES = {
 };
 
 // A plain base map to align old maps against: white land, pale water whose
-// edge is the coastline, roads and railways as thin centrelines with their
-// names, and elevation contours in feet, with nothing filled or extruded.
+// edge is the coastline, roads as blue centrelines and railways as dashed
+// lines, with their names, and elevation contours in feet, with nothing filled or extruded.
 function linesStyle() {
   const font = ['Noto Sans Regular'];
   const roads = ['motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'minor', 'service', 'track'];
@@ -87,10 +87,11 @@ function linesStyle() {
       filter: ['match', ['get', 'class'], roads, true, false],
       layout: { 'line-cap': 'round', 'line-join': 'round' },
       paint: {
-        'line-color': ['match', ['get', 'brunnel'], 'tunnel', '#9a9a9a', '#3a3a3a'],
+        'line-color': ['match', ['get', 'brunnel'], 'tunnel', '#9fbbe6', '#1458c8'],
         'line-width': ['interpolate', ['linear'], ['zoom'],
-          10, ['match', ['get', 'class'], ['motorway', 'trunk', 'primary'], 1, 0.4],
-          16, ['match', ['get', 'class'], ['motorway', 'trunk', 'primary'], 2, ['service', 'track'], 0.6, 1.2]],
+          10, ['match', ['get', 'class'], ['motorway', 'trunk', 'primary'], 1.5, 0.7],
+          16, ['match', ['get', 'class'], ['motorway', 'trunk', 'primary'], 3.5, ['service', 'track'], 1.2, 2.2],
+          19, ['match', ['get', 'class'], ['motorway', 'trunk', 'primary'], 6, ['service', 'track'], 2, 4]],
       } },
     { id: 'lines_rail', type: 'line', source: 'openmaptiles', 'source-layer': 'transportation',
       filter: ['==', ['get', 'class'], 'rail'],
@@ -138,7 +139,7 @@ const linkHasView = !!window.location.hash;
 
 const map = new maplibregl.Map({
   container: 'map',
-  style: STYLES.streets,
+  style: STYLES.lines,
   center: [0, 20],
   zoom: 1.5,
   maxPitch: 0,

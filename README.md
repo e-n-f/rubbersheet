@@ -18,8 +18,8 @@ Map rubbersheeting in the browser. Drop a scanned map or photo onto a MapLibre b
 - **Hide paper** makes the image's paper transparent, so the map shows through between its lines. Rubbersheet finds the paper's colour itself, block by block, so it follows uneven lighting and yellowing across a photographed map (the swatch shows the most common paper colour). Each pixel turns transparent in proportion to how close it is to the paper, and keeps its true colour over the map. At the middle of the slider the paper alone is cleared. To the left, the paper only partly fades; to the right, colours close to the paper, such as pale washes, fade too. Like *Opacity*, it changes only the view, not exports.
 - **Undo** with ⌘Z (Ctrl-Z) or the *Undo* button, and **redo** with ⇧⌘Z (Ctrl-Shift-Z or Ctrl-Y) or *Redo*. Each drag, added or removed point and *Clear points* is one step, up to 50 back. Loading or removing an image starts afresh.
 - **Export** saves the warped image, north-up, in the format chosen under *Format*:
-  - **PNG**: Web Mercator (EPSG:3857), at about the source resolution.
-  - **GeoTIFF**: the same image as a deflate-compressed RGBA GeoTIFF in EPSG:3857. QGIS, ArcGIS and GDAL open it directly, with no side files.
+  - **GeoTIFF** (the default): a deflate-compressed RGBA GeoTIFF in Web Mercator (EPSG:3857), at about the source resolution. QGIS, ArcGIS and GDAL open it directly, with no side files.
+  - **PNG**: the same image as a PNG, also in EPSG:3857.
   - **KMZ for Google Earth**: a KMZ you can open in, or drag into, Google Earth. Google Earth stretches an overlay evenly in latitude, so the image inside is in EPSG:4326 (plate carrée), not Mercator, with square pixels at its middle latitude. It is capped at 8192 pixels a side.
 
 How the image is fitted depends on the number of control points:
@@ -85,6 +85,6 @@ These tests cover the warp math, the world-file conversions and the PNG metadata
 ## Base maps
 
 - Streets: [OpenFreeMap](https://openfreemap.org/) (OpenMapTiles schema, © OpenStreetMap contributors)
-- Lines & contours: a plain style for aligning old maps against, with no buildings, parks or fills. Roads and railways are thin centrelines with their names, water is a pale fill whose edge is the coastline, and elevation contours (in feet, from zoom 10) are drawn by [maplibre-contour](https://github.com/onthegomap/maplibre-contour) from the [Mapzen terrain tiles](https://github.com/tilezen/joerd/blob/master/docs/attribution.md) on AWS. Same OpenFreeMap vector tiles as Streets.
+- Lines & contours (the default): a plain style for aligning old maps against, with no buildings, parks or fills. Roads are blue centrelines and railways dashed lines, with their names, water is a pale fill whose edge is the coastline, and elevation contours (in feet, from zoom 10) are drawn by [maplibre-contour](https://github.com/onthegomap/maplibre-contour) from the [Mapzen terrain tiles](https://github.com/tilezen/joerd/blob/master/docs/attribution.md) on AWS. Same OpenFreeMap vector tiles as Streets.
 - Satellite: Esri World Imagery
 - OpenStreetMap: the standard tile layer, for light interactive use under the [OSM tile usage policy](https://operations.osmfoundation.org/policies/tiles/)
