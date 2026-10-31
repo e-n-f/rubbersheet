@@ -2043,15 +2043,26 @@ function dragCard(L, e) {
   card.classList.add('moving');
   const start = state.layers.slice();
   const orderFromList = () => [...list.children].reverse().map(c => state.layers.find(x => x.card === c));
+  // Where the card would be if it followed the pointer: it moves past a
+  // neighbour once its leading edge passes the neighbour's middle, which is
+  // half a card either way, wherever on the card it was grabbed.
+  const grab = e.clientY - card.getBoundingClientRect().top;
+  const mid = (c) => {
+    const r = c.getBoundingClientRect();
+    return r.top + r.height / 2;
+  };
   const move = (ev) => {
     if (ev.pointerId !== id) return;
-    const others = [...list.children].filter(c => c !== card);
-    const next = others.find(c => {
-      const r = c.getBoundingClientRect();
-      return ev.clientY < r.top + r.height / 2;
-    });
-    if (card.nextElementSibling === (next || null)) return;
-    list.insertBefore(card, next || null);
+    const top = ev.clientY - grab, bottom = top + card.offsetHeight;
+    let moved = false;
+    for (;;) {
+      const next = card.nextElementSibling, prev = card.previousElementSibling;
+      if (next && mid(next) < bottom) list.insertBefore(next, card);
+      else if (prev && mid(prev) > top) list.insertBefore(card, prev);
+      else break;
+      moved = true;
+    }
+    if (!moved) return;
     state.layers = orderFromList();
     map.triggerRepaint();
     drawOverlay();
