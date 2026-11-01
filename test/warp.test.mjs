@@ -387,7 +387,10 @@ test('paper to alpha: the middle of the slider clears the paper alone', () => {
 // ---------------------------------------------------------------------------
 // Isolate color
 
-import { density, pickDensity, isolateWeights, isolateAlpha, inkAmount, drawColor, toHex, fromHex } from '../js/isolate.js';
+import { density, pickDensity, isolateWeights, isolateTransmittance, inkAmount, drawColor, toHex, fromHex } from '../js/isolate.js';
+
+// How much of the map a pixel's isolated ink hides, at its most.
+const isolateAlpha = (...args) => [0, 0, 0, 1 - Math.min(...isolateTransmittance(...args))];
 
 // RGBA bytes for a list of RGB colors (0..1).
 const pixels = (cs) => Uint8Array.from(cs.flatMap(c => [...c.map(x => Math.round(x * 255)), 255]));
@@ -407,7 +410,7 @@ test('isolate color: the picked ink shows; paper, black and a hidden ink do not'
   const w2 = isolateWeights(showD);
   assert.equal(alpha(w2, paper), 0);
   assert.equal(alpha(w2, black), 0);
-  assert.equal(alpha(w2, pencil), 1);
+  assert.ok(alpha(w2, pencil) > 0.5);
   // Heavy black whose blue bottoms out, so that it has the pencil's hue
   // (as measured on a scan), is still black.
   assert.equal(alpha(w2, inked(paper, [1.76, 1.67, 1.21])), 0);
@@ -417,8 +420,8 @@ test('isolate color: the picked ink shows; paper, black and a hidden ink do not'
   const w3 = isolateWeights(showD, density(red, paper));
   assert.equal(alpha(w3, red), 0);
   assert.equal(alpha(w3, black), 0);
-  assert.equal(alpha(w3, pencil), 1);
-  close(inkAmount(w3, showD), 1, 1e-9);
+  assert.ok(alpha(w3, pencil) > 0.5);
+  close(inkAmount(w3, showD, showD), showD.reduce((a, b) => a + b), 1e-9);
 });
 
 test('isolate color: nothing to pick from paper or black ink', () => {
@@ -429,9 +432,9 @@ test('isolate color: nothing to pick from paper or black ink', () => {
 });
 
 test('isolate color: a pixel is judged by its neighbourhood\'s hue at its own strength', () => {
-  const w = isolateWeights([0.2, 0.5, 0.3]);
+  const showD = [0.2, 0.5, 0.3], w = isolateWeights(showD);
   // A faint pixel in a strong red neighbourhood is faintly red.
-  close(inkAmount(w, [0.1, 0.25, 0.15], [0.2, 0.5, 0.3]), 0.5, 1e-9);
+  close(inkAmount(w, showD, [0.1, 0.25, 0.15], [0.2, 0.5, 0.3]), 0.5, 1e-9);
   assert.equal(toHex(fromHex('#a1b2c3')), '#a1b2c3');
 });
 
@@ -443,4 +446,19 @@ test('paper color ignores a black surround larger than the paper', () => {
   }
   const p = estimatePaper(px, w, h);
   assert.deepEqual(p.colour, [200, 180, 120]);
+});
+
+test('isolate color: opacity follows the amount of ink, wherever it was picked', () => {
+  const paper = [1, 0.98, 0.75];
+  const heavy = [0.27, 0.6, 0.92], thin = heavy.map(x => x / 4);
+  const col = [0, 0, 0];
+  const alphaOf = (showD, d) => isolateAlpha([...inked(paper, d), 1], paper, isolateWeights(showD), showD, col, 0.5)[3];
+  // A thin line, or a line covering part of a pixel, shows partly.
+  const a = alphaOf(heavy, thin);
+  assert.ok(a > 0.1 && a < alphaOf(heavy, heavy), `${a}`);
+  // Picking a thin line of an ink gives the same as picking a heavy one.
+  close(alphaOf(thin, thin), a, 1e-6);
+  close(alphaOf(thin, heavy), alphaOf(heavy, heavy), 1e-6);
+  // Paper grain doesn't show.
+  assert.equal(alphaOf(heavy, heavy.map(x => x / 40)), 0);
 });

@@ -9,7 +9,7 @@ import { makeZip, readZip } from './zip.js';
 import { isTIFF, readGeoTIFF, readTIFFTags, writeGeoTIFF } from './tiff.js';
 import { crsFromGeoKeys } from './proj.js';
 import { estimatePaper, paperThresholds } from './paper.js';
-import { pickDensity, isolateWeights, isolateThresholds, isolateCeiling, drawColor, toHex, fromHex } from './isolate.js';
+import { pickDensity, isolateWeights, isolateGain, blackThresholds, inkDensity, drawColor, toHex, fromHex } from './isolate.js';
 
 const maplibregl = window.maplibregl;
 const META_KEY = 'rubbersheet';
@@ -182,10 +182,10 @@ void main() {
 // (setDetail) is drawn from it instead of u_tex.
 // With u_hide > 0, the paper (u_paper, a coarse grid of its colour across
 // the image) turns transparent: paperToAlpha in paper.js, which has the
-// details. With u_iso.y > 0, only one ink shows instead, in u_isoColor:
-// isolateAlpha in isolate.js, which has the details. Its hue is judged over
-// a 3 x 3 neighbourhood of taps ISO_STEP texels apart, each of which the
-// linear filter averages over 2 x 2 texels.
+// details. With u_iso.y > 0, only one ink shows instead, as ink that
+// multiplies the map under it: isolateTransmittance in isolate.js, which
+// has the details. Its hue is judged over a 3 x 3 neighbourhood of taps
+// ISO_STEP texels apart.
 const FRAGMENT_SHADER = `
 precision mediump float;
 uniform sampler2D u_tex;
@@ -194,18 +194,20 @@ uniform sampler2D u_detail;
 uniform float u_hasDetail;
 uniform float u_opacity;
 uniform vec3 u_hide;  // paperThresholds, or 0 for off
-uniform vec2 u_iso;   // isolateThresholds, or 0 for off
-uniform vec3 u_isoW;  // isolateWeights
-uniform vec3 u_isoColor;
-uniform vec2 u_isoMax;   // isolateCeiling
+uniform vec2 u_iso;   // isolateGain, or 0 for off
+uniform vec3 u_isoW;  // isolateWeights, times the picked density
+uniform vec3 u_isoInk;  // the draw color's density, as a share of each
+                         // channel (inkDensity), or 0 for off
+uniform vec4 u_black;   // blackThresholds
 uniform vec2 u_texel;   // the size of a texel of u_tex, in v_uv
 uniform vec2 u_dtexel;  // and of u_detail, in v_duv
 uniform vec3 u_lens;    // centre and radius, in framebuffer pixels, of the
-                        // circle to isolate within, or 0 for everywhere
+                        // preview circle
+uniform float u_lensSide;  // 1 to draw only inside it, -1 only outside, 0 all
 varying vec2 v_uv;
 varying vec2 v_duv;
 const vec3 EPS = vec3(1.0 / 255.0);
-const float ISO_STEP = 1.5;
+const float ISO_STEP = 1.0;
 // The image's density over paper of log colour lp at offset o (in texels)
 // from here, and whether there is image there.
 vec4 densityAt(vec2 o, float detail, vec3 lp) {
@@ -229,16 +231,22 @@ void main() {
       for (int j = -1; j <= 1; j++) near += densityAt(vec2(float(i), float(j)) * ISO_STEP, detail, lp);
     }
   }
-  bool inLens = u_lens.z <= 0.0 || distance(gl_FragCoord.xy, u_lens.xy) < u_lens.z;
-  if (u_iso.y > 0.0 && inLens) {
+  if (u_lensSide != 0.0 && (distance(gl_FragCoord.xy, u_lens.xy) < u_lens.z) != (u_lensSide > 0.0)) discard;
+  if (u_iso.y > 0.0) {
+    // Isolated, the lines are drawn as ink that multiplies what's under
+    // them (with the blend function set to suit): the transmittance of the
+    // picked ink's density.
+    float ink = 0.0;
     if (t.a > 0.0) {
       vec3 d = lp - log(max(t.rgb / t.a, EPS));
       vec3 n = near.rgb / max(near.a, 1.0);
-      float total = d.r + d.g + d.b;
-      float b = dot(u_isoW, n) * max(total, 0.0) / max(n.r + n.g + n.b, 0.05);
-      float fade = 1.0 - clamp((total - u_isoMax.x) / (u_isoMax.y - u_isoMax.x), 0.0, 1.0);
-      t = vec4(u_isoColor, 1.0) * (clamp((b - u_iso.x) / (u_iso.y - u_iso.x), 0.0, 1.0) * fade * t.a);
+      float b = dot(u_isoW, n) * max(d.r + d.g + d.b, 0.0) / max(n.r + n.g + n.b, 0.05);
+      float fade = (1.0 - clamp((min(min(d.r, d.g), d.b) - u_black.x) / (u_black.y - u_black.x), 0.0, 1.0)) *
+        (1.0 - clamp((min(min(n.r, n.g), n.b) - u_black.z) / (u_black.w - u_black.z), 0.0, 1.0));
+      ink = max(b - u_iso.x, 0.0) * u_iso.y * fade;
     }
+    gl_FragColor = vec4(1.0 - (1.0 - exp(-u_isoInk * ink)) * (t.a * u_opacity), 1.0);
+    return;
   } else if (u_hide.y > 0.0 && t.a > 0.0) {
     vec3 c = t.rgb / t.a;
     vec3 p = texture2D(u_paper, v_uv).rgb;
@@ -282,11 +290,12 @@ class MeshRenderer {
     this.uHide = gl.getUniformLocation(p, 'u_hide');
     this.uIso = gl.getUniformLocation(p, 'u_iso');
     this.uIsoW = gl.getUniformLocation(p, 'u_isoW');
-    this.uIsoColor = gl.getUniformLocation(p, 'u_isoColor');
-    this.uIsoMax = gl.getUniformLocation(p, 'u_isoMax');
+    this.uIsoInk = gl.getUniformLocation(p, 'u_isoInk');
+    this.uBlack = gl.getUniformLocation(p, 'u_black');
     this.uTexel = gl.getUniformLocation(p, 'u_texel');
     this.uDTexel = gl.getUniformLocation(p, 'u_dtexel');
     this.uLens = gl.getUniformLocation(p, 'u_lens');
+    this.uLensSide = gl.getUniformLocation(p, 'u_lensSide');
     this.uDetail = gl.getUniformLocation(p, 'u_detail');
     this.uDetailRect = gl.getUniformLocation(p, 'u_detailRect');
     this.uHasDetail = gl.getUniformLocation(p, 'u_hasDetail');
@@ -386,8 +395,22 @@ class MeshRenderer {
   // settings, {amount, w, color}, or null for off, and `lens` the circle
   // [x, y, r] in framebuffer pixels to isolate within, or null for all.
   draw(m, matrix, opacity, hide = 0, iso = null, lens = null) {
-    const gl = this.gl;
     if (!m.tex || !m.count) return;
+    const isoOn = iso && iso.amount > 0 && iso.w && m.paperTex;
+    if (!isoOn) {
+      this.pass(m, matrix, opacity, hide, null, null, 0);
+    } else if (lens) {
+      this.pass(m, matrix, opacity, hide, null, lens, -1);
+      this.pass(m, matrix, opacity, hide, iso, lens, 1);
+    } else {
+      this.pass(m, matrix, opacity, hide, iso, null, 0);
+    }
+  }
+
+  // One drawing of the mesh: isolated if `iso`, within or outside `lens` by
+  // `side` (as u_lensSide).
+  pass(m, matrix, opacity, hide, iso, lens, side) {
+    const gl = this.gl;
     gl.useProgram(this.program);
     gl.uniformMatrix4fv(this.uMatrix, false, matrix);
     gl.uniform1f(this.uOpacity, opacity);
@@ -397,14 +420,17 @@ class MeshRenderer {
     gl.uniform1f(this.uHasDetail, m.detailTex ? 1 : 0);
     gl.uniform4fv(this.uDetailRect, m.detailRect || [0, 0, 1, 1]);
     gl.uniform3fv(this.uHide, hide > 0 && m.paperTex ? paperThresholds(hide) : [0, 0, 0]);
-    const isoOn = iso && iso.amount > 0 && iso.w && m.paperTex;
-    gl.uniform2fv(this.uIso, isoOn ? isolateThresholds(iso.amount) : [0, 0]);
-    gl.uniform3fv(this.uIsoW, isoOn ? iso.w : [0, 0, 0]);
-    gl.uniform3fv(this.uIsoColor, isoOn ? iso.color : [0, 0, 0]);
-    gl.uniform2fv(this.uIsoMax, isoOn ? isolateCeiling(iso.showD) : [0, 1]);
+    gl.uniform2fv(this.uIso, iso ? isolateGain(iso.amount) : [0, 0]);
+    const scale = iso ? iso.showD.reduce((a, b) => a + b) : 0;
+    gl.uniform3fv(this.uIsoW, iso ? iso.w.map(x => x * scale) : [0, 0, 0]);
+    gl.uniform3fv(this.uIsoInk, iso ? inkDensity(iso.color) : [0, 0, 0]);
+    gl.uniform4fv(this.uBlack, iso ? blackThresholds(iso.showD) : [0, 1, 0, 1]);
     gl.uniform2fv(this.uTexel, m.texel || [0, 0]);
     gl.uniform2fv(this.uDTexel, m.detailTex && m.dtexel ? m.dtexel : [0, 0]);
     gl.uniform3fv(this.uLens, lens || [0, 0, 0]);
+    gl.uniform1f(this.uLensSide, side);
+    // Isolated ink multiplies what's under it; otherwise premultiplied over.
+    if (iso) gl.blendFuncSeparate(gl.ZERO, gl.SRC_COLOR, gl.ZERO, gl.ONE);
     // The paper texture's unit is bound even when unused: an unbound sampler
     // reads black, but the map's own textures could be sitting there.
     gl.activeTexture(gl.TEXTURE1);
@@ -420,6 +446,7 @@ class MeshRenderer {
     gl.enableVertexAttribArray(this.aUv);
     gl.vertexAttribPointer(this.aUv, 2, gl.FLOAT, false, 0, 0);
     gl.drawArrays(gl.TRIANGLES, 0, m.count);
+    if (iso) gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 
   free(m) {

@@ -93,46 +93,69 @@ export function drawColor(showD) {
   return showD.map(x => Math.exp(-Math.max(x, 0) * DRAW_DENSITY / m));
 }
 
-// The Isolate slider runs from 0 (off) to 1. Returns [clear, solid]: pixels
-// with less of the picked ink than `clear` are transparent, those with more
-// than `solid` are opaque, with a ramp between. Further right, fainter lines
-// show.
-export function isolateThresholds(amount) {
-  const clear = 0.5 - 0.42 * amount;
-  return [clear, clear + 0.35];
+// The Isolate slider runs from 0 (off) to 1, as the gain: what the picked
+// ink's density (summed over the channels) is multiplied by, doubling every
+// quarter of the way. The lines are drawn as ink of that density, in the
+// draw color, which multiplies the map under it as ink does the paper. A
+// thin line spread over two pixels, or averaged with the paper when zoomed
+// out, then shows about as faintly as it does on the image instead of
+// dropping out or swelling, and the soft edges of a heavy line stay soft.
+// Below `floor`, which is paper grain and stains, nothing shows. Returns
+// [floor, gain].
+const FLOOR = 0.1;
+export function isolateGain(amount) {
+  return [FLOOR, amount > 0 ? 3 * 2 ** (4 * amount - 2) : 0];
+}
+
+// The density of a draw color (RGB 0..1) as a share of each channel, so
+// that ink of total density D drawn in it lets through e^(-D * share) of
+// each channel.
+export function inkDensity(col) {
+  const d = col.map(x => -Math.log(Math.min(1, Math.max(x, EPS))));
+  const t = sum(d);
+  return t > 0 ? d.map(x => x / t) : [1 / 3, 1 / 3, 1 / 3];
 }
 
 // Black ink at its heaviest doesn't quite absorb every color alike: on a
 // scan its color bottoms out at different levels in each channel, and over
-// yellowed paper it takes on the hue of grey pencil. So anything far darker
-// than the line picked is taken for black: from CEILING[0] times the
-// picked density it fades, and from CEILING[1] times it's gone. Returns
-// [lo, hi] as total densities (summed over the channels).
-const CEILING = [1.8, 2.6];
-export function isolateCeiling(showD) {
-  return CEILING.map(f => f * Math.max(sum(showD), 0.1));
+// yellowed paper it takes on the hue of grey pencil. But it is dark in every
+// channel, as no colored ink is, so a pixel fades out once its density in
+// its lightest channel passes BLACK[0], and is gone by BLACK[1]. The soft
+// edge of a black line, part black and part paper, is lighter than that
+// but has a tint of its own, so a pixel also fades out as the lightest
+// channel of its neighbourhood's density passes that of the picked ink
+// (showD) by NEAR_BLACK in the same way. Returns the thresholds, [lo, hi,
+// near lo, near hi].
+export const BLACK = [0.7, 1.0];
+export const NEAR_BLACK = [0.25, 0.45];
+export const blackThresholds = (showD) => [...BLACK, ...NEAR_BLACK.map(x => x + Math.max(0, Math.min(...showD)))];
+const ramp = (lo, hi, x) => Math.min(1, Math.max(0, (x - lo) / (hi - lo)));
+export function blackFade(showD, d, near = d) {
+  const [lo, hi, nlo, nhi] = blackThresholds(showD);
+  return (1 - ramp(lo, hi, Math.min(...d))) * (1 - ramp(nlo, nhi, Math.min(...near)));
 }
 
 // The amount of the picked ink in a pixel of density d whose neighbourhood
-// has density near: the split of the neighbourhood, scaled to the pixel.
-// The shader in app.js does the same.
+// has density near, as a density (summed over the channels): the split of
+// the neighbourhood, scaled to the pixel. `w` is from isolateWeights and
+// showD the picked density. The shader in app.js does the same, with w
+// scaled by sum(showD) ahead of time.
 const NEAR_MIN = 0.05;
-export function inkAmount(w, d, near = d) {
-  return dot(w, near) * Math.max(sum(d), 0) / Math.max(sum(near), NEAR_MIN);
+export function inkAmount(w, showD, d, near = d) {
+  return dot(w, near) * sum(showD) * Math.max(sum(d), 0) / Math.max(sum(near), NEAR_MIN);
 }
 
 // What the shader draws for color c (RGBA 0..1, unassociated) over paper p,
-// with `near` the mean density around it: the draw color `col` at the
-// opacity the amount of picked ink gives, faded where it's far darker than
-// the picked line (isolateCeiling). Returns [r, g, b, a], unassociated.
-export function isolateAlpha(c, p, w, showD, col, amount, near = null) {
-  const [clear, solid] = isolateThresholds(amount);
+// with `near` the mean density around it: the share of each channel of the
+// map under it to let through, as RGB. Black ink (by blackFade) and the
+// paper let all through.
+export function isolateTransmittance(c, p, w, showD, col, amount, near = null) {
+  const [floor, gain] = isolateGain(amount);
   const d = density(c, p);
-  const b = inkAmount(w, d, near || d);
-  const [lo, hi] = isolateCeiling(showD);
-  const fade = 1 - Math.min(1, Math.max(0, (sum(d) - lo) / (hi - lo)));
-  const a = Math.min(1, Math.max(0, (b - clear) / (solid - clear))) * fade;
-  return [...col, a * c[3]];
+  const b = inkAmount(w, showD, d, near || d);
+  const fade = blackFade(showD, d, near || d);
+  const ink = Math.max(0, b - floor) * gain * fade;
+  return inkDensity(col).map(k => 1 - (1 - Math.exp(-k * ink)) * c[3]);
 }
 
 // '#rrggbb' for RGB 0..1, and back.
