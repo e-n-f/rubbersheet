@@ -387,42 +387,51 @@ test('paper to alpha: the middle of the slider clears the paper alone', () => {
 // ---------------------------------------------------------------------------
 // Isolate color
 
-import { estimateInk, density, pickDensity, isolateWeights, isolateAlpha, drawColor, toHex, fromHex } from '../js/isolate.js';
+import { density, pickDensity, isolateWeights, isolateAlpha, inkAmount, drawColor, toHex, fromHex } from '../js/isolate.js';
 
-test('isolate color: the picked ink shows, paper and dark ink do not', () => {
-  const paper = [0.76, 0.66, 0.44], ink = [0.14, 0.13, 0.12], red = [0.6, 0.3, 0.28];
-  const inkD = density(ink, paper);
-  // Around the click: paper, black ink, and a few red pixels.
-  const px = [];
-  const put = (c) => px.push(...c.map(x => Math.round(x * 255)), 255);
-  for (let n = 0; n < 20; n++) put(paper);
-  for (let n = 0; n < 10; n++) put(ink);
-  for (let n = 0; n < 5; n++) put(red);
-  const showD = pickDensity(Uint8Array.from(px), paper, inkD);
-  for (let n = 0; n < 3; n++) close(showD[n], density(red, paper)[n], 0.02);
-  const w = isolateWeights(showD, inkD);
+// RGBA bytes for a list of RGB colors (0..1).
+const pixels = (cs) => Uint8Array.from(cs.flatMap(c => [...c.map(x => Math.round(x * 255)), 255]));
+// A color as ink of density d over paper p.
+const inked = (p, d) => p.map((x, n) => x * Math.exp(-d[n]));
+
+test('isolate color: the picked ink shows; paper, black and a hidden ink do not', () => {
+  const paper = [0.83, 0.73, 0.49];
+  const black = inked(paper, [1.2, 1.2, 1.2]);
+  const red = inked(paper, [0.24, 0.41, 0.3]);
+  const pencil = inked(paper, [0.38, 0.4, 0.27]);
+  // Around the click: mostly paper, and a line of pencil.
+  const showD = pickDensity(pixels([...Array(14).fill(paper), ...Array(11).fill(pencil)]), paper);
+  for (let n = 0; n < 3; n++) close(showD[n], density(pencil, paper)[n], 0.02);
   const col = drawColor(showD);
-  const alpha = (c) => isolateAlpha([...c, 1], paper, w, col, 0.5)[3];
-  assert.equal(alpha(paper), 0);
-  assert.equal(alpha(ink), 0);
-  assert.equal(alpha(red), 1);
-  // Red under black ink: mostly black, but the red still counts.
-  const both = [0, 1, 2].map(n => red[n] * ink[n] / paper[n]);
-  assert.equal(alpha(both), 1);
-  // Paper alone and black alone give nothing to pick.
-  assert.equal(pickDensity(Uint8Array.from([...paper, 1].map(x => Math.round(x * 255))), paper, inkD), null);
-  // An ink like the black can't be told apart.
-  assert.equal(isolateWeights(inkD.map(x => x / 2), inkD), null);
+  const alpha = (w, c) => isolateAlpha([...c, 1], paper, w, showD, col, 0.5)[3];
+  const w2 = isolateWeights(showD);
+  assert.equal(alpha(w2, paper), 0);
+  assert.equal(alpha(w2, black), 0);
+  assert.equal(alpha(w2, pencil), 1);
+  // Heavy black whose blue bottoms out, so that it has the pencil's hue
+  // (as measured on a scan), is still black.
+  assert.equal(alpha(w2, inked(paper, [1.76, 1.67, 1.21])), 0);
+  // Pencil only partly over black shows at least partly.
+  assert.ok(alpha(w2, inked(paper, [0.58, 0.6, 0.47])) > 0.5);
+  // With red hidden as well, red drops out and pencil stays.
+  const w3 = isolateWeights(showD, density(red, paper));
+  assert.equal(alpha(w3, red), 0);
+  assert.equal(alpha(w3, black), 0);
+  assert.equal(alpha(w3, pencil), 1);
+  close(inkAmount(w3, showD), 1, 1e-9);
 });
 
-test('isolate color: dark ink is the darkest pixels, not a black surround', () => {
-  const px = [];
-  for (let n = 0; n < 500; n++) px.push(0, 0, 0, 255);          // scanner bed
-  for (let n = 0; n < 1000; n++) px.push(190, 170, 110, 255);   // paper
-  for (let n = 0; n < 20; n++) px.push(36, 34, 30, 255);        // ink
-  const ink = estimateInk(Uint8Array.from(px));
-  close(ink[0], 36 / 255, 1e-9);
-  close(ink[2], 30 / 255, 1e-9);
+test('isolate color: nothing to pick from paper or black ink', () => {
+  const paper = [0.83, 0.73, 0.49];
+  assert.equal(pickDensity(pixels(Array(9).fill(paper)), paper), null);
+  const blackD = pickDensity(pixels(Array(9).fill(inked(paper, [1, 1, 1]))), paper);
+  assert.equal(isolateWeights(blackD), null);
+});
+
+test('isolate color: a pixel is judged by its neighbourhood\'s hue at its own strength', () => {
+  const w = isolateWeights([0.2, 0.5, 0.3]);
+  // A faint pixel in a strong red neighbourhood is faintly red.
+  close(inkAmount(w, [0.1, 0.25, 0.15], [0.2, 0.5, 0.3]), 0.5, 1e-9);
   assert.equal(toHex(fromHex('#a1b2c3')), '#a1b2c3');
 });
 

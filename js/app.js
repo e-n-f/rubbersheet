@@ -9,7 +9,7 @@ import { makeZip, readZip } from './zip.js';
 import { isTIFF, readGeoTIFF, readTIFFTags, writeGeoTIFF } from './tiff.js';
 import { crsFromGeoKeys } from './proj.js';
 import { estimatePaper, paperThresholds } from './paper.js';
-import { estimateInk, density, pickDensity, isolateWeights, isolateThresholds, drawColor, toHex, fromHex } from './isolate.js';
+import { pickDensity, isolateWeights, isolateThresholds, isolateCeiling, drawColor, toHex, fromHex } from './isolate.js';
 
 const maplibregl = window.maplibregl;
 const META_KEY = 'rubbersheet';
@@ -182,7 +182,9 @@ void main() {
 // With u_hide > 0, the paper (u_paper, a coarse grid of its colour across
 // the image) turns transparent: paperToAlpha in paper.js, which has the
 // details. With u_iso.y > 0, only one ink shows instead, in u_isoColor:
-// isolateAlpha in isolate.js, which has the details.
+// isolateAlpha in isolate.js, which has the details. Its hue is judged over
+// a 3 x 3 neighbourhood of taps ISO_STEP texels apart, each of which the
+// linear filter averages over 2 x 2 texels.
 const FRAGMENT_SHADER = `
 precision mediump float;
 uniform sampler2D u_tex;
@@ -194,20 +196,41 @@ uniform vec3 u_hide;  // paperThresholds, or 0 for off
 uniform vec2 u_iso;   // isolateThresholds, or 0 for off
 uniform vec3 u_isoW;  // isolateWeights
 uniform vec3 u_isoColor;
+uniform vec2 u_isoMax;   // isolateCeiling
+uniform vec2 u_texel;   // the size of a texel of u_tex, in v_uv
+uniform vec2 u_dtexel;  // and of u_detail, in v_duv
 varying vec2 v_uv;
 varying vec2 v_duv;
+const vec3 EPS = vec3(1.0 / 255.0);
+const float ISO_STEP = 1.5;
+// The image's density over paper of log colour lp at offset o (in texels)
+// from here, and whether there is image there.
+vec4 densityAt(vec2 o, float detail, vec3 lp) {
+  vec4 s = mix(texture2D(u_tex, v_uv + o * u_texel), texture2D(u_detail, v_duv + o * u_dtexel), detail);
+  return s.a > 0.0 ? vec4(lp - log(max(s.rgb / s.a, EPS)), 1.0) : vec4(0.0);
+}
 void main() {
   // Both sampled, outside any branch, so the mipmap level stays well defined.
   vec4 t = texture2D(u_tex, v_uv);
   vec4 dt = texture2D(u_detail, v_duv);
   vec2 inside = step(0.0, v_duv) * step(v_duv, vec2(1.0));
-  t = mix(t, dt, u_hasDetail * inside.x * inside.y);
-  if (u_iso.y > 0.0 && t.a > 0.0) {
-    vec3 c = t.rgb / t.a;
-    vec3 p = texture2D(u_paper, v_uv).rgb;
-    const vec3 EPS = vec3(1.0 / 255.0);
-    float b = dot(u_isoW, log(max(p, EPS)) - log(max(c, EPS)));
-    t = vec4(u_isoColor, 1.0) * (clamp((b - u_iso.x) / (u_iso.y - u_iso.x), 0.0, 1.0) * t.a);
+  float detail = u_hasDetail * inside.x * inside.y;
+  t = mix(t, dt, detail);
+  if (u_iso.y > 0.0) {
+    // The neighbourhood, sampled outside the branch on t.a likewise.
+    vec3 lp = log(max(texture2D(u_paper, v_uv).rgb, EPS));
+    vec4 near = vec4(0.0);
+    for (int i = -1; i <= 1; i++) {
+      for (int j = -1; j <= 1; j++) near += densityAt(vec2(float(i), float(j)) * ISO_STEP, detail, lp);
+    }
+    if (t.a > 0.0) {
+      vec3 d = lp - log(max(t.rgb / t.a, EPS));
+      vec3 n = near.rgb / max(near.a, 1.0);
+      float total = d.r + d.g + d.b;
+      float b = dot(u_isoW, n) * max(total, 0.0) / max(n.r + n.g + n.b, 0.05);
+      float fade = 1.0 - clamp((total - u_isoMax.x) / (u_isoMax.y - u_isoMax.x), 0.0, 1.0);
+      t = vec4(u_isoColor, 1.0) * (clamp((b - u_iso.x) / (u_iso.y - u_iso.x), 0.0, 1.0) * fade * t.a);
+    }
   } else if (u_hide.y > 0.0 && t.a > 0.0) {
     vec3 c = t.rgb / t.a;
     vec3 p = texture2D(u_paper, v_uv).rgb;
@@ -252,6 +275,9 @@ class MeshRenderer {
     this.uIso = gl.getUniformLocation(p, 'u_iso');
     this.uIsoW = gl.getUniformLocation(p, 'u_isoW');
     this.uIsoColor = gl.getUniformLocation(p, 'u_isoColor');
+    this.uIsoMax = gl.getUniformLocation(p, 'u_isoMax');
+    this.uTexel = gl.getUniformLocation(p, 'u_texel');
+    this.uDTexel = gl.getUniformLocation(p, 'u_dtexel');
     this.uDetail = gl.getUniformLocation(p, 'u_detail');
     this.uDetailRect = gl.getUniformLocation(p, 'u_detailRect');
     this.uHasDetail = gl.getUniformLocation(p, 'u_hasDetail');
@@ -267,6 +293,7 @@ class MeshRenderer {
   // pick a smaller level, as it can for a rotated image.
   setTexture(m, source, mip = true) {
     const gl = this.gl;
+    m.texel = [1 / (source.naturalWidth || source.width), 1 / (source.naturalHeight || source.height)];
     if (m.tex) gl.deleteTexture(m.tex);
     m.tex = gl.createTexture();
     gl.activeTexture(gl.TEXTURE0);
@@ -334,6 +361,7 @@ class MeshRenderer {
     gl.activeTexture(gl.TEXTURE0);
     const [u0, v0, u1, v1] = detail.rect;
     m.detailRect = [u0, v0, 1 / (u1 - u0), 1 / (v1 - v0)];
+    m.dtexel = [1 / detail.source.width, 1 / detail.source.height];
   }
 
   setTriangles(m, { positions, uvs, count }) {
@@ -363,6 +391,9 @@ class MeshRenderer {
     gl.uniform2fv(this.uIso, isoOn ? isolateThresholds(iso.amount) : [0, 0]);
     gl.uniform3fv(this.uIsoW, isoOn ? iso.w : [0, 0, 0]);
     gl.uniform3fv(this.uIsoColor, isoOn ? iso.color : [0, 0, 0]);
+    gl.uniform2fv(this.uIsoMax, isoOn ? isolateCeiling(iso.showD) : [0, 1]);
+    gl.uniform2fv(this.uTexel, m.texel || [0, 0]);
+    gl.uniform2fv(this.uDTexel, m.detailTex && m.dtexel ? m.dtexel : [0, 0]);
     // The paper texture's unit is bound even when unused: an unbound sampler
     // reads black, but the map's own textures could be sitting there.
     gl.activeTexture(gl.TEXTURE1);
@@ -472,7 +503,7 @@ const imageLayer = {
       const d = state.drag;
       const see = d && d.layer === L && !['world', 'slide'].includes(d.kind);
       const opacity = see ? Math.min(0.5, L.opacity) : L.opacity;
-      r.draw(L.gpu, rebaseMatrix(matrix, L.origin[0], L.origin[1]), opacity, L.hidePaper, L.isolate);
+      r.draw(L.gpu, rebaseMatrix(matrix, L.origin[0], L.origin[1]), opacity, L.hidePaper, L.preview || L.isolate);
     }
   },
 };
@@ -1079,7 +1110,7 @@ container.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     e.stopPropagation();
     swallowing = true;
-    pickIsolate(state.picking, p);
+    pickIsolate(state.picking, p, e.shiftKey);
     return;
   }
   const hit = hitTest(p);
@@ -1190,6 +1221,7 @@ for (const type of ['mousedown', 'touchstart', 'dblclick', 'contextmenu']) {
 container.addEventListener('pointermove', (e) => {
   lastPointer = localPoint(e);
   if (!state.drag) setHover(hitTest(lastPointer), isCommand(e));
+  if (state.picking) previewPick(e.shiftKey);
 });
 
 window.addEventListener('pointermove', (e) => {
@@ -1515,11 +1547,13 @@ window.addEventListener('keydown', (e) => {
   if ((e.key === 'Meta' || e.key === 'Control') && lastPointer && !state.drag) {
     setHover(hitTest(lastPointer), true);
   }
+  if (e.key === 'Shift' && state.picking) previewPick(true);
 });
 window.addEventListener('keyup', (e) => {
   if ((e.key === 'Meta' || e.key === 'Control') && lastPointer && !state.drag) {
     setHover(hitTest(lastPointer), false);
   }
+  if (e.key === 'Shift' && state.picking) previewPick(false);
 });
 window.addEventListener('blur', () => endDrag(false));
 
@@ -1720,9 +1754,12 @@ function newLayer(image, T, points) {
     warp: null, mesh: null, fine: null, origin: [0, 0],
     opacity: 1,
     hidePaper: 0,
-    // Isolate color: {amount (0 for off), w (isolateWeights), color (to draw
-    // in), picked (the picked color, for its swatch)}.
-    isolate: { amount: 0, w: null, color: null, picked: null },
+    // Isolate color: {amount (0 for off), w (isolateWeights), showD and hideD
+    // (the densities picked to show and hide), color (to draw in), picked
+    // and hidden (the colors picked)}, and while picking, the same for the
+    // line under the pointer.
+    isolate: { amount: 0, w: null, showD: null, hideD: null, color: null, picked: null, hidden: null },
+    preview: null,
     gpu: null, texDirty: true, meshDirty: true,
     card: null,
   };
@@ -1783,10 +1820,7 @@ function findPaper(img) {
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(img, 0, 0, c.width, c.height);
   try {
-    const data = ctx.getImageData(0, 0, c.width, c.height).data;
-    const paper = estimatePaper(data, c.width, c.height);
-    // The image's dark ink, for Isolate color.
-    return paper && { ...paper, ink: estimateInk(data) };
+    return estimatePaper(ctx.getImageData(0, 0, c.width, c.height).data, c.width, c.height);
   } catch (err) {
     console.warn(err);
     return null;
@@ -2400,37 +2434,46 @@ function setStatus(html, error) {
 // Isolate color: click a line on the image to show only lines of its color.
 // isolate.js has the details.
 
-// Start picking the color for layer L, or stop with null.
+// Start picking the color for layer L, or stop with null. While picking,
+// the layer previews the pick under the pointer, so it's plain whether the
+// pointer is on the line meant before clicking.
 function setPicking(L) {
   const was = state.picking;
   state.picking = L;
+  if (was && was !== L) was.preview = null;
   for (const x of [was, L]) if (x?.card) x.card.querySelector('.isolate-pick').textContent = x === L ? 'Cancel' : 'Pick';
   document.body.classList.toggle('picking', !!L);
-  if (L) setStatus(`Click a line of the color to show on <b>${escapeHTML(L.image.name)}</b>. <kbd>Esc</kbd> cancels.`);
+  if (L) setStatus(pickHelp(L, false));
   else if (was) setStatus('');
   map.getCanvas().style.cursor = cursorFor(lastPointer && hitTest(lastPointer), false);
+  if (L && lastPointer) previewPick(false);
+  map.triggerRepaint();
 }
 
-// The radius, in screen pixels, around a click within which to look for the
-// line meant, and the most source pixels across to look at.
-const PICK_RADIUS = 6;
-const PICK_SIDE = 31;
+const pickHelp = (L, hide) => hide
+  ? `Click a line of a color to hide from <b>${escapeHTML(L.image.name)}</b> as well. <kbd>Esc</kbd> cancels.`
+  : `Point at a line on <b>${escapeHTML(L.image.name)}</b> to see only its color, and click to keep it.` +
+    (L.isolate.showD ? ' <kbd>⇧</kbd>-click to hide another color too.' : '') + ' <kbd>Esc</kbd> cancels.';
 
-// Pick L's isolated color from the image around screen point p.
-function pickIsolate(L, p) {
+// The radius, in screen pixels, around the pointer within which to look for
+// the line meant, and the most source pixels across to look at.
+const PICK_RADIUS = 4;
+const PICK_SIDE = 25;
+
+// L's Isolate color settings for the line at screen point p: to show only
+// its color, or with `hide`, to hide its color too. {iso} or {error}.
+function pickCandidate(L, p, hide) {
   const paper = L.image.paper;
   const m = screenToMerc(p);
-  const uv = L.mesh && invertDrawn(L.mesh, L.fine, m[0], m[1]);
-  if (!uv) {
-    setStatus(`Click on <b>${escapeHTML(L.image.name)}</b> to pick a color from it. <kbd>Esc</kbd> cancels.`, true);
-    return;
-  }
+  const uv = paper && L.mesh && invertDrawn(L.mesh, L.fine, m[0], m[1]);
+  if (!uv) return { error: pickHelp(L, hide) };
+  if (hide && !L.isolate.showD) return { error: 'Pick a color to show first, then <kbd>⇧</kbd>-click one to hide.' };
   // The search radius in source pixels, from how big a screen pixel is there.
   const m2 = screenToMerc([p[0] + PICK_RADIUS, p[1]]);
   const uv2 = invertDrawn(L.mesh, L.fine, m2[0], m2[1]);
   const r = Math.max(1.5, uv2 ? Math.hypot(uv2[0] - uv[0], uv2[1] - uv[1]) : PICK_RADIUS);
   const n = Math.min(PICK_SIDE, Math.ceil(2 * r));
-  const c = document.createElement('canvas');
+  const c = pickCandidate.canvas ||= document.createElement('canvas');
   c.width = c.height = n;
   const ctx = c.getContext('2d', { willReadFrequently: true });
   ctx.drawImage(L.image.img, uv[0] - r, uv[1] - r, 2 * r, 2 * r, 0, 0, n, n);
@@ -2438,33 +2481,52 @@ function pickIsolate(L, p) {
   try {
     data = ctx.getImageData(0, 0, n, n).data;
   } catch (err) {
-    console.warn(err);
-    setPicking(null);
-    setStatus('The browser won’t share this image’s pixels, so its colors can’t be picked.', true);
-    return;
+    return { error: 'The browser won’t share this image’s pixels, so its colors can’t be picked.' };
   }
   // The paper's color there, from the nearest cell of its grid.
   const { grid, gw, gh } = paper;
   const i = Math.min(gw - 1, Math.max(0, Math.floor(uv[0] / L.image.W * gw)));
   const j = Math.min(gh - 1, Math.max(0, Math.floor(uv[1] / L.image.H * gh)));
   const pc = [0, 1, 2].map(k => grid[(j * gw + i) * 4 + k] / 255);
-  const inkD = density(paper.ink, pc);
-  const showD = pickDensity(data, pc, inkD);
-  const w = showD && isolateWeights(showD, inkD);
-  if (!w) {
-    setStatus(showD
-      ? 'That color is too much like the image’s dark ink to tell apart. Try another spot, or <kbd>Esc</kbd> to cancel.'
-      : 'Nothing there stands out from the paper and the dark ink. Try clicking right on a line, or <kbd>Esc</kbd> to cancel.', true);
+  const d = pickDensity(data, pc);
+  if (!d) return { error: 'There’s only paper here. Point right at a line.' };
+  const rgb = pc.map((x, k) => x * Math.exp(-d[k]));
+  if (hide) {
+    return { iso: { ...L.isolate, w: isolateWeights(L.isolate.showD, d), hideD: d, hidden: rgb } };
+  }
+  const w = isolateWeights(d);
+  if (!w) return { error: 'That’s black ink, or too close to it to tell apart. Point at a line of another color.' };
+  return {
+    iso: { amount: L.isolate.amount || 0.5, w, showD: d, hideD: null, color: drawColor(d), picked: rgb, hidden: null },
+  };
+}
+
+// Preview the pick under the pointer, at most once a frame.
+let previewFrame = 0;
+function previewPick(hide) {
+  if (previewFrame) cancelAnimationFrame(previewFrame);
+  previewFrame = requestAnimationFrame(() => {
+    previewFrame = 0;
+    const L = state.picking;
+    if (!L || !lastPointer || state.drag) return;
+    const c = pickCandidate(L, lastPointer, hide);
+    L.preview = c.iso || null;
+    setStatus(c.iso ? pickHelp(L, hide) : c.error, !c.iso);
+    map.triggerRepaint();
+  });
+}
+
+// Keep the pick at screen point p for layer L.
+function pickIsolate(L, p, hide) {
+  const c = pickCandidate(L, p, hide);
+  if (!c.iso) {
+    setStatus(c.error, true);
     return;
   }
-  const iso = L.isolate;
-  iso.w = w;
-  iso.picked = pc.map((x, k) => x * Math.exp(-showD[k]));
-  iso.color = drawColor(showD);
-  if (!(iso.amount > 0)) iso.amount = 0.5;
+  L.isolate = c.iso;
+  L.preview = null;
   setPicking(null);
   syncIsolate(L);
-  map.triggerRepaint();
 }
 
 // Show L's Isolate color settings in its card.
@@ -2477,7 +2539,7 @@ function syncIsolate(L) {
   q('.isolate-color').disabled = !iso.w;
   if (iso.color) q('.isolate-color').value = toHex(iso.color);
   q('.isolate-color').title = iso.picked
-    ? `Drawn in this color. Picked: ${toHex(iso.picked)}`
+    ? `Drawn in this color. Picked: ${toHex(iso.picked)}` + (iso.hidden ? `; hidden: ${toHex(iso.hidden)}` : '')
     : 'Pick a color from the image first';
 }
 
