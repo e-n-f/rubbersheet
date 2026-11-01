@@ -461,7 +461,8 @@ const imageLayer = {
 // Detail: the display texture is at most DISPLAY_TEXTURE pixels a side, so a
 // larger image is drawn from a shrunk copy. Once nothing has changed for
 // DETAIL_IDLE_MS, each image gets a second texture, cut from the source at
-// the screen's resolution for the part in view and a margin around it, and
+// the screen's resolution (device pixels, not CSS pixels) for the part in
+// view and a margin around it, and
 // is drawn from that wherever it reaches. Being a piece of the source, it
 // stays right however the map moves or the image bends; it is only replaced
 // when the view outgrows it or needs finer detail, and dropped when zooming
@@ -469,7 +470,7 @@ const imageLayer = {
 // mipmaps of an image drawn at about its own size, which blur it.
 
 const DISPLAY_TEXTURE = 4096;
-const DETAIL_IDLE_MS = 2000;
+const DETAIL_IDLE_MS = 500;
 // Pixels for one layer's detail, and for all of them together: with
 // several large layers in view, each gets an even share.
 const DETAIL_MAX_PIXELS = 12e6;
@@ -478,7 +479,7 @@ const DETAIL_TOTAL_PIXELS = 24e6;
 // side, widest first: the widest that fits the layer's pixels at full
 // resolution is used. A detail is kept while it covers the view and
 // DETAIL_KEEP of this margin.
-const DETAIL_MARGINS = [1, 0.5, 0.25, 0];
+const DETAIL_MARGINS = [0.5, 0.25, 0];
 const DETAIL_KEEP = 0.25;
 let detailTimer = 0;
 
