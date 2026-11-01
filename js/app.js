@@ -462,8 +462,7 @@ const imageLayer = {
 // larger image is drawn from a shrunk copy. Once nothing has changed for
 // DETAIL_IDLE_MS, each image gets a second texture, cut from the source at
 // the screen's resolution (device pixels, not CSS pixels) for the part in
-// view and a margin around it, and
-// is drawn from that wherever it reaches. Being a piece of the source, it
+// view and a margin around it, and is drawn from that wherever it reaches. Being a piece of the source, it
 // stays right however the map moves or the image bends; it is only replaced
 // when the view outgrows it or needs finer detail, and dropped when zooming
 // out leaves it much finer than the screen. It also stands in for the
