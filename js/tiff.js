@@ -242,10 +242,11 @@ export async function readGeoTIFF(bytes, decodeJPEG = null) {
   const offsets = tags[tiled ? TAG.TileOffsets : TAG.StripOffsets];
   const counts = tags[tiled ? TAG.TileByteCounts : TAG.StripByteCounts];
   const across = Math.ceil(width / cw);
-  const chunks = await Promise.all(offsets.map((o, i) => {
+  const chunks = await Promise.all(offsets.map(async (o, i) => {
     const raw = bytes.subarray(o, o + counts[i]);
     if (compression === 1) return raw;
     if (compression === 5) return lzwDecode(raw, cw * ch * spp);
+    if (jpeg && photometric === 2 && spp === 4) return decodeJPEGWithAlpha(jpegStream(raw, tags[TAG.JPEGTables], false), decodeJPEG);
     if (jpeg) return decodeJPEG(jpegStream(raw, tags[TAG.JPEGTables], photometric === 2 && spp === 3));
     return pipe(raw, new DecompressionStream('deflate'));
   }));
@@ -334,6 +335,49 @@ function readGeoKeys(tags) {
     }
   }
   return out;
+}
+
+// RGBA in a four-component JPEG, as GDAL writes for a JPEG-compressed RGBA
+// GeoTIFF. Browsers take four components for CMYK, and give each colour
+// times the fourth over 255: R·A, G·A, B·A, with the alpha itself lost, so
+// that transparent pixels come out black. So the tile is decoded a second
+// time with the first three components' quantization set to zero, which
+// makes them a flat 128, giving 128·A/255 in every channel. That is the
+// alpha, which then divides back out of the first decode.
+async function decodeJPEGWithAlpha(stream, decodeJPEG) {
+  const [rgb, a] = await Promise.all([decodeJPEG(stream), decodeJPEG(flattenColour(stream))]);
+  const out = rgb.rgba, alpha = a.rgba;
+  for (let k = 0; k < out.length; k += 4) {
+    const A = Math.min(255, Math.round(alpha[k] * 255 / 128));
+    out[k + 3] = A;
+    for (let c = 0; c < 3; c++) out[k + c] = A ? Math.min(255, Math.round(out[k + c] * 255 / A)) : 0;
+  }
+  return rgb;
+}
+
+// A copy of a JPEG stream with its first three components dequantized by an
+// all-zero table (number 3), added before the frame header.
+function flattenColour(stream) {
+  for (let k = 2; k + 4 <= stream.length;) {
+    if (stream[k] !== 0xff) break;
+    const marker = stream[k + 1], len = stream[k + 2] << 8 | stream[k + 3];
+    if (marker >= 0xc0 && marker <= 0xc2) {
+      const sof = stream.slice(k, k + 2 + len);
+      const n = sof[9];
+      for (let c = 0; c < Math.min(3, n); c++) sof[10 + 3 * c + 2] = 3;
+      const dqt = new Uint8Array(69);
+      dqt.set([0xff, 0xdb, 0, 67, 3]);
+      const out = new Uint8Array(stream.length + dqt.length);
+      out.set(stream.subarray(0, k));
+      out.set(dqt, k);
+      out.set(sof, k + dqt.length);
+      out.set(stream.subarray(k + sof.length), k + dqt.length + sof.length);
+      return out;
+    }
+    if (marker === 0xda) break;
+    k += 2 + len;
+  }
+  return stream;
 }
 
 // A complete JPEG for one tile or strip: the shared tables spliced in after
