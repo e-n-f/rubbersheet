@@ -73,3 +73,42 @@ export function readTextChunks(bytes) {
   }
   return out;
 }
+
+// Insert a chunk of any type, holding raw bytes, just before IEND.
+export function addChunk(bytes, type, data) {
+  if (!isPNG(bytes)) throw new Error('Not a PNG');
+  const end = findChunk(bytes, 'IEND');
+  if (!end) throw new Error('PNG has no IEND');
+  const chunk = new Uint8Array(12 + data.length);
+  const dv = new DataView(chunk.buffer);
+  dv.setUint32(0, data.length);
+  chunk.set(new TextEncoder().encode(type), 4);
+  chunk.set(data, 8);
+  dv.setUint32(8 + data.length, crc32(chunk.subarray(4, 8 + data.length)));
+  const out = new Uint8Array(bytes.length + chunk.length);
+  out.set(bytes.subarray(0, end.at), 0);
+  out.set(chunk, end.at);
+  out.set(bytes.subarray(end.at), end.at + chunk.length);
+  return out;
+}
+
+// The data of the first chunk of this type, or null.
+export function readChunk(bytes, type) {
+  const c = findChunk(bytes, type);
+  return c ? bytes.subarray(c.at + 8, c.at + 8 + c.length) : null;
+}
+
+function findChunk(bytes, type) {
+  if (!isPNG(bytes)) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let p = 8;
+  while (p + 12 <= bytes.length) {
+    const length = dv.getUint32(p);
+    const t = String.fromCharCode(...bytes.subarray(p + 4, p + 8));
+    if (p + 12 + length > bytes.length) return null;
+    if (t === type) return { at: p, length };
+    if (t === 'IEND') return null;
+    p += 12 + length;
+  }
+  return null;
+}
