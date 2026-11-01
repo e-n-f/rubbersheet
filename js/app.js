@@ -380,9 +380,9 @@ const imageLayer = {
         L.meshDirty = false;
       }
       // Half see-through while dragging, except when the streets on top are
-      // what moves.
+      // what moves, or a point is sliding across the image (which stays put).
       const d = state.drag;
-      const see = d && d.layer === L && d.kind !== 'world';
+      const see = d && d.layer === L && !['world', 'slide'].includes(d.kind);
       const opacity = see ? Math.min(0.5, L.opacity) : L.opacity;
       r.draw(L.gpu, rebaseMatrix(matrix, L.origin[0], L.origin[1]), opacity, L.hidePaper);
     }
