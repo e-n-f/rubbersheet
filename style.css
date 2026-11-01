@@ -232,3 +232,13 @@ kbd {
 }
 .row .isolate-pick { flex: none; }
 body.picking .maplibregl-canvas { cursor: crosshair !important; }
+
+.row .spacer { flex: 1; }
+.row .hide-clear, .row .hide-pick { flex: none; }
+.row[hidden], .row [hidden] { display: none; }
+.lens {
+  fill: none;
+  stroke: #fff;
+  stroke-width: 3;
+  filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.8));
+}

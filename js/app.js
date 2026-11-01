@@ -138,6 +138,7 @@ const state = {
   streetsOnTop: false,
   ease: null,       // a world anchor's release in progress (easeWorldRelease)
   picking: null,    // the layer whose Isolate color is being picked
+  pickHide: false,  // and whether it's the color to hide
 };
 
 let nextLayerId = 1;
@@ -199,6 +200,8 @@ uniform vec3 u_isoColor;
 uniform vec2 u_isoMax;   // isolateCeiling
 uniform vec2 u_texel;   // the size of a texel of u_tex, in v_uv
 uniform vec2 u_dtexel;  // and of u_detail, in v_duv
+uniform vec3 u_lens;    // centre and radius, in framebuffer pixels, of the
+                        // circle to isolate within, or 0 for everywhere
 varying vec2 v_uv;
 varying vec2 v_duv;
 const vec3 EPS = vec3(1.0 / 255.0);
@@ -216,13 +219,18 @@ void main() {
   vec2 inside = step(0.0, v_duv) * step(v_duv, vec2(1.0));
   float detail = u_hasDetail * inside.x * inside.y;
   t = mix(t, dt, detail);
+  // The neighbourhood, sampled outside the branches on t.a and the lens
+  // likewise.
+  vec3 lp = vec3(0.0);
+  vec4 near = vec4(0.0);
   if (u_iso.y > 0.0) {
-    // The neighbourhood, sampled outside the branch on t.a likewise.
-    vec3 lp = log(max(texture2D(u_paper, v_uv).rgb, EPS));
-    vec4 near = vec4(0.0);
+    lp = log(max(texture2D(u_paper, v_uv).rgb, EPS));
     for (int i = -1; i <= 1; i++) {
       for (int j = -1; j <= 1; j++) near += densityAt(vec2(float(i), float(j)) * ISO_STEP, detail, lp);
     }
+  }
+  bool inLens = u_lens.z <= 0.0 || distance(gl_FragCoord.xy, u_lens.xy) < u_lens.z;
+  if (u_iso.y > 0.0 && inLens) {
     if (t.a > 0.0) {
       vec3 d = lp - log(max(t.rgb / t.a, EPS));
       vec3 n = near.rgb / max(near.a, 1.0);
@@ -278,6 +286,7 @@ class MeshRenderer {
     this.uIsoMax = gl.getUniformLocation(p, 'u_isoMax');
     this.uTexel = gl.getUniformLocation(p, 'u_texel');
     this.uDTexel = gl.getUniformLocation(p, 'u_dtexel');
+    this.uLens = gl.getUniformLocation(p, 'u_lens');
     this.uDetail = gl.getUniformLocation(p, 'u_detail');
     this.uDetailRect = gl.getUniformLocation(p, 'u_detailRect');
     this.uHasDetail = gl.getUniformLocation(p, 'u_hasDetail');
@@ -374,8 +383,9 @@ class MeshRenderer {
   }
 
   // `hide` is the Hide paper amount, 0 for off; `iso` is the Isolate color
-  // settings, {amount, w, color}, or null for off.
-  draw(m, matrix, opacity, hide = 0, iso = null) {
+  // settings, {amount, w, color}, or null for off, and `lens` the circle
+  // [x, y, r] in framebuffer pixels to isolate within, or null for all.
+  draw(m, matrix, opacity, hide = 0, iso = null, lens = null) {
     const gl = this.gl;
     if (!m.tex || !m.count) return;
     gl.useProgram(this.program);
@@ -394,6 +404,7 @@ class MeshRenderer {
     gl.uniform2fv(this.uIsoMax, isoOn ? isolateCeiling(iso.showD) : [0, 1]);
     gl.uniform2fv(this.uTexel, m.texel || [0, 0]);
     gl.uniform2fv(this.uDTexel, m.detailTex && m.dtexel ? m.dtexel : [0, 0]);
+    gl.uniform3fv(this.uLens, lens || [0, 0, 0]);
     // The paper texture's unit is bound even when unused: an unbound sampler
     // reads black, but the map's own textures could be sitting there.
     gl.activeTexture(gl.TEXTURE1);
@@ -503,7 +514,11 @@ const imageLayer = {
       const d = state.drag;
       const see = d && d.layer === L && !['world', 'slide'].includes(d.kind);
       const opacity = see ? Math.min(0.5, L.opacity) : L.opacity;
-      r.draw(L.gpu, rebaseMatrix(matrix, L.origin[0], L.origin[1]), opacity, L.hidePaper, L.preview || L.isolate);
+      // While picking, the image shows as it is, but for a preview of the
+      // pick around the pointer.
+      const picking = state.picking === L;
+      r.draw(L.gpu, rebaseMatrix(matrix, L.origin[0], L.origin[1]), opacity, L.hidePaper,
+        picking ? L.preview : L.isolate, picking ? lensCircle() : null);
     }
   },
 };
@@ -989,6 +1004,9 @@ function drawOverlay() {
     parts.push(`<polygon class="${cls}" points="${pts.map(p => p.join(',')).join(' ')}"/>`);
   };
   for (const other of state.layers) if (other !== L && other.mesh) outline(other, 'outline other');
+  if (state.picking && state.picking.preview && lastPointer) {
+    parts.push(`<circle class="lens" cx="${lastPointer[0]}" cy="${lastPointer[1]}" r="${LENS_RADIUS}"/>`);
+  }
   if (!L || !L.mesh) {
     overlay.innerHTML = parts.join('');
     return;
@@ -1110,7 +1128,7 @@ container.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     e.stopPropagation();
     swallowing = true;
-    pickIsolate(state.picking, p, e.shiftKey);
+    pickIsolate(state.picking, p, state.pickHide);
     return;
   }
   const hit = hitTest(p);
@@ -1221,7 +1239,7 @@ for (const type of ['mousedown', 'touchstart', 'dblclick', 'contextmenu']) {
 container.addEventListener('pointermove', (e) => {
   lastPointer = localPoint(e);
   if (!state.drag) setHover(hitTest(lastPointer), isCommand(e));
-  if (state.picking) previewPick(e.shiftKey);
+  if (state.picking) previewPick();
 });
 
 window.addEventListener('pointermove', (e) => {
@@ -1547,13 +1565,11 @@ window.addEventListener('keydown', (e) => {
   if ((e.key === 'Meta' || e.key === 'Control') && lastPointer && !state.drag) {
     setHover(hitTest(lastPointer), true);
   }
-  if (e.key === 'Shift' && state.picking) previewPick(true);
 });
 window.addEventListener('keyup', (e) => {
   if ((e.key === 'Meta' || e.key === 'Control') && lastPointer && !state.drag) {
     setHover(hitTest(lastPointer), false);
   }
-  if (e.key === 'Shift' && state.picking) previewPick(false);
 });
 window.addEventListener('blur', () => endDrag(false));
 
@@ -2434,26 +2450,41 @@ function setStatus(html, error) {
 // Isolate color: click a line on the image to show only lines of its color.
 // isolate.js has the details.
 
-// Start picking the color for layer L, or stop with null. While picking,
-// the layer previews the pick under the pointer, so it's plain whether the
-// pointer is on the line meant before clicking.
-function setPicking(L) {
+// Start picking the color for layer L to show, or with `hide`, to hide as
+// well; or stop with null. While picking, the image shows as it is, but in
+// a circle around the pointer, which previews the pick under it, so it's
+// plain whether the pointer is on the line meant before clicking.
+function setPicking(L, hide = false) {
   const was = state.picking;
   state.picking = L;
-  if (was && was !== L) was.preview = null;
-  for (const x of [was, L]) if (x?.card) x.card.querySelector('.isolate-pick').textContent = x === L ? 'Cancel' : 'Pick';
+  state.pickHide = !!L && hide;
+  if (was) was.preview = null;
+  if (was?.card) syncIsolate(was);
+  if (L?.card) syncIsolate(L);
   document.body.classList.toggle('picking', !!L);
-  if (L) setStatus(pickHelp(L, false));
+  if (L) setStatus(pickHelp(L, hide));
   else if (was) setStatus('');
   map.getCanvas().style.cursor = cursorFor(lastPointer && hitTest(lastPointer), false);
-  if (L && lastPointer) previewPick(false);
+  if (L && lastPointer) previewPick();
+  drawOverlay();
   map.triggerRepaint();
 }
 
 const pickHelp = (L, hide) => hide
-  ? `Click a line of a color to hide from <b>${escapeHTML(L.image.name)}</b> as well. <kbd>Esc</kbd> cancels.`
-  : `Point at a line on <b>${escapeHTML(L.image.name)}</b> to see only its color, and click to keep it.` +
-    (L.isolate.showD ? ' <kbd>⇧</kbd>-click to hide another color too.' : '') + ' <kbd>Esc</kbd> cancels.';
+  ? `Point at a line of a color to hide from <b>${escapeHTML(L.image.name)}</b> as well. The circle shows the result; click to keep it. <kbd>Esc</kbd> cancels.`
+  : `Point at a line on <b>${escapeHTML(L.image.name)}</b>. The circle shows only lines of its color; click to keep it. <kbd>Esc</kbd> cancels.`;
+
+// The preview circle around the pointer, in CSS pixels.
+const LENS_RADIUS = 90;
+
+// The preview circle as [x, y, r] in framebuffer pixels (y up), for the
+// shader.
+function lensCircle() {
+  if (!lastPointer) return [0, 0, 0];
+  const canvas = map.getCanvas();
+  const k = canvas.width / canvas.clientWidth;
+  return [lastPointer[0] * k, canvas.height - lastPointer[1] * k, LENS_RADIUS * k];
+}
 
 // The radius, in screen pixels, around the pointer within which to look for
 // the line meant, and the most source pixels across to look at.
@@ -2467,7 +2498,6 @@ function pickCandidate(L, p, hide) {
   const m = screenToMerc(p);
   const uv = paper && L.mesh && invertDrawn(L.mesh, L.fine, m[0], m[1]);
   if (!uv) return { error: pickHelp(L, hide) };
-  if (hide && !L.isolate.showD) return { error: 'Pick a color to show first, then <kbd>⇧</kbd>-click one to hide.' };
   // The search radius in source pixels, from how big a screen pixel is there.
   const m2 = screenToMerc([p[0] + PICK_RADIUS, p[1]]);
   const uv2 = invertDrawn(L.mesh, L.fine, m2[0], m2[1]);
@@ -2494,24 +2524,27 @@ function pickCandidate(L, p, hide) {
   if (hide) {
     return { iso: { ...L.isolate, w: isolateWeights(L.isolate.showD, d), hideD: d, hidden: rgb } };
   }
-  const w = isolateWeights(d);
+  // A color picked to hide before stays hidden.
+  const w = isolateWeights(d, L.isolate.hideD);
   if (!w) return { error: 'That’s black ink, or too close to it to tell apart. Point at a line of another color.' };
   return {
-    iso: { amount: L.isolate.amount || 0.5, w, showD: d, hideD: null, color: drawColor(d), picked: rgb, hidden: null },
+    iso: { ...L.isolate, amount: L.isolate.amount || 0.5, w, showD: d, color: drawColor(d), picked: rgb },
   };
 }
 
 // Preview the pick under the pointer, at most once a frame.
 let previewFrame = 0;
-function previewPick(hide) {
+function previewPick() {
   if (previewFrame) cancelAnimationFrame(previewFrame);
   previewFrame = requestAnimationFrame(() => {
     previewFrame = 0;
-    const L = state.picking;
+    const L = state.picking, hide = state.pickHide;
     if (!L || !lastPointer || state.drag) return;
     const c = pickCandidate(L, lastPointer, hide);
     L.preview = c.iso || null;
-    setStatus(c.iso ? pickHelp(L, hide) : c.error, !c.iso);
+    // Not shown as an error until a click misses.
+    setStatus(c.iso ? pickHelp(L, hide) : c.error);
+    drawOverlay();
     map.triggerRepaint();
   });
 }
@@ -2524,9 +2557,15 @@ function pickIsolate(L, p, hide) {
     return;
   }
   L.isolate = c.iso;
-  L.preview = null;
   setPicking(null);
+}
+
+// Stop hiding L's second color.
+function clearHidden(L) {
+  const iso = L.isolate;
+  L.isolate = { ...iso, w: isolateWeights(iso.showD), hideD: null, hidden: null };
   syncIsolate(L);
+  map.triggerRepaint();
 }
 
 // Show L's Isolate color settings in its card.
@@ -2534,13 +2573,20 @@ function syncIsolate(L) {
   if (!L.card) return;
   const q = (sel) => L.card.querySelector(sel);
   const iso = L.isolate;
+  const picking = state.picking === L;
   q('.isolate').value = iso.amount;
   q('.isolate').disabled = !iso.w;
-  q('.isolate-color').disabled = !iso.w;
+  // Nothing to color, nor to hide as well, until there's a color to show.
+  q('.isolate-color').hidden = !iso.w;
   if (iso.color) q('.isolate-color').value = toHex(iso.color);
-  q('.isolate-color').title = iso.picked
-    ? `Drawn in this color. Picked: ${toHex(iso.picked)}` + (iso.hidden ? `; hidden: ${toHex(iso.hidden)}` : '')
-    : 'Pick a color from the image first';
+  q('.isolate-color').title = iso.picked ? `Drawn in this color. Picked: ${toHex(iso.picked)}` : '';
+  q('.isolate-pick').textContent = picking && !state.pickHide ? 'Cancel' : 'Pick';
+  q('.hide-row').hidden = !iso.showD;
+  q('.hidden-swatch').hidden = !iso.hidden;
+  q('.hidden-swatch').style.background = iso.hidden ? toHex(iso.hidden) : 'transparent';
+  q('.hidden-swatch').title = iso.hidden ? `Hidden: ${toHex(iso.hidden)}` : '';
+  q('.hide-pick').textContent = picking && state.pickHide ? 'Cancel' : 'Pick';
+  q('.hide-clear').hidden = !iso.hidden;
 }
 
 // ---------------------------------------------------------------------------
@@ -2627,11 +2673,20 @@ function layerCard(L) {
     L.isolate.color = fromHex(isoColor.value);
     map.triggerRepaint();
   });
-  pick.disabled = !paper;
-  pick.addEventListener('click', (e) => {
+  // Pick, or while picking that, cancel.
+  const pickButton = (button, hide) => {
+    button.disabled = !paper;
+    button.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (state.selected !== L) select(L);
+      setPicking(state.picking === L && state.pickHide === hide ? null : L, hide);
+    });
+  };
+  pickButton(pick, false);
+  pickButton(q('.hide-pick'), true);
+  q('.hide-clear').addEventListener('click', (e) => {
     e.stopPropagation();
-    if (state.selected !== L) select(L);
-    setPicking(state.picking === L ? null : L);
+    clearHidden(L);
   });
   syncIsolate(L);
   q('.export').addEventListener('click', () => runExport(L));
