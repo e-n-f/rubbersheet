@@ -36,7 +36,7 @@
         <option value="kmz">KMZ for Google Earth</option>
       </select>
     </div>
-    <label class="check" title="Makes the export bigger. Dropping it back on the map then works from the unwarped image, so repeated edits don't blur it."><input id="include-original" type="checkbox"> Include unwarped image</label>
+    <label class="check" title="Makes the export bigger. Dropping it back on the map then works from the unwarped image, so repeated edits don't blur it."><input id="include-original" type="checkbox" checked> Include unwarped image</label>
     <label class="check" id="worldfile-row" hidden><input id="worldfile" type="checkbox"> Also download world file (.pgw + .aux.xml)</label>
     <div class="buttons">
       <button id="undo" disabled title="⌘Z / Ctrl-Z">Undo</button>
@@ -83,7 +83,7 @@
         <li><b>Hide paper</b> makes a layer's paper see-through, so the map shows between its lines. It finds the paper's colour itself (shown in the swatch), following uneven lighting across a photo. At the middle of the slider the paper alone is cleared; to the left it fades only partly, and to the right colours close to the paper's fade too. Like Opacity, it changes only the view, not exports.</li>
         <li><b>Undo</b> with <kbd>⌘</kbd>/<kbd>Ctrl</kbd>-<kbd>Z</kbd>, <b>redo</b> with <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> or <kbd>Ctrl</kbd>-<kbd>Y</kbd>. Undo covers all the layers: each drag, each added or removed point, and each added, removed or moved image is one step.</li>
         <li><b>Export</b> saves that layer's warped image, north-up. PNG and GeoTIFF are in Web Mercator; KMZ opens in Google Earth. The placement and control points are stored inside, so dropping the file back on the map puts it in the same place.</li>
-        <li><b>Include unwarped image</b> also puts the image as you loaded it inside the export. That makes the file bigger, but dropping it back on the map then loads the unwarped image with its control points, rather than the warped one, so editing and exporting again and again never blurs it.</li>
+        <li><b>Include unwarped image</b>, on unless you untick it, also puts the image as you loaded it inside the export. That makes the file bigger, but dropping it back on the map then loads the unwarped image with its control points, rather than the warped one, so editing and exporting again and again never blurs it.</li>
       </ul>
     </details>
   </aside>
