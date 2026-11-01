@@ -15,6 +15,7 @@ const META_KEY = 'rubbersheet';
 const DISPLAY_CELLS = 64;
 const EXPORT_CELLS = 256;
 const HIT_RADIUS = 11;
+const SLIDE_PX = 3;  // how far a ⌘-click on a point must move to slide it rather than remove it
 
 // ---------------------------------------------------------------------------
 // Base maps
@@ -687,7 +688,7 @@ function drawOverlay() {
     parts.push(`<path class="bent-streets" d="${easedStreetsPath(state.ease)}"/>`);
   }
   L.points.forEach((p, i) => {
-    const active = d && ['point', 'world'].includes(d.kind) && d.index === i;
+    const active = d && ['point', 'world', 'slide'].includes(d.kind) && d.index === i;
     // A world anchor being dragged rides on its bent street, at the pointer.
     const easing = state.ease && state.ease.index === i;
     const [x, y] = active && d.kind === 'world' && d.cursor ? d.cursor
@@ -745,7 +746,7 @@ const isCommand = (e) => e.metaKey || e.ctrlKey;
 function cursorFor(hit, cmd) {
   if (!hit) return '';
   if (hit.layer !== state.selected) return 'pointer';
-  if (hit.kind === 'point') return cmd ? 'pointer' : 'grab';
+  if (hit.kind === 'point') return cmd ? 'move' : 'grab';
   if (cmd) return 'copy';
   if (hit.kind === 'corner') return hit.index % 2 === 0 ? 'nwse-resize' : 'nesw-resize';
   return imageMovable(hit.layer) ? 'move' : '';
@@ -820,15 +821,36 @@ container.addEventListener('pointerdown', (e) => {
     return;
   }
 
+  // ⌘-dragging a point slides it: the image spot and the map place move
+  // together, so the image stays where it is. A ⌘-click without a drag
+  // removes the point (in endDrag).
+  if (isCommand(e) && hit.kind === 'point') {
+    const q = L.points[hit.index];
+    const [sx, sy] = mercToScreen([q.x, q.y]);
+    state.drag = {
+      layer: L,
+      token: checkpoint(L),
+      kind: 'slide',
+      index: hit.index,
+      p0: p,
+      offset: [sx - p[0], sy - p[1]],
+      moved: false,
+      mesh: L.mesh,
+      fine: L.fine,
+      pts0: L.points.map(q => ({ ...q })),
+      T0: L.T.slice(),
+    };
+    document.body.classList.add('dragging');
+    map.getCanvas().style.cursor = 'grabbing';
+    drawOverlay();
+    return;
+  }
+
   if (isCommand(e)) {
     checkpoint(L);
-    if (hit.kind === 'point') {
-      L.points.splice(hit.index, 1);
-    } else {
-      const uv = hit.kind === 'corner' ? cornerUV(L, hit.index) : hit.uv;
-      const target = hit.kind === 'corner' ? L.warp.map(uv[0], uv[1]) : hit.merc;
-      L.points.push({ u: uv[0], v: uv[1], x: target[0], y: target[1] });
-    }
+    const uv = hit.kind === 'corner' ? cornerUV(L, hit.index) : hit.uv;
+    const target = hit.kind === 'corner' ? L.warp.map(uv[0], uv[1]) : hit.merc;
+    L.points.push({ u: uv[0], v: uv[1], x: target[0], y: target[1] });
     state.hover = null;
     update(L);
     return;
@@ -882,6 +904,19 @@ window.addEventListener('pointermove', (e) => {
   const m = screenToMerc(lastPointer);
   if (d.kind === 'world') {
     worldStep(d, [lastPointer[0] + d.offset[0], lastPointer[1] + d.offset[1]]);
+    return;
+  }
+  if (d.kind === 'slide') {
+    if (!d.moved && Math.hypot(lastPointer[0] - d.p0[0], lastPointer[1] - d.p0[1]) < SLIDE_PX) return;
+    d.moved = true;
+    // The point goes to the map place under it, and to the image spot drawn
+    // there when the drag began.
+    const target = screenToMerc([lastPointer[0] + d.offset[0], lastPointer[1] + d.offset[1]]);
+    const uv = invertDrawn(d.mesh, d.fine, target[0], target[1]);
+    if (!uv) return;  // Off the image: stay at the last spot on it.
+    L.points = d.pts0.map(q => ({ ...q }));
+    Object.assign(L.points[d.index], { u: uv[0], v: uv[1], x: target[0], y: target[1] });
+    update(L);
     return;
   }
   const dx = m[0] - d.m0[0], dy = m[1] - d.m0[1];
@@ -1140,11 +1175,14 @@ function easedStreetsPath(ease) {
   }));
 }
 
-function endDrag(cancel) {
+// `released`: the pointer was let go (rather than the window losing focus).
+function endDrag(cancel, released = false) {
   const d = state.drag;
   swallowing = false;
   if (!d) return;
   const L = d.layer;
+  // A ⌘-click on a point, not dragged, removes it.
+  if (d.kind === 'slide' && !d.moved && !cancel && released) L.points.splice(d.index, 1);
   if (d.kind === 'world') {
     hideStreets(false);
     // The image spot under the pointer goes to the anchor's place.
@@ -1162,7 +1200,7 @@ function endDrag(cancel) {
   if (lastPointer) setHover(hitTest(lastPointer), false);
 }
 
-window.addEventListener('pointerup', (e) => { if (e.isPrimary) endDrag(false); });
+window.addEventListener('pointerup', (e) => { if (e.isPrimary) endDrag(false, true); });
 window.addEventListener('pointercancel', () => endDrag(true));
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') endDrag(true);
