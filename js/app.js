@@ -36,6 +36,13 @@ const STYLES = {
   osm: rasterStyle(
     'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
     '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'),
+  // Nothing but white, for aligning one image to another, such as to a
+  // bottom layer tinted with Isolate color, without the map showing through.
+  white: {
+    version: 8,
+    sources: {},
+    layers: [{ id: 'background', type: 'background', paint: { 'background-color': '#ffffff' } }],
+  },
 };
 
 // A plain base map to align old maps against: white land, pale water whose
