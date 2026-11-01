@@ -20,10 +20,14 @@ const lum = (r, g, b) => 0.299 * r + 0.587 * g + 0.114 * b;
 
 // The most common colour among opaque pixels. Colours are binned at 4 bits a
 // channel; the paper is the mean of the fullest bin and its neighbours.
+// Near-black is left out: a scan rotated or cropped onto black, or
+// photographed on a black cloth, can have more of that than of paper.
+const NOT_PAPER = 32;  // every channel below this, of 255
 export function globalPaper(rgba) {
   const counts = new Uint32Array(4096);
   for (let k = 0; k < rgba.length; k += 4) {
     if (rgba[k + 3] < 255) continue;
+    if (rgba[k] < NOT_PAPER && rgba[k + 1] < NOT_PAPER && rgba[k + 2] < NOT_PAPER) continue;
     counts[(rgba[k] >> 4) << 8 | (rgba[k + 1] >> 4) << 4 | rgba[k + 2] >> 4]++;
   }
   let best = -1, bestN = 0;

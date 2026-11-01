@@ -220,3 +220,26 @@ kbd {
 @media (max-width: 600px) {
   #panel { top: auto; bottom: 30px; width: auto; right: 10px; max-height: 45vh; }
 }
+
+.row .tint-on { flex: none; margin: 0; }
+.row .tint {
+  flex: none;
+  width: 26px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid #b5bcc4;
+  border-radius: 3px;
+  background: none;
+}
+.row .isolate-pick { flex: none; }
+body.picking .maplibregl-canvas { cursor: crosshair !important; }
+
+.row .spacer { flex: 1; }
+.row .hide-clear, .row .hide-pick { flex: none; }
+.row[hidden], .row [hidden] { display: none; }
+.lens {
+  fill: none;
+  stroke: #fff;
+  stroke-width: 3;
+  filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.8));
+}

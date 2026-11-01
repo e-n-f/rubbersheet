@@ -383,3 +383,82 @@ test('paper to alpha: the middle of the slider clears the paper alone', () => {
   assert.equal(paperToAlpha(pale, p, 1)[3], 0);
   assert.equal(paperToAlpha(ink, p, 1)[3], 1);
 });
+
+// ---------------------------------------------------------------------------
+// Isolate color
+
+import { density, pickDensity, isolateWeights, isolateTransmittance, inkAmount, drawColor, toHex, fromHex } from '../js/isolate.js';
+
+// How much of the map a pixel's isolated ink hides, at its most.
+const isolateAlpha = (...args) => [0, 0, 0, 1 - Math.min(...isolateTransmittance(...args))];
+
+// RGBA bytes for a list of RGB colors (0..1).
+const pixels = (cs) => Uint8Array.from(cs.flatMap(c => [...c.map(x => Math.round(x * 255)), 255]));
+// A color as ink of density d over paper p.
+const inked = (p, d) => p.map((x, n) => x * Math.exp(-d[n]));
+
+test('isolate color: the picked ink shows; paper, black and a hidden ink do not', () => {
+  const paper = [0.83, 0.73, 0.49];
+  const black = inked(paper, [1.2, 1.2, 1.2]);
+  const red = inked(paper, [0.24, 0.41, 0.3]);
+  const pencil = inked(paper, [0.38, 0.4, 0.27]);
+  // Around the click: mostly paper, and a line of pencil.
+  const showD = pickDensity(pixels([...Array(14).fill(paper), ...Array(11).fill(pencil)]), paper);
+  for (let n = 0; n < 3; n++) close(showD[n], density(pencil, paper)[n], 0.02);
+  const col = drawColor(showD);
+  const alpha = (w, c) => isolateAlpha([...c, 1], paper, w, showD, col, 0.5)[3];
+  const w2 = isolateWeights(showD);
+  assert.equal(alpha(w2, paper), 0);
+  assert.equal(alpha(w2, black), 0);
+  assert.ok(alpha(w2, pencil) > 0.5);
+  // Heavy black whose blue bottoms out, so that it has the pencil's hue
+  // (as measured on a scan), is still black.
+  assert.equal(alpha(w2, inked(paper, [1.76, 1.67, 1.21])), 0);
+  // Pencil only partly over black shows at least partly.
+  assert.ok(alpha(w2, inked(paper, [0.58, 0.6, 0.47])) > 0.5);
+  // With red hidden as well, red drops out and pencil stays.
+  const w3 = isolateWeights(showD, density(red, paper));
+  assert.equal(alpha(w3, red), 0);
+  assert.equal(alpha(w3, black), 0);
+  assert.ok(alpha(w3, pencil) > 0.5);
+  close(inkAmount(w3, showD, showD), showD.reduce((a, b) => a + b), 1e-9);
+});
+
+test('isolate color: nothing to pick from paper or black ink', () => {
+  const paper = [0.83, 0.73, 0.49];
+  assert.equal(pickDensity(pixels(Array(9).fill(paper)), paper), null);
+  const blackD = pickDensity(pixels(Array(9).fill(inked(paper, [1, 1, 1]))), paper);
+  assert.equal(isolateWeights(blackD), null);
+});
+
+test('isolate color: a pixel is judged by its neighbourhood\'s hue at its own strength', () => {
+  const showD = [0.2, 0.5, 0.3], w = isolateWeights(showD);
+  // A faint pixel in a strong red neighbourhood is faintly red.
+  close(inkAmount(w, showD, [0.1, 0.25, 0.15], [0.2, 0.5, 0.3]), 0.5, 1e-9);
+  assert.equal(toHex(fromHex('#a1b2c3')), '#a1b2c3');
+});
+
+test('paper color ignores a black surround larger than the paper', () => {
+  const w = 40, h = 40, px = new Uint8Array(w * h * 4);
+  for (let k = 0; k < px.length; k += 4) {
+    const inside = (k / 4) % w < 15;
+    px.set(inside ? [200, 180, 120, 255] : [3, 2, 4, 255], k);
+  }
+  const p = estimatePaper(px, w, h);
+  assert.deepEqual(p.colour, [200, 180, 120]);
+});
+
+test('isolate color: opacity follows the amount of ink, wherever it was picked', () => {
+  const paper = [1, 0.98, 0.75];
+  const heavy = [0.27, 0.6, 0.92], thin = heavy.map(x => x / 4);
+  const col = [0, 0, 0];
+  const alphaOf = (showD, d) => isolateAlpha([...inked(paper, d), 1], paper, isolateWeights(showD), showD, col, 0.5)[3];
+  // A thin line, or a line covering part of a pixel, shows partly.
+  const a = alphaOf(heavy, thin);
+  assert.ok(a > 0.1 && a < alphaOf(heavy, heavy), `${a}`);
+  // Picking a thin line of an ink gives the same as picking a heavy one.
+  close(alphaOf(thin, thin), a, 1e-6);
+  close(alphaOf(thin, heavy), alphaOf(heavy, heavy), 1e-6);
+  // Paper grain doesn't show.
+  assert.equal(alphaOf(heavy, heavy.map(x => x / 40)), 0);
+});
