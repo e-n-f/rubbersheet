@@ -221,7 +221,8 @@ kbd {
   #panel { top: auto; bottom: 30px; width: auto; right: 10px; max-height: 45vh; }
 }
 
-.row .isolate-color {
+.row .tint-on { flex: none; margin: 0; }
+.row .tint {
   flex: none;
   width: 26px;
   height: 20px;

@@ -64,7 +64,6 @@
         <div class="row">
           <label class="isolate-label">Isolate color</label>
           <input class="isolate" type="range" min="0" max="1" step="0.02" value="0" disabled>
-          <input class="isolate-color" type="color" disabled>
           <button class="isolate-pick" title="Click a line on the image to show only lines of its color">Pick</button>
         </div>
         <div class="row hide-row" hidden>
@@ -73,6 +72,11 @@
           <span class="spacer"></span>
           <button class="hide-clear" hidden>Clear</button>
           <button class="hide-pick" title="Click a line of another color on the image to hide it as well">Pick</button>
+        </div>
+        <div class="row">
+          <label class="tint-label">Tint</label>
+          <input class="tint-on" type="checkbox">
+          <input class="tint" type="color" title="The color to draw the image's lines in">
         </div>
         <div class="buttons">
           <button class="export">Export</button>
@@ -94,7 +98,8 @@
         <li><b>Drag a control point</b> to pin that spot of the image to a new place on the map. The image warps to fit.</li>
         <li><b>Streets on top of the image</b> draws the street map's roads and railways over the image as thin yellow lines. While it's on, <kbd>⌘</kbd>/<kbd>Ctrl</kbd>-clicking the image adds a <b>world anchor</b> (a blue square), which is tied to that place on the map rather than to the image. Dragging a world anchor bends the streets instead of the image: drag the street onto the image's feature and let go. The image warps to bring that feature to the anchor's place, and the map eases so the anchor stays where you let go. Points added with the streets off are image anchors (red circles); dragging one moves the image. (Streets base maps only.)</li>
         <li><b>Hide paper</b> makes a layer's paper see-through, so the map shows between its lines. It finds the paper's color itself (shown in the swatch), following uneven lighting across a photo. At the middle of the slider the paper alone is cleared; to the left it fades only partly, and to the right colors close to the paper's fade too. Like Opacity, it changes only the view, not exports.</li>
-        <li><b>Isolate color</b> shows only the lines of one color, such as red ink or grey pencil contours among black engraved hatching. Press <b>Pick</b> and point at a line: the image shows as it is, but for a circle around the pointer that shows only lines of the color under it, so you can see when you're on the one you mean. Click to keep it. Then <b>Also hide</b> can take a second color out the same way, such as red lines when you're after the pencil. Black ink is always hidden, even where it crosses the line. The lines are drawn as ink that tints the map under them, as faint or heavy as on the image, so thin lines that fall across parts of pixels still show. The slider sets how strongly, and the color box the color of the ink. Drag the slider to 0 to turn it off. Like Hide paper, it changes only the view, not exports.</li>
+        <li><b>Isolate color</b> shows only the lines of one color, such as red ink or grey pencil contours among black engraved hatching. Press <b>Pick</b> and point at a line: the image shows as it is, but for a circle around the pointer that shows only lines of the color under it, so you can see when you're on the one you mean. Click to keep it. Then <b>Also hide</b> can take a second color out the same way, such as red lines when you're after the pencil. Black ink is always hidden, even where it crosses the line. The lines are drawn as ink that tints the map under them, as faint or heavy as on the image, so thin lines that fall across parts of pixels still show. The slider sets how strongly. Drag the slider to 0 to turn it off. Like Hide paper, it changes only the view, not exports.</li>
+        <li><b>Tint</b> draws the image's lines in one color, magenta unless you choose another, so they stand out from the map's own lines when you line them up. The paper stays light. It works with Isolate color too. Like Opacity, it changes only the view, not exports.</li>
         <li><b>Undo</b> with <kbd>⌘</kbd>/<kbd>Ctrl</kbd>-<kbd>Z</kbd>, <b>redo</b> with <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> or <kbd>Ctrl</kbd>-<kbd>Y</kbd>. Undo covers all the layers: each drag, each added or removed point, and each added, removed or moved image is one step.</li>
         <li><b>Export</b> saves that layer's warped image, north-up. PNG and GeoTIFF are in Web Mercator; KMZ opens in Google Earth. The placement and control points are stored inside, so dropping the file back on the map puts it in the same place.</li>
         <li><b>Include unwarped image</b>, on unless you untick it, also puts the image as you loaded it inside the export. That makes the file bigger, but dropping it back on the map then loads the unwarped image with its control points, rather than the warped one, so editing and exporting again and again never blurs it.</li>

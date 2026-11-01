@@ -204,6 +204,7 @@ uniform vec2 u_dtexel;  // and of u_detail, in v_duv
 uniform vec3 u_lens;    // centre and radius, in framebuffer pixels, of the
                         // preview circle
 uniform float u_lensSide;  // 1 to draw only inside it, -1 only outside, 0 all
+uniform vec4 u_tint;    // the layer's tint, with a = 1 for on
 varying vec2 v_uv;
 varying vec2 v_duv;
 const vec3 EPS = vec3(1.0 / 255.0);
@@ -259,6 +260,14 @@ void main() {
     vec3 col = div > 0.0 ? clamp(p + (c - p) / div, 0.0, 1.0) : p;
     t = vec4(col, 1.0) * (a * t.a);
   }
+  if (u_tint.a > 0.0 && t.a > 0.0) {
+    // Tinted, the image's darkness, measured from its paper, is drawn in the
+    // tint: the paper stays light and the ink takes the tint's color.
+    const vec3 LUM = vec3(0.299, 0.587, 0.114);
+    float paper = dot(texture2D(u_paper, v_uv).rgb, LUM);
+    float dark = clamp(1.0 - dot(t.rgb / t.a, LUM) / max(paper, 0.05), 0.0, 1.0);
+    t = vec4(1.0 - dark * (1.0 - u_tint.rgb), 1.0) * t.a;
+  }
   gl_FragColor = t * u_opacity;
 }`;
 
@@ -296,6 +305,7 @@ class MeshRenderer {
     this.uDTexel = gl.getUniformLocation(p, 'u_dtexel');
     this.uLens = gl.getUniformLocation(p, 'u_lens');
     this.uLensSide = gl.getUniformLocation(p, 'u_lensSide');
+    this.uTint = gl.getUniformLocation(p, 'u_tint');
     this.uDetail = gl.getUniformLocation(p, 'u_detail');
     this.uDetailRect = gl.getUniformLocation(p, 'u_detailRect');
     this.uHasDetail = gl.getUniformLocation(p, 'u_hasDetail');
@@ -394,22 +404,24 @@ class MeshRenderer {
   // `hide` is the Hide paper amount, 0 for off; `iso` is the Isolate color
   // settings, {amount, w, color}, or null for off, and `lens` the circle
   // [x, y, r] in framebuffer pixels to isolate within, or null for all.
-  draw(m, matrix, opacity, hide = 0, iso = null, lens = null) {
+  // `tint` is the layer's tint color, RGB 0..1, or null for none; outside
+  // the lens, the image shows untinted.
+  draw(m, matrix, opacity, hide = 0, iso = null, lens = null, tint = null) {
     if (!m.tex || !m.count) return;
     const isoOn = iso && iso.amount > 0 && iso.w && m.paperTex;
     if (!isoOn) {
-      this.pass(m, matrix, opacity, hide, null, null, 0);
+      this.pass(m, matrix, opacity, hide, null, null, 0, lens ? null : tint);
     } else if (lens) {
-      this.pass(m, matrix, opacity, hide, null, lens, -1);
-      this.pass(m, matrix, opacity, hide, iso, lens, 1);
+      this.pass(m, matrix, opacity, hide, null, lens, -1, null);
+      this.pass(m, matrix, opacity, hide, iso, lens, 1, tint);
     } else {
-      this.pass(m, matrix, opacity, hide, iso, null, 0);
+      this.pass(m, matrix, opacity, hide, iso, null, 0, tint);
     }
   }
 
   // One drawing of the mesh: isolated if `iso`, within or outside `lens` by
-  // `side` (as u_lensSide).
-  pass(m, matrix, opacity, hide, iso, lens, side) {
+  // `side` (as u_lensSide), and tinted if `tint`.
+  pass(m, matrix, opacity, hide, iso, lens, side, tint) {
     const gl = this.gl;
     gl.useProgram(this.program);
     gl.uniformMatrix4fv(this.uMatrix, false, matrix);
@@ -423,7 +435,8 @@ class MeshRenderer {
     gl.uniform2fv(this.uIso, iso ? isolateGain(iso.amount) : [0, 0]);
     const scale = iso ? iso.showD.reduce((a, b) => a + b) : 0;
     gl.uniform3fv(this.uIsoW, iso ? iso.w.map(x => x * scale) : [0, 0, 0]);
-    gl.uniform3fv(this.uIsoInk, iso ? inkDensity(iso.color) : [0, 0, 0]);
+    gl.uniform3fv(this.uIsoInk, iso ? inkDensity(tint || iso.color) : [0, 0, 0]);
+    gl.uniform4fv(this.uTint, tint && !iso ? [...tint, 1] : [0, 0, 0, 0]);
     gl.uniform4fv(this.uBlack, iso ? blackThresholds(iso.showD) : [0, 1, 0, 1]);
     gl.uniform2fv(this.uTexel, m.texel || [0, 0]);
     gl.uniform2fv(this.uDTexel, m.detailTex && m.dtexel ? m.dtexel : [0, 0]);
@@ -545,7 +558,7 @@ const imageLayer = {
       // pick around the pointer.
       const picking = state.picking === L;
       r.draw(L.gpu, rebaseMatrix(matrix, L.origin[0], L.origin[1]), opacity, L.hidePaper,
-        picking ? L.preview : L.isolate, picking ? lensCircle() : null);
+        picking ? L.preview : L.isolate, picking ? lensCircle() : null, L.tint.on ? L.tint.color : null);
     }
   },
 };
@@ -1787,6 +1800,9 @@ async function loadImage(files, dropPoint) {
   };
 }
 
+// Magenta: unlike the black, blue and brown of base maps and old maps.
+const TINT_DEFAULT = [0.85, 0, 0.5];
+
 function newLayer(image, T, points) {
   return {
     id: nextLayerId++,
@@ -1797,6 +1813,8 @@ function newLayer(image, T, points) {
     warp: null, mesh: null, fine: null, origin: [0, 0],
     opacity: 1,
     hidePaper: 0,
+    // Tint: the image's ink drawn in one color, to tell it from the map.
+    tint: { on: false, color: TINT_DEFAULT },
     // Isolate color: {amount (0 for off), w (isolateWeights), showD and hideD
     // (the densities picked to show and hide), color (to draw in), picked
     // and hidden (the colors picked)}, and while picking, the same for the
@@ -2604,9 +2622,6 @@ function syncIsolate(L) {
   q('.isolate').value = iso.amount;
   q('.isolate').disabled = !iso.w;
   // Nothing to color, nor to hide as well, until there's a color to show.
-  q('.isolate-color').hidden = !iso.w;
-  if (iso.color) q('.isolate-color').value = toHex(iso.color);
-  q('.isolate-color').title = iso.picked ? `Drawn in this color. Picked: ${toHex(iso.picked)}` : '';
   q('.isolate-pick').textContent = picking && !state.pickHide ? 'Cancel' : 'Pick';
   q('.hide-row').hidden = !iso.showD;
   q('.hidden-swatch').hidden = !iso.hidden;
@@ -2689,15 +2704,26 @@ function layerCard(L) {
   hide.disabled = !paper;
   q('.swatch').style.background = paper ? `rgb(${paper.colour.join(',')})` : 'transparent';
   q('.swatch').title = paper ? `Paper color: rgb(${paper.colour.join(', ')})` : '';
-  const iso = q('.isolate'), isoColor = q('.isolate-color'), pick = q('.isolate-pick');
+  const iso = q('.isolate'), pick = q('.isolate-pick');
   iso.id = `isolate-${L.id}`;
   q('.isolate-label').htmlFor = iso.id;
   iso.addEventListener('input', () => {
     L.isolate.amount = Number(iso.value);
     map.triggerRepaint();
   });
-  isoColor.addEventListener('input', () => {
-    L.isolate.color = fromHex(isoColor.value);
+  const tintOn = q('.tint-on'), tint = q('.tint');
+  tintOn.id = `tint-${L.id}`;
+  q('.tint-label').htmlFor = tintOn.id;
+  tintOn.checked = L.tint.on;
+  tint.value = toHex(L.tint.color);
+  tintOn.addEventListener('change', () => {
+    L.tint.on = tintOn.checked;
+    map.triggerRepaint();
+  });
+  // Choosing a color turns the tint on.
+  tint.addEventListener('input', () => {
+    L.tint = { on: true, color: fromHex(tint.value) };
+    tintOn.checked = true;
     map.triggerRepaint();
   });
   // Pick, or while picking that, cancel.
