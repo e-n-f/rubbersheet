@@ -7,9 +7,9 @@ import {
   sampleMesh,
   refineMesh, invertDrawn, meshTriangles, refinedSoup,
 } from '../js/warp.js';
-import { addTextChunk, readTextChunks } from '../js/png-text.js';
+import { addChunk, addTextChunk, readChunk, readTextChunks } from '../js/png-text.js';
 import { makeZip, readZip } from '../js/zip.js';
-import { isTIFF, readGeoTIFF, writeGeoTIFF } from '../js/tiff.js';
+import { isTIFF, readGeoTIFF, readTIFFTags, writeGeoTIFF } from '../js/tiff.js';
 import { crsFromGeoKeys, ELLIPSOIDS, utm, polyconic, lambertConformalConic } from '../js/proj.js';
 
 const close = (a, b, eps = 1e-12) => assert.ok(Math.abs(a - b) <= eps, `${a} != ${b}`);
@@ -171,12 +171,25 @@ test('similarity about pivot fixes the pivot', () => {
   close(x2, 5); close(y2, 6);
 });
 
+// 1x1 transparent PNG
+const MINIMAL_PNG = Uint8Array.from(Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64'));
+
 test('PNG text chunk round-trips', () => {
-  // 1x1 transparent PNG
-  const png = Uint8Array.from(Buffer.from(
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64'));
+  const png = MINIMAL_PNG;
   const out = addTextChunk(png, 'rubbersheet', '{"a":"é"}');
   assert.deepEqual(JSON.parse(readTextChunks(out).rubbersheet), { a: 'é' });
+});
+
+test('a private PNG chunk round-trips alongside the text chunk', () => {
+  const png = addTextChunk(MINIMAL_PNG, 'rubbersheet', '{"a":1}');
+  const data = new Uint8Array(5000).map((_, k) => (k * 7) & 255);
+  const out = addChunk(png, 'rsOr', data);
+  assert.deepEqual([...readChunk(out, 'rsOr')], [...data]);
+  assert.equal(readTextChunks(out).rubbersheet, '{"a":1}');
+  assert.equal(readChunk(png, 'rsOr'), null);
+  // Still ends with IEND.
+  assert.equal(String.fromCharCode(...out.subarray(out.length - 8, out.length - 4)), 'IEND');
 });
 
 test('lng/lat <-> Mercator round-trips and matches known values', () => {
@@ -222,6 +235,15 @@ test('GeoTIFF round-trips pixels and georeferencing', async () => {
   assert.deepEqual(t.scale, [12.5, 12.5]);
   assert.deepEqual(t.origin, [-13627000, 4562000]);
   assert.equal(t.description, '{"generator":"rubbersheet"}');
+
+  // A private tag holding bytes, readable without decoding the pixels.
+  const blob = new Uint8Array(1234).map((_, k) => (k * 11) & 255);
+  const withTag = await writeGeoTIFF({
+    width: W, height: H, rgba, epsg: 3857, scale: [12.5, 12.5], origin: [-13627000, 4562000],
+    description: 'x', extraTags: [{ tag: 65123, bytes: blob }],
+  });
+  assert.deepEqual([...readTIFFTags(withTag)[65123]], [...blob]);
+  assert.deepEqual([...(await readGeoTIFF(withTag)).rgba], [...rgba]);
 });
 
 test('GeoTIFF reads a GDAL file: tiled, LZW, predictor 2, EPSG:4326', async () => {

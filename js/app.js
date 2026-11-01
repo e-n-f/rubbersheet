@@ -4,14 +4,20 @@ import {
   EARTH_CIRCUMFERENCE, mercToMeters, similarityAboutPivot, translateAffine, worldFileToAffine,
   sampleMesh, refineMesh, invertDrawn, refinedSoup,
 } from './warp.js';
-import { addTextChunk, isPNG, readTextChunks } from './png-text.js';
+import { addChunk, addTextChunk, isPNG, readChunk, readTextChunks } from './png-text.js';
 import { makeZip, readZip } from './zip.js';
-import { isTIFF, readGeoTIFF, writeGeoTIFF } from './tiff.js';
+import { isTIFF, readGeoTIFF, readTIFFTags, writeGeoTIFF } from './tiff.js';
 import { crsFromGeoKeys } from './proj.js';
 import { estimatePaper, paperThresholds } from './paper.js';
 
 const maplibregl = window.maplibregl;
 const META_KEY = 'rubbersheet';
+// Where an export keeps the unwarped image, when asked to: a private PNG
+// chunk (ancillary, private, safe to copy), a private TIFF tag, or a folder
+// in a KMZ.
+const ORIGINAL_CHUNK = 'rsOr';
+const ORIGINAL_TAG = 65123;
+const ORIGINAL_DIR = 'unwarped/';
 const DISPLAY_CELLS = 64;
 const EXPORT_CELLS = 256;
 const HIT_RADIUS = 11;
@@ -224,7 +230,10 @@ class MeshRenderer {
     return { tex: null, paperTex: null, posBuf: gl.createBuffer(), uvBuf: gl.createBuffer(), count: 0 };
   }
 
-  setTexture(m, source) {
+  // Mipmaps (with anisotropic filtering) only if `mip`: they blur an image
+  // drawn at about its own size, where the GPU's estimate of the scale can
+  // pick a smaller level, as it can for a rotated image.
+  setTexture(m, source, mip = true) {
     const gl = this.gl;
     if (m.tex) gl.deleteTexture(m.tex);
     m.tex = gl.createTexture();
@@ -236,7 +245,7 @@ class MeshRenderer {
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     const pot = (n) => (n & (n - 1)) === 0;
     const isGL2 = typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext;
-    const mip = isGL2 || (pot(source.width) && pot(source.height));
+    mip &&= isGL2 || (pot(source.width) && pot(source.height));
     if (mip) gl.generateMipmap(gl.TEXTURE_2D);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mip ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -1253,6 +1262,14 @@ $('file').addEventListener('change', (e) => {
   if (files.length) loadFiles(files, null);
 });
 
+// 'png', 'jpg' or 'webp' from a file's first bytes, or null.
+function imageType(b) {
+  if (isPNG(b)) return 'png';
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'jpg';
+  if (String.fromCharCode(...b.subarray(0, 4)) === 'RIFF' && String.fromCharCode(...b.subarray(8, 12)) === 'WEBP') return 'webp';
+  return null;
+}
+
 function decodeImage(file) {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
@@ -1312,9 +1329,10 @@ async function loadImage(files, dropPoint) {
   let imageFile = files.find(isImageFile);
   let kmlText = '';
   const kmzFile = files.find(f => KMZ_RE.test(f.name));
+  let kmzOriginal = null;
   if (!imageFile && kmzFile) {
     try {
-      ({ imageFile, kmlText } = await unpackKMZ(kmzFile));
+      ({ imageFile, kmlText, original: kmzOriginal } = await unpackKMZ(kmzFile));
     } catch (err) {
       console.warn(err);
       return { message: `Could not read <b>${escapeHTML(kmzFile.name)}</b>: ${escapeHTML(err.message)}`, error: true };
@@ -1324,6 +1342,11 @@ async function loadImage(files, dropPoint) {
   const worldFile = files.find(f => WORLD_RE.test(f.name));
   const crsFile = files.find(f => /\.(prj|aux\.xml)$/i.test(f.name));
   const bytes = new Uint8Array(await imageFile.arrayBuffer());
+
+  // An export with its unwarped image inside: work from that instead.
+  const unwarped = await loadUnwarped(bytes, kmzOriginal);
+  if (unwarped) return unwarped;
+
   let img, tiff = null;
   try {
     if (isTIFF(bytes)) {
@@ -1382,18 +1405,12 @@ async function loadImage(files, dropPoint) {
     placement = { T: dropPlacement(dropPoint, W, H), points: [] };
   }
 
-  const layer = {
-    id: nextLayerId++,
-    image: { name: imageFile.name, img: source, W, H, paper: findPaper(source) },
-    url: null,
-    T: placement.T,
-    points: placement.points,
-    warp: null, mesh: null, fine: null, origin: [0, 0],
-    opacity: 1,
-    hidePaper: 0,
-    gpu: null, texDirty: true, meshDirty: true,
-    card: null,
-  };
+  // `bytes`: the file, for embedding as the unwarped image, if the browser
+  // decodes it as it is and the layer shows it as it is.
+  const layer = newLayer({
+    name: imageFile.name, img: source, W, H, paper: findPaper(source),
+    bytes: source === img && imageType(bytes) ? bytes : null,
+  }, placement.T, placement.points);
   return {
     layer,
     placed: !!(placement.points.length || how),
@@ -1401,6 +1418,63 @@ async function loadImage(files, dropPoint) {
       (problem ? ` ${escapeHTML(problem)}` : ''),
     error: !!problem,
   };
+}
+
+function newLayer(image, T, points) {
+  return {
+    id: nextLayerId++,
+    image,
+    url: null,
+    T,
+    points,
+    warp: null, mesh: null, fine: null, origin: [0, 0],
+    opacity: 1,
+    hidePaper: 0,
+    gpu: null, texDirty: true, meshDirty: true,
+    card: null,
+  };
+}
+
+// The layer for an export that has its unwarped image embedded (see
+// ORIGINAL_CHUNK), placed and with its control points as when it was
+// exported; null if there isn't one, or it can't be used.
+async function loadUnwarped(bytes, kmzOriginal) {
+  let text = null, original = null;
+  try {
+    if (isPNG(bytes)) {
+      text = readTextChunks(bytes)[META_KEY];
+      original = kmzOriginal || readChunk(bytes, ORIGINAL_CHUNK);
+    } else if (isTIFF(bytes)) {
+      const tags = readTIFFTags(bytes);
+      text = tags[270];
+      original = tags[ORIGINAL_TAG];
+    }
+    if (!text || !original || !imageType(original)) return null;
+    const meta = JSON.parse(text);
+    const { source, sourceWorldFile } = meta;
+    if (meta.generator !== 'rubbersheet' || !source || !Array.isArray(sourceWorldFile)) return null;
+    const name = source.name || `image.${imageType(original)}`;
+    // A copy, so the layer doesn't keep the whole export alive.
+    const own = original.slice();
+    const img = await decodeImage(new File([own], name));
+    const W = img.naturalWidth, H = img.naturalHeight;
+    if (W !== source.width || H !== source.height) return null;
+    const points = (meta.controlPoints || []).map(cp => {
+      const [x, y] = toMerc({ lng: cp.lngLat[0], lat: cp.lngLat[1] });
+      return { u: cp.sourcePixel[0], v: cp.sourcePixel[1], x, y, ...(cp.anchor === 'world' ? { world: true } : {}) };
+    });
+    const layer = newLayer({ name, img, W, H, paper: findPaper(img), bytes: own },
+      worldFileToAffine(sourceWorldFile), points);
+    return {
+      layer,
+      placed: true,
+      message: `<b>${escapeHTML(name)}</b> (${W}×${H}), from the unwarped image inside the export, placed as it was.`,
+      error: false,
+    };
+  } catch (err) {
+    console.warn(err);
+    return null;
+  }
 }
 
 // The paper's colour across an image (estimatePaper), found on a copy at most
@@ -1649,11 +1723,12 @@ async function unpackKMZ(file) {
       entry = entries.find(e => e.name === path || e.name === href);
     }
   }
-  entry ||= entries.find(e => IMAGE_RE.test(e.name));
+  entry ||= entries.find(e => IMAGE_RE.test(e.name) && !e.name.startsWith(ORIGINAL_DIR));
   if (!entry) throw new Error('no PNG, JPEG or WebP image inside.');
   const name = entry.name.split('/').pop();
   const type = MIME[name.split('.').pop().toLowerCase()] || '';
-  return { imageFile: new File([entry.data], name, { type }), kmlText };
+  const original = entries.find(e => e.name.startsWith(ORIGINAL_DIR))?.data || null;
+  return { imageFile: new File([entry.data], name, { type }), kmlText, original };
 }
 
 // ---------------------------------------------------------------------------
@@ -1697,6 +1772,7 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
   maxSide = Math.min(maxSide, MAX_EXPORT_SIDE);
 
   // Keep roughly the source resolution, within the export limits.
+  const px0 = px, py0 = py;
   let ow, oh;
   for (;;) {
     ow = Math.max(1, Math.ceil((maxX - minX) / px));
@@ -1723,7 +1799,10 @@ async function rasterize(mesh, pos, px, py, maxSide = Infinity, output = 'png', 
   const origin = [minX + spanX / 2, minY + oh * py / 2];
   const renderer = new MeshRenderer(gl);
   const gpu = renderer.create();
-  renderer.setTexture(gpu, textureSource(img, gl.getParameter(gl.MAX_TEXTURE_SIZE)));
+  // Mipmaps only when the image is shrunk to fit the limits: at the source's
+  // own resolution they'd only blur it.
+  const shrunk = px > px0 * 1.01 || py > py0 * 1.01;
+  renderer.setTexture(gpu, textureSource(img, gl.getParameter(gl.MAX_TEXTURE_SIZE)), shrunk);
   renderer.setTriangles(gpu, meshTriangles({ ...mesh, pos }, origin));
   gl.viewport(0, 0, ow, sh);
   gl.clearColor(0, 0, 0, 0);
@@ -1796,7 +1875,28 @@ function exportMesh(snap, minCells) {
 // What an export works from, copied when it starts: the export yields to the
 // browser to show its progress, and the image may be edited meanwhile.
 function exportSnapshot(L) {
-  return { image: L.image, warp: L.warp, points: L.points.map(p => ({ ...p })) };
+  return {
+    image: L.image, warp: L.warp, T: L.T.slice(), points: L.points.map(p => ({ ...p })),
+    embed: $('include-original').checked,
+  };
+}
+
+// The unwarped image's file, to embed: the bytes it was loaded from when the
+// browser can decode them as they are, otherwise the image as a PNG.
+async function unwarpedBytes(image) {
+  if (image.bytes) return image.bytes;
+  await exportProgress('Encoding unwarped image');
+  const { img, W, H } = image;
+  let c = img;
+  if (!(img instanceof HTMLCanvasElement)) {
+    c = document.createElement('canvas');
+    c.width = W;
+    c.height = H;
+    c.getContext('2d').drawImage(img, 0, 0);
+  }
+  const blob = await new Promise((resolve, reject) =>
+    c.toBlob(b => (b ? resolve(b) : reject(new Error('could not encode the unwarped image'))), 'image/png'));
+  return new Uint8Array(await blob.arrayBuffer());
 }
 
 // Metadata for an exported raster. `toPixel` maps Mercator units to its
@@ -1811,7 +1911,10 @@ function exportMetadata(snap, crs, ow, oh, worldFile, bounds, toPixel) {
     height: oh,
     worldFile,
     bounds,
-    source: { name, width: W, height: H },
+    source: { name, width: W, height: H, ...(snap.embed ? { embedded: true } : {}) },
+    // The unwarped image's placement, in EPSG:3857 whatever `crs` is, so it
+    // can be put back exactly when it's embedded.
+    sourceWorldFile: affineToWorldFile(snap.T),
     controlPoints: snap.points.map(p => {
       const ll = toLngLat([p.x, p.y]);
       return {
@@ -1837,7 +1940,8 @@ async function exportImage(snap) {
   const nw = toLngLat([minX, minY]), se = toLngLat([minX + ow * ps, minY + oh * ps]);
   const meta = exportMetadata(snap, 'EPSG:3857', ow, oh, worldFile, [nw.lng, se.lat, se.lng, nw.lat],
     (x, y) => [(x - minX) / ps, (y - minY) / ps]);
-  const bytes = addTextChunk(r.bytes, META_KEY, JSON.stringify(meta));
+  let bytes = addTextChunk(r.bytes, META_KEY, JSON.stringify(meta));
+  if (snap.embed) bytes = addChunk(bytes, ORIGINAL_CHUNK, await unwarpedBytes(snap.image));
   const base = exportBaseName(snap);
   download(new Blob([bytes], { type: 'image/png' }), `${base}.png`);
   if ($('worldfile').checked) {
@@ -1859,12 +1963,14 @@ async function exportGeoTIFF(snap) {
   const meta = exportMetadata(snap, 'EPSG:3857', ow, oh, worldFile, [nw.lng, se.lat, se.lng, nw.lat],
     (x, y) => [(x - minX) / ps, (y - minY) / ps]);
   const size = ps * EARTH_CIRCUMFERENCE;
+  const extraTags = snap.embed ? [{ tag: ORIGINAL_TAG, bytes: await unwarpedBytes(snap.image) }] : [];
   await exportProgress('Compressing');
   const tiff = await writeGeoTIFF({
     width: ow, height: oh, rgba: r.bytes, epsg: 3857,
     scale: [size, size], origin: mercToMeters(minX, minY),
     description: JSON.stringify(meta).replace(/[^\x20-\x7e]/g,
       ch => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0')),
+    extraTags,
   });
   const base = exportBaseName(snap);
   download(new Blob([tiff], { type: 'image/tiff' }), `${base}.tif`);
@@ -1913,11 +2019,18 @@ async function exportKMZ(snap) {
   </GroundOverlay>
 </kml>
 `;
-  await exportProgress('Zipping');
-  const zip = makeZip([
+  const entries = [
     { name: 'doc.kml', data: new TextEncoder().encode(kml) },
     { name: imageName, data: png },
-  ]);
+  ];
+  if (snap.embed) {
+    // Google Earth ignores the other files in a KMZ.
+    const data = await unwarpedBytes(snap.image);
+    const stem = snap.image.name.replace(/\.[^.]+$/, '').replace(/[^\w.-]+/g, '_') || 'image';
+    entries.push({ name: `${ORIGINAL_DIR}${stem}.${imageType(data) || 'png'}`, data });
+  }
+  await exportProgress('Zipping');
+  const zip = makeZip(entries);
   download(new Blob([zip], { type: 'application/vnd.google-earth.kmz' }), `${base}.kmz`);
   setStatus(`Exported <b>${escapeHTML(base)}.kmz</b> (${ow}×${oh}).`);
 }

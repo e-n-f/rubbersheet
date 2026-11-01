@@ -7,7 +7,7 @@
 // in, since that needs a browser), with or without the horizontal predictor.
 // That covers rubbersheet's own files, GDAL's usual output and USGS scans.
 
-const SHORT = 3, LONG = 4, ASCII = 2, DOUBLE = 12;
+const SHORT = 3, LONG = 4, ASCII = 2, DOUBLE = 12, UNDEFINED = 7;
 const TYPE_SIZE = { 1: 1, 2: 1, 3: 2, 4: 4, 6: 1, 7: 1, 8: 2, 9: 4, 11: 4, 12: 8, 16: 8 };
 
 const TAG = {
@@ -87,8 +87,9 @@ export function isTIFF(bytes) {
 
 // rgba: Uint8Array of width*height*4, unassociated alpha, top row first.
 // scale: [x, y] size of a pixel in CRS units; origin: [x, y] of the top-left
-// corner of the top-left pixel. epsg: 3857 or 4326.
-export async function writeGeoTIFF({ width, height, rgba, scale, origin, epsg, description }) {
+// corner of the top-left pixel. epsg: 3857 or 4326. extraTags: [{tag, bytes}]
+// written as UNDEFINED, for private tags (65000 and up).
+export async function writeGeoTIFF({ width, height, rgba, scale, origin, epsg, description, extraTags = [] }) {
   const rowBytes = width * 4;
   const rowsPerStrip = Math.max(1, Math.floor((256 * 1024) / rowBytes));
   const strips = [];
@@ -126,6 +127,7 @@ export async function writeGeoTIFF({ width, height, rgba, scale, origin, epsg, d
     [TAG.ModelPixelScale, DOUBLE, [scale[0], scale[1], 0]],
     [TAG.ModelTiepoint, DOUBLE, [0, 0, 0, origin[0], origin[1], 0]],
     [TAG.GeoKeyDirectory, SHORT, geoKeys],
+    ...extraTags.sort((a, b) => a.tag - b.tag).map(({ tag, bytes }) => [tag, UNDEFINED, bytes]),
   ];
 
   // Layout: header, strips, IFD, then values too big to sit in the IFD.
@@ -141,7 +143,7 @@ export async function writeGeoTIFF({ width, height, rgba, scale, origin, epsg, d
   let extra = ifdOffset + 2 + entries.length * 12 + 4;
   const enc = new TextEncoder();
   const encoded = entries.map(([tag, type, values]) => {
-    const bytes = type === ASCII ? enc.encode(values + '\0') : null;
+    const bytes = type === ASCII ? enc.encode(values + '\0') : type === UNDEFINED ? values : null;
     const count = bytes ? bytes.length : values.length;
     const size = count * TYPE_SIZE[type];
     let at = null;
@@ -178,11 +180,9 @@ export async function writeGeoTIFF({ width, height, rgba, scale, origin, epsg, d
   return out;
 }
 
-// Returns {width, height, rgba, scale, origin, epsg, description}. scale,
-// origin and epsg are undefined when the file doesn't say.
-// decodeJPEG(bytes) -> Promise<{width, height, rgba}> decodes one JPEG; it is
-// only needed for JPEG-compressed files.
-export async function readGeoTIFF(bytes, decodeJPEG = null) {
+// The first image's tags, by number, without decoding its pixels: ASCII
+// tags as strings, BYTE and UNDEFINED ones as byte arrays, numbers as arrays.
+export function readTIFFTags(bytes) {
   if (!isTIFF(bytes)) throw new Error('Not a TIFF');
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const le = bytes[0] === 0x49;
@@ -207,6 +207,17 @@ export async function readGeoTIFF(bytes, decodeJPEG = null) {
     }
     tags[tag] = type === 1 || type === 7 ? bytes.subarray(at, at + count) : values;
   }
+  return tags;
+}
+
+// Returns {width, height, rgba, scale, origin, epsg, description}. scale,
+// origin and epsg are undefined when the file doesn't say.
+// decodeJPEG(bytes) -> Promise<{width, height, rgba}> decodes one JPEG; it is
+// only needed for JPEG-compressed files.
+export async function readGeoTIFF(bytes, decodeJPEG = null) {
+  const tags = readTIFFTags(bytes);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const le = bytes[0] === 0x49;
   const one = (t, d) => (tags[t] ? tags[t][0] : d);
   const width = one(TAG.ImageWidth), height = one(TAG.ImageLength);
   const spp = one(TAG.SamplesPerPixel, 1);

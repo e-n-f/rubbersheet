@@ -22,6 +22,7 @@ Map rubbersheeting in the browser. Drop a scanned map or photo onto a MapLibre b
 - **Export** saves that layer's warped image, north-up, in the format chosen under *Format*:
   - **GeoTIFF** (the default): a deflate-compressed RGBA GeoTIFF in Web Mercator (EPSG:3857), at about the source resolution. QGIS, ArcGIS and GDAL open it directly, with no side files.
   - **PNG**: the same image as a PNG, also in EPSG:3857.
+  - **Include unwarped image** puts the image as it was loaded inside the export as well: in a private PNG chunk (`rsOr`), a private GeoTIFF tag (65123), or a file under `unwarped/` in a KMZ. Other programs ignore it. Dropping the export back on the map then loads the unwarped image, placed and with its control points as when it was exported, instead of the warped pixels. Without it, each round of edit, export and re-import resamples the image again and blurs it a little more. The image is embedded as the file it was loaded from (a JPEG stays the same JPEG), or as a PNG if it was a TIFF or had to be reprojected.
   - **KMZ for Google Earth**: a KMZ you can open in, or drag into, Google Earth. Google Earth stretches an overlay evenly in latitude, so the image inside is in EPSG:4326 (plate carrée), not Mercator, with square pixels at its middle latitude. It is capped at 8192 pixels a side.
 
 How the image is fitted depends on the number of control points:
@@ -33,7 +34,7 @@ How the image is fitted depends on the number of control points:
 | 2 | The similarity transform (shift + scale + rotation) through both points |
 | 3+ | A least-squares similarity, then rigid Moving Least Squares (Schaefer et al. 2006) to bend the rest of the way. Every point lands exactly where you put it. |
 
-The warp is evaluated on a 64×64 grid and drawn as a textured mesh in a MapLibre custom WebGL layer, so it updates live while you drag. When you're zoomed in, the cells in view are split into pieces about 16 screen pixels across, evaluated exactly, and rebuilt whenever the warp changes or the map stops moving. Without that, the image near a control point that was moved a long way could be drawn tens of pixels from the point's marker. The export uses the same method on a 256×256 grid. Each cell is checked against the exact warp at its centre, its edge midpoints and any control point inside it. Cells off by more than a quarter of an output pixel are split 16 × 16, along with their neighbours, so the export stays that accurate even right next to a point moved far out of line with its neighbours. A whole cell next to split ones shares their edge vertices, so no hairline gaps open between them.
+The warp is evaluated on a 64×64 grid and drawn as a textured mesh in a MapLibre custom WebGL layer, so it updates live while you drag. When you're zoomed in, the cells in view are split into pieces about 16 screen pixels across, evaluated exactly, and rebuilt whenever the warp changes or the map stops moving. Without that, the image near a control point that was moved a long way could be drawn tens of pixels from the point's marker. The export uses the same method on a 256×256 grid, sampling the image bilinearly. It uses mipmaps only when the image has to be shrunk to fit the export size limits; at the source's own resolution they would blur it, since the GPU can pick a smaller level for a rotated or slightly squeezed image. Each cell is checked against the exact warp at its centre, its edge midpoints and any control point inside it. Cells off by more than a quarter of an output pixel are split 16 × 16, along with their neighbours, so the export stays that accurate even right next to a point moved far out of line with its neighbours. A whole cell next to split ones shares their edge vertices, so no hairline gaps open between them.
 
 ## Georeferencing metadata
 
@@ -47,14 +48,15 @@ Exported PNGs carry a `tEXt` chunk with the keyword `rubbersheet` holding JSON (
   "width": 892, "height": 687,
   "worldFile": [A, D, B, E, C, F],
   "bounds": [west, south, east, north],
-  "source": { "name": "old-map.png", "width": 800, "height": 600 },
+  "source": { "name": "old-map.png", "width": 800, "height": 600, "embedded": true },
+  "sourceWorldFile": [A, D, B, E, C, F],
   "controlPoints": [
     { "pixel": [x, y], "sourcePixel": [u, v], "lngLat": [lng, lat] }
   ]
 }
 ```
 
-`worldFile` uses the standard [world file](https://gdal.org/en/stable/drivers/raster/wld.html) parameters in the units of `crs`: EPSG:3857 metres for the PNG and GeoTIFF exports, and degrees (`"crs": "EPSG:4326"`) for the PNG inside a KMZ. `pixel` is the point's position in the exported image, and `sourcePixel` is its position in the original image. A world anchor also has `"anchor": "world"`. If you drop an exported PNG, GeoTIFF or KMZ (or the PNG from inside a KMZ) back on the map, it goes to the same place with its control points restored, so you can keep adjusting it. Images in any other projection are reprojected into Web Mercator when they are loaded, using the same mesh renderer as the export.
+`worldFile` uses the standard [world file](https://gdal.org/en/stable/drivers/raster/wld.html) parameters in the units of `crs`: EPSG:3857 metres for the PNG and GeoTIFF exports, and degrees (`"crs": "EPSG:4326"`) for the PNG inside a KMZ. `sourceWorldFile` is the original image's own placement before any bending, always in EPSG:3857 metres; with `embedded` it puts the embedded unwarped image back exactly. `pixel` is the point's position in the exported image, and `sourcePixel` is its position in the original image. A world anchor also has `"anchor": "world"`. If you drop an exported PNG, GeoTIFF or KMZ (or the PNG from inside a KMZ) back on the map, it goes to the same place with its control points restored, so you can keep adjusting it. Images in any other projection are reprojected into Web Mercator when they are loaded, using the same mesh renderer as the export.
 
 Tick *Also download world file* to get `name.pgw` and `name.png.aux.xml` (the CRS) next to the PNG. GDAL and QGIS can open the result directly. You can also drop an image together with its world file (`.wld`, `.pgw`, `.jgw`, …) and an optional `.prj` or `.aux.xml`. Images in EPSG:3857 and EPSG:4326 are placed from the world file. A KMZ from elsewhere is placed from its first GroundOverlay's `LatLonBox`, including its rotation.
 
