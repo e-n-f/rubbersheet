@@ -383,3 +383,55 @@ test('paper to alpha: the middle of the slider clears the paper alone', () => {
   assert.equal(paperToAlpha(pale, p, 1)[3], 0);
   assert.equal(paperToAlpha(ink, p, 1)[3], 1);
 });
+
+// ---------------------------------------------------------------------------
+// Isolate color
+
+import { estimateInk, density, pickDensity, isolateWeights, isolateAlpha, drawColor, toHex, fromHex } from '../js/isolate.js';
+
+test('isolate color: the picked ink shows, paper and dark ink do not', () => {
+  const paper = [0.76, 0.66, 0.44], ink = [0.14, 0.13, 0.12], red = [0.6, 0.3, 0.28];
+  const inkD = density(ink, paper);
+  // Around the click: paper, black ink, and a few red pixels.
+  const px = [];
+  const put = (c) => px.push(...c.map(x => Math.round(x * 255)), 255);
+  for (let n = 0; n < 20; n++) put(paper);
+  for (let n = 0; n < 10; n++) put(ink);
+  for (let n = 0; n < 5; n++) put(red);
+  const showD = pickDensity(Uint8Array.from(px), paper, inkD);
+  for (let n = 0; n < 3; n++) close(showD[n], density(red, paper)[n], 0.02);
+  const w = isolateWeights(showD, inkD);
+  const col = drawColor(showD);
+  const alpha = (c) => isolateAlpha([...c, 1], paper, w, col, 0.5)[3];
+  assert.equal(alpha(paper), 0);
+  assert.equal(alpha(ink), 0);
+  assert.equal(alpha(red), 1);
+  // Red under black ink: mostly black, but the red still counts.
+  const both = [0, 1, 2].map(n => red[n] * ink[n] / paper[n]);
+  assert.equal(alpha(both), 1);
+  // Paper alone and black alone give nothing to pick.
+  assert.equal(pickDensity(Uint8Array.from([...paper, 1].map(x => Math.round(x * 255))), paper, inkD), null);
+  // An ink like the black can't be told apart.
+  assert.equal(isolateWeights(inkD.map(x => x / 2), inkD), null);
+});
+
+test('isolate color: dark ink is the darkest pixels, not a black surround', () => {
+  const px = [];
+  for (let n = 0; n < 500; n++) px.push(0, 0, 0, 255);          // scanner bed
+  for (let n = 0; n < 1000; n++) px.push(190, 170, 110, 255);   // paper
+  for (let n = 0; n < 20; n++) px.push(36, 34, 30, 255);        // ink
+  const ink = estimateInk(Uint8Array.from(px));
+  close(ink[0], 36 / 255, 1e-9);
+  close(ink[2], 30 / 255, 1e-9);
+  assert.equal(toHex(fromHex('#a1b2c3')), '#a1b2c3');
+});
+
+test('paper color ignores a black surround larger than the paper', () => {
+  const w = 40, h = 40, px = new Uint8Array(w * h * 4);
+  for (let k = 0; k < px.length; k += 4) {
+    const inside = (k / 4) % w < 15;
+    px.set(inside ? [200, 180, 120, 255] : [3, 2, 4, 255], k);
+  }
+  const p = estimatePaper(px, w, h);
+  assert.deepEqual(p.colour, [200, 180, 120]);
+});

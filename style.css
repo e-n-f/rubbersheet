@@ -220,3 +220,15 @@ kbd {
 @media (max-width: 600px) {
   #panel { top: auto; bottom: 30px; width: auto; right: 10px; max-height: 45vh; }
 }
+
+.row .isolate-color {
+  flex: none;
+  width: 26px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid #b5bcc4;
+  border-radius: 3px;
+  background: none;
+}
+.row .isolate-pick { flex: none; }
+body.picking .maplibregl-canvas { cursor: crosshair !important; }
