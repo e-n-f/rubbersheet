@@ -1800,8 +1800,9 @@ async function loadImage(files, dropPoint) {
   };
 }
 
-// Magenta: unlike the black, blue and brown of base maps and old maps.
-const TINT_DEFAULT = [0.85, 0, 0.5];
+// Red: unlike the black, blue and brown of base maps and old maps, even to
+// colour-blind eyes, which lose magenta.
+const TINT_DEFAULT = [1, 0, 0];
 
 function newLayer(image, T, points) {
   return {
