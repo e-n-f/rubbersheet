@@ -439,8 +439,8 @@ const imageLayer = {
       if (L.meshDirty) {
         r.setTriangles(L.gpu, meshTriangles(L.mesh, L.origin, L.fine));
         L.meshDirty = false;
-        // What is drawn changed, so the detail no longer fits it.
-        L.detail = null;
+        // The detail is a piece of the source, so it stays right wherever
+        // the image is drawn; it may just no longer cover the view.
         scheduleDetail();
       }
       if (L.gpu.detailFor !== L.detail) {
@@ -461,28 +461,27 @@ const imageLayer = {
 // Detail: the display texture is at most DISPLAY_TEXTURE pixels a side, so a
 // larger image is drawn from a shrunk copy. Once nothing has changed for
 // DETAIL_IDLE_MS, each image gets a second texture, cut from the source at
-// the screen's resolution for just the part in view, and is drawn from that
-// until the map moves or the image changes. It also stands in for the
+// the screen's resolution for the part in view and a margin around it, and
+// is drawn from that wherever it reaches. Being a piece of the source, it
+// stays right however the map moves or the image bends; it is only replaced
+// when the view outgrows it or needs finer detail, and dropped when zooming
+// out leaves it much finer than the screen. It also stands in for the
 // mipmaps of an image drawn at about its own size, which blur it.
 
 const DISPLAY_TEXTURE = 4096;
 const DETAIL_IDLE_MS = 2000;
 const DETAIL_MAX_PIXELS = 24e6;
+// The margins tried, as fractions of the view's width and height on each
+// side, widest first: the widest that fits DETAIL_MAX_PIXELS at full
+// resolution is used. A detail is kept while it covers the view and
+// DETAIL_KEEP of this margin.
+const DETAIL_MARGINS = [1, 0.5, 0.25, 0];
+const DETAIL_KEEP = 0.25;
 let detailTimer = 0;
 
 function scheduleDetail() {
   clearTimeout(detailTimer);
   detailTimer = setTimeout(makeDetails, DETAIL_IDLE_MS);
-}
-
-function dropDetails() {
-  clearTimeout(detailTimer);
-  let any = false;
-  for (const L of state.layers) {
-    if (L.detail) any = true;
-    L.detail = null;
-  }
-  if (any) map.triggerRepaint();
 }
 
 function makeDetails() {
@@ -493,15 +492,30 @@ function makeDetails() {
   const maxSize = Math.min(8192, imageLayer.maxTexture || 4096);
   let changed = false;
   for (const L of state.layers) {
-    if (!L.mesh || !L.gpu || L.meshDirty || L.detail || !L.texScale) continue;
-    L.detail = detailFor(L, maxSize);
-    if (L.detail) changed = true;
+    if (!L.mesh || !L.gpu || L.meshDirty || !L.texScale) continue;
+    const detail = detailFor(L, maxSize);
+    if (detail !== L.detail) changed = true;
+    L.detail = detail;
   }
   if (changed) map.triggerRepaint();
 }
 
-// The crop of L's source in view, at the finest scale it is drawn at on
-// screen, or null if the display texture already has as much detail.
+// Zoomed out to where the detail is minified more than twice over, it
+// would shimmer without mipmaps: the display texture does better there.
+map.on('zoom', () => {
+  const z = map.getZoom();
+  for (const L of state.layers) {
+    if (L.detail && L.detail.s > 2 * L.detail.screenScale * 2 ** (z - L.detail.zoom)) {
+      L.detail = null;
+      map.triggerRepaint();
+    }
+  }
+});
+map.on('resize', scheduleDetail);
+
+// L's detail for the current view: its current one if that still serves,
+// a new crop of the source, or null if the display texture already has as
+// much detail.
 function detailFor(L, maxSize) {
   const { W, H, img } = L.image;
   const canvas = map.getCanvas();
@@ -510,7 +524,13 @@ function detailFor(L, maxSize) {
   const A = mercToScreenAffine();
   const { positions, uvs, count } = meshTriangles(L.mesh, L.origin, L.fine);
   const [ox, oy] = L.origin;
-  let u0 = Infinity, v0 = Infinity, u1 = -Infinity, v1 = -Infinity, scale = 0;
+  // Source pixel bounds of the view with each margin, and with DETAIL_KEEP
+  // of each.
+  const margins = [...DETAIL_MARGINS, ...DETAIL_MARGINS.map(m => m * DETAIL_KEEP)];
+  const bounds = margins.map(() => [Infinity, Infinity, -Infinity, -Infinity]);
+  const views = margins.map(m => [-m * w, -m * h, (1 + m) * w, (1 + m) * h]);
+  const [vx0, vy0, vx1, vy1] = views[0];
+  let scale = 0;
   const sx = new Float64Array(3), sy = new Float64Array(3);
   for (let t = 0; t < count; t += 3) {
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
@@ -521,16 +541,24 @@ function detailFor(L, maxSize) {
       minX = Math.min(minX, sx[k]); maxX = Math.max(maxX, sx[k]);
       minY = Math.min(minY, sy[k]); maxY = Math.max(maxY, sy[k]);
     }
-    if (maxX < 0 || minX > w || maxY < 0 || minY > h) continue;
+    if (maxX < vx0 || minX > vx1 || maxY < vy0 || minY > vy1) continue;
     const i = t * 2;
     const pu = [uvs[i] * W, uvs[i + 2] * W, uvs[i + 4] * W];
     const pv = [uvs[i + 1] * H, uvs[i + 3] * H, uvs[i + 5] * H];
-    // Only the part in view: a single triangle can cover far more.
-    for (const [, , u, v] of clipToView([0, 1, 2].map(k => [sx[k], sy[k], pu[k], pv[k]]), w, h)) {
-      u0 = Math.min(u0, u); u1 = Math.max(u1, u);
-      v0 = Math.min(v0, v); v1 = Math.max(v1, v);
-    }
-    // The triangle's screen pixels per source pixel, at its most stretched.
+    const tri = [0, 1, 2].map(k => [sx[k], sy[k], pu[k], pv[k]]);
+    // Only the part in each view: a single triangle can cover far more.
+    margins.forEach((m, n) => {
+      const b = bounds[n], [x0, y0, x1, y1] = views[n];
+      if (maxX < x0 || minX > x1 || maxY < y0 || minY > y1) return;
+      const whole = minX >= x0 && maxX <= x1 && minY >= y0 && maxY <= y1;
+      for (const [, , u, v] of whole ? tri : clipToView(tri, views[n])) {
+        b[0] = Math.min(b[0], u); b[1] = Math.min(b[1], v);
+        b[2] = Math.max(b[2], u); b[3] = Math.max(b[3], v);
+      }
+    });
+    if (maxX < 0 || minX > w || maxY < 0 || minY > h) continue;
+    // The triangle's screen pixels per source pixel, at its most stretched,
+    // over the view itself.
     const du1 = pu[1] - pu[0], dv1 = pv[1] - pv[0], du2 = pu[2] - pu[0], dv2 = pv[2] - pv[0];
     const det = du1 * dv2 - du2 * dv1;
     if (!det) continue;
@@ -541,28 +569,54 @@ function detailFor(L, maxSize) {
     const r = Math.sqrt((a * a + b * b - c * c - d * d) ** 2 / 4 + (a * c + b * d) ** 2);
     scale = Math.max(scale, Math.sqrt(q + r));
   }
-  if (!(u1 > u0) || !(v1 > v0)) return null;
   // Whole source pixels, with one to spare for the bilinear filter.
-  u0 = Math.max(0, Math.floor(u0) - 1); v0 = Math.max(0, Math.floor(v0) - 1);
-  u1 = Math.min(W, Math.ceil(u1) + 1); v1 = Math.min(H, Math.ceil(v1) + 1);
-  const cw = u1 - u0, ch = v1 - v0;
-  let s = Math.min(1, scale * dpr, maxSize / cw, maxSize / ch, Math.sqrt(DETAIL_MAX_PIXELS / (cw * ch)));
+  const crop = ([u0, v0, u1, v1]) => u1 > u0 && v1 > v0 ? [
+    Math.max(0, Math.floor(u0) - 1), Math.max(0, Math.floor(v0) - 1),
+    Math.min(W, Math.ceil(u1) + 1), Math.min(H, Math.ceil(v1) + 1)] : null;
+  const fit = ([u0, v0, u1, v1]) => {
+    const cw = u1 - u0, ch = v1 - v0;
+    return Math.min(1, maxSize / cw, maxSize / ch, Math.sqrt(DETAIL_MAX_PIXELS / (cw * ch)));
+  };
+  const inView = crop(bounds[DETAIL_MARGINS.length - 1]);
+  if (!inView || !scale) return null;
+  const want = Math.min(1, scale * dpr);
   // At the display texture's own scale or coarser there's nothing to gain,
   // unless it's being drawn from blurry mipmaps.
-  if (s <= L.texScale / 2 || (L.texScale >= 1 && s >= 1)) return null;
+  const useful = (s) => !(s <= L.texScale / 2 || (L.texScale >= 1 && s >= 1));
+  if (!useful(Math.min(want, fit(inView)))) return null;
+
+  // Keep the current detail if it is fine enough and covers enough.
+  const old = L.detail;
+  const contains = (r, b) => b && r[0] <= b[0] && r[1] <= b[1] && r[2] >= b[2] && r[3] >= b[3];
+  if (old) {
+    const keep = crop(bounds[DETAIL_MARGINS.length + old.margin]);
+    if (old.s >= Math.min(want, fit(inView)) * 0.95 && old.s <= 2 * want && contains(old.px, keep)) return old;
+  }
+
+  // The widest margin that fits at the resolution wanted, or else the view
+  // alone as fine as it fits.
+  let n = DETAIL_MARGINS.findIndex((m, k) => { const c = crop(bounds[k]); return c && fit(c) >= want; });
+  if (n < 0) n = DETAIL_MARGINS.length - 1;
+  const px = crop(bounds[n]);
+  const [u0, v0, u1, v1] = px;
+  const cw = u1 - u0, ch = v1 - v0;
+  const s = Math.min(want, fit(px));
   const c = document.createElement('canvas');
   c.width = Math.max(1, Math.round(cw * s));
   c.height = Math.max(1, Math.round(ch * s));
   const ctx = c.getContext('2d');
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(img, u0, v0, cw, ch, 0, 0, c.width, c.height);
-  return { source: c, rect: [u0 / W, v0 / H, u1 / W, v1 / H] };
+  return {
+    source: c, rect: [u0 / W, v0 / H, u1 / W, v1 / H], px, s, margin: n,
+    screenScale: scale * dpr, zoom: map.getZoom(),
+  };
 }
 
-// A polygon of [x, y, u, v] clipped to the screen rectangle 0..w × 0..h,
+// A polygon of [x, y, u, v] clipped to the screen rectangle [x0, y0, x1, y1],
 // with u and v interpolated along with x and y.
-function clipToView(poly, w, h) {
-  const edges = [[0, 1, 0], [0, -1, w], [1, 1, 0], [1, -1, h]];  // [axis, sign, bound]
+function clipToView(poly, [x0, y0, x1, y1]) {
+  const edges = [[0, 1, x0], [0, -1, x1], [1, 1, y0], [1, -1, y1]];  // [axis, sign, bound]
   for (const [axis, sign, bound] of edges) {
     const inside = (p) => sign * (p[axis] - bound) >= 0;
     const out = [];
@@ -579,9 +633,6 @@ function clipToView(poly, w, h) {
   }
   return poly;
 }
-
-map.on('movestart', dropDetails);
-map.on('resize', dropDetails);
 
 function freeGPU(L) {
   if (L.gpu && imageLayer.renderer) imageLayer.renderer.free(L.gpu);
