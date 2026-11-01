@@ -470,9 +470,12 @@ const imageLayer = {
 
 const DISPLAY_TEXTURE = 4096;
 const DETAIL_IDLE_MS = 2000;
-const DETAIL_MAX_PIXELS = 24e6;
+// Pixels for one layer's detail, and for all of them together: with
+// several large layers in view, each gets an even share.
+const DETAIL_MAX_PIXELS = 12e6;
+const DETAIL_TOTAL_PIXELS = 24e6;
 // The margins tried, as fractions of the view's width and height on each
-// side, widest first: the widest that fits DETAIL_MAX_PIXELS at full
+// side, widest first: the widest that fits the layer's pixels at full
 // resolution is used. A detail is kept while it covers the view and
 // DETAIL_KEEP of this margin.
 const DETAIL_MARGINS = [1, 0.5, 0.25, 0];
@@ -491,9 +494,17 @@ function makeDetails() {
   }
   const maxSize = Math.min(8192, imageLayer.maxTexture || 4096);
   let changed = false;
-  for (const L of state.layers) {
-    if (!L.mesh || !L.gpu || L.meshDirty || !L.texScale) continue;
-    const detail = detailFor(L, maxSize);
+  const ready = state.layers.filter(L => L.mesh && L.gpu && !L.meshDirty && L.texScale);
+  // An invisible layer, or one out of view, needs none.
+  const shown = ready.filter(L => L.opacity > 0 && meshInView(L.mesh));
+  for (const L of ready) {
+    if (shown.includes(L)) continue;
+    if (L.detail) changed = true;
+    L.detail = null;
+  }
+  const maxPixels = Math.min(DETAIL_MAX_PIXELS, DETAIL_TOTAL_PIXELS / Math.max(1, shown.length));
+  for (const L of shown) {
+    const detail = detailFor(L, maxSize, maxPixels);
     if (detail !== L.detail) changed = true;
     L.detail = detail;
   }
@@ -516,7 +527,16 @@ map.on('resize', scheduleDetail);
 // L's detail for the current view: its current one if that still serves,
 // a new crop of the source, or null if the display texture already has as
 // much detail.
-function detailFor(L, maxSize) {
+function meshInView(mesh) {
+  const canvas = map.getCanvas();
+  const [minX, minY, maxX, maxY] = meshBounds(mesh);
+  const pts = [[minX, minY], [maxX, minY], [minX, maxY], [maxX, maxY]].map(mercToScreen);
+  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+  return Math.max(...xs) >= 0 && Math.min(...xs) <= canvas.clientWidth &&
+    Math.max(...ys) >= 0 && Math.min(...ys) <= canvas.clientHeight;
+}
+
+function detailFor(L, maxSize, maxPixels) {
   const { W, H, img } = L.image;
   const canvas = map.getCanvas();
   const w = canvas.clientWidth, h = canvas.clientHeight;
@@ -575,7 +595,7 @@ function detailFor(L, maxSize) {
     Math.min(W, Math.ceil(u1) + 1), Math.min(H, Math.ceil(v1) + 1)] : null;
   const fit = ([u0, v0, u1, v1]) => {
     const cw = u1 - u0, ch = v1 - v0;
-    return Math.min(1, maxSize / cw, maxSize / ch, Math.sqrt(DETAIL_MAX_PIXELS / (cw * ch)));
+    return Math.min(1, maxSize / cw, maxSize / ch, Math.sqrt(maxPixels / (cw * ch)));
   };
   const inView = crop(bounds[DETAIL_MARGINS.length - 1]);
   if (!inView || !scale) return null;
@@ -590,7 +610,9 @@ function detailFor(L, maxSize) {
   const contains = (r, b) => b && r[0] <= b[0] && r[1] <= b[1] && r[2] >= b[2] && r[3] >= b[3];
   if (old) {
     const keep = crop(bounds[DETAIL_MARGINS.length + old.margin]);
-    if (old.s >= Math.min(want, fit(inView)) * 0.95 && old.s <= 2 * want && contains(old.px, keep)) return old;
+    const pixels = old.source.width * old.source.height;
+    if (old.s >= Math.min(want, fit(inView)) * 0.95 && old.s <= 2 * want && contains(old.px, keep) &&
+      pixels <= maxPixels * 1.01) return old;
   }
 
   // The widest margin that fits at the resolution wanted, or else the view
@@ -2355,6 +2377,7 @@ function setLayers(order) {
   }
   syncImageParam();
   map.triggerRepaint();
+  scheduleDetail();
   drawOverlay();
   updateUI();
 }
@@ -2398,6 +2421,7 @@ function layerCard(L) {
   opacity.addEventListener('input', () => {
     L.opacity = Number(opacity.value);
     map.triggerRepaint();
+    scheduleDetail();
   });
   hide.addEventListener('input', () => {
     L.hidePaper = Number(hide.value);
