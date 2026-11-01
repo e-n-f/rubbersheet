@@ -164,12 +164,19 @@ const VERTEX_SHADER = `
 attribute vec2 a_pos;
 attribute vec2 a_uv;
 uniform mat4 u_matrix;
+uniform vec4 u_detailRect;  // the detail texture's corner and 1 / size, in a_uv
 varying vec2 v_uv;
+varying vec2 v_duv;
 void main() {
   v_uv = a_uv;
+  // Here rather than in the fragment shader, where mediump can be too coarse
+  // for texture coordinates across a large image.
+  v_duv = (a_uv - u_detailRect.xy) * u_detailRect.zw;
   gl_Position = u_matrix * vec4(a_pos, 0.0, 1.0);
 }`;
 
+// Where u_hasDetail is set, the part of the image inside the detail texture
+// (setDetail) is drawn from it instead of u_tex.
 // With u_hide > 0, the paper (u_paper, a coarse grid of its colour across
 // the image) turns transparent: paperToAlpha in paper.js, which has the
 // details.
@@ -177,11 +184,18 @@ const FRAGMENT_SHADER = `
 precision mediump float;
 uniform sampler2D u_tex;
 uniform sampler2D u_paper;
+uniform sampler2D u_detail;
+uniform float u_hasDetail;
 uniform float u_opacity;
 uniform vec3 u_hide;  // paperThresholds, or 0 for off
 varying vec2 v_uv;
+varying vec2 v_duv;
 void main() {
+  // Both sampled, outside any branch, so the mipmap level stays well defined.
   vec4 t = texture2D(u_tex, v_uv);
+  vec4 dt = texture2D(u_detail, v_duv);
+  vec2 inside = step(0.0, v_duv) * step(v_duv, vec2(1.0));
+  t = mix(t, dt, u_hasDetail * inside.x * inside.y);
   if (u_hide.y > 0.0 && t.a > 0.0) {
     vec3 c = t.rgb / t.a;
     vec3 p = texture2D(u_paper, v_uv).rgb;
@@ -223,11 +237,14 @@ class MeshRenderer {
     this.uTex = gl.getUniformLocation(p, 'u_tex');
     this.uPaper = gl.getUniformLocation(p, 'u_paper');
     this.uHide = gl.getUniformLocation(p, 'u_hide');
+    this.uDetail = gl.getUniformLocation(p, 'u_detail');
+    this.uDetailRect = gl.getUniformLocation(p, 'u_detailRect');
+    this.uHasDetail = gl.getUniformLocation(p, 'u_hasDetail');
   }
 
   create() {
     const gl = this.gl;
-    return { tex: null, paperTex: null, posBuf: gl.createBuffer(), uvBuf: gl.createBuffer(), count: 0 };
+    return { tex: null, paperTex: null, detailTex: null, detailRect: null, posBuf: gl.createBuffer(), uvBuf: gl.createBuffer(), count: 0 };
   }
 
   // Mipmaps (with anisotropic filtering) only if `mip`: they blur an image
@@ -278,6 +295,32 @@ class MeshRenderer {
     gl.activeTexture(gl.TEXTURE0);
   }
 
+  // A sharper texture for part of the image, drawn in place of the main one
+  // there: `detail` is {source, rect: [u0, v0, u1, v1]} (texture coordinates
+  // of the whole image), or null for none. No mipmaps: it is made at about
+  // the screen's resolution.
+  setDetail(m, detail) {
+    const gl = this.gl;
+    if (m.detailTex) gl.deleteTexture(m.detailTex);
+    m.detailTex = null;
+    m.detailRect = null;
+    if (!detail) return;
+    m.detailTex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, m.detailTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, detail.source);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.activeTexture(gl.TEXTURE0);
+    const [u0, v0, u1, v1] = detail.rect;
+    m.detailRect = [u0, v0, 1 / (u1 - u0), 1 / (v1 - v0)];
+  }
+
   setTriangles(m, { positions, uvs, count }) {
     const gl = this.gl;
     gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf);
@@ -296,11 +339,16 @@ class MeshRenderer {
     gl.uniform1f(this.uOpacity, opacity);
     gl.uniform1i(this.uTex, 0);
     gl.uniform1i(this.uPaper, 1);
+    gl.uniform1i(this.uDetail, 2);
+    gl.uniform1f(this.uHasDetail, m.detailTex ? 1 : 0);
+    gl.uniform4fv(this.uDetailRect, m.detailRect || [0, 0, 1, 1]);
     gl.uniform3fv(this.uHide, hide > 0 && m.paperTex ? paperThresholds(hide) : [0, 0, 0]);
     // The paper texture's unit is bound even when unused: an unbound sampler
     // reads black, but the map's own textures could be sitting there.
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, m.paperTex);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, m.detailTex || m.tex);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, m.tex);
     gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf);
@@ -316,6 +364,7 @@ class MeshRenderer {
     const gl = this.gl;
     if (m.tex) gl.deleteTexture(m.tex);
     if (m.paperTex) gl.deleteTexture(m.paperTex);
+    if (m.detailTex) gl.deleteTexture(m.detailTex);
     gl.deleteBuffer(m.posBuf);
     gl.deleteBuffer(m.uvBuf);
   }
@@ -356,6 +405,7 @@ const imageLayer = {
   renderingMode: '2d',
   onAdd(_map, gl) {
     this.renderer = new MeshRenderer(gl);
+    this.maxTexture = gl.getParameter(gl.MAX_TEXTURE_SIZE);
     // Resources from before went with the old layer (and a removed layer's
     // were freed when it was removed).
     for (const L of state.layers) L.gpu = null;
@@ -380,13 +430,22 @@ const imageLayer = {
         L.texDirty = L.meshDirty = true;
       }
       if (L.texDirty) {
-        r.setTexture(L.gpu, textureSource(L.image.img, Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE))));
+        const source = textureSource(L.image.img, Math.min(DISPLAY_TEXTURE, gl.getParameter(gl.MAX_TEXTURE_SIZE)));
+        L.texScale = (source.naturalWidth || source.width) / L.image.W;
+        r.setTexture(L.gpu, source);
         r.setPaper(L.gpu, L.image.paper);
         L.texDirty = false;
       }
       if (L.meshDirty) {
         r.setTriangles(L.gpu, meshTriangles(L.mesh, L.origin, L.fine));
         L.meshDirty = false;
+        // The detail is a piece of the source, so it stays right wherever
+        // the image is drawn; it may just no longer cover the view.
+        scheduleDetail();
+      }
+      if (L.gpu.detailFor !== L.detail) {
+        r.setDetail(L.gpu, L.detail);
+        L.gpu.detailFor = L.detail;
       }
       // Half see-through while dragging, except when the streets on top are
       // what moves, or a point is sliding across the image (which stays put).
@@ -397,6 +456,205 @@ const imageLayer = {
     }
   },
 };
+
+// ---------------------------------------------------------------------------
+// Detail: the display texture is at most DISPLAY_TEXTURE pixels a side, so a
+// larger image is drawn from a shrunk copy. Once nothing has changed for
+// DETAIL_IDLE_MS, each image gets a second texture, cut from the source at
+// the screen's resolution for the part in view and a margin around it, and
+// is drawn from that wherever it reaches. Being a piece of the source, it
+// stays right however the map moves or the image bends; it is only replaced
+// when the view outgrows it or needs finer detail, and dropped when zooming
+// out leaves it much finer than the screen. It also stands in for the
+// mipmaps of an image drawn at about its own size, which blur it.
+
+const DISPLAY_TEXTURE = 4096;
+const DETAIL_IDLE_MS = 2000;
+// Pixels for one layer's detail, and for all of them together: with
+// several large layers in view, each gets an even share.
+const DETAIL_MAX_PIXELS = 12e6;
+const DETAIL_TOTAL_PIXELS = 24e6;
+// The margins tried, as fractions of the view's width and height on each
+// side, widest first: the widest that fits the layer's pixels at full
+// resolution is used. A detail is kept while it covers the view and
+// DETAIL_KEEP of this margin.
+const DETAIL_MARGINS = [1, 0.5, 0.25, 0];
+const DETAIL_KEEP = 0.25;
+let detailTimer = 0;
+
+function scheduleDetail() {
+  clearTimeout(detailTimer);
+  detailTimer = setTimeout(makeDetails, DETAIL_IDLE_MS);
+}
+
+function makeDetails() {
+  if (state.drag || state.ease || map.isMoving()) {
+    scheduleDetail();
+    return;
+  }
+  const maxSize = Math.min(8192, imageLayer.maxTexture || 4096);
+  let changed = false;
+  const ready = state.layers.filter(L => L.mesh && L.gpu && !L.meshDirty && L.texScale);
+  // An invisible layer, or one out of view, needs none.
+  const shown = ready.filter(L => L.opacity > 0 && meshInView(L.mesh));
+  for (const L of ready) {
+    if (shown.includes(L)) continue;
+    if (L.detail) changed = true;
+    L.detail = null;
+  }
+  const maxPixels = Math.min(DETAIL_MAX_PIXELS, DETAIL_TOTAL_PIXELS / Math.max(1, shown.length));
+  for (const L of shown) {
+    const detail = detailFor(L, maxSize, maxPixels);
+    if (detail !== L.detail) changed = true;
+    L.detail = detail;
+  }
+  if (changed) map.triggerRepaint();
+}
+
+// Zoomed out to where the detail is minified more than twice over, it
+// would shimmer without mipmaps: the display texture does better there.
+map.on('zoom', () => {
+  const z = map.getZoom();
+  for (const L of state.layers) {
+    if (L.detail && L.detail.s > 2 * L.detail.screenScale * 2 ** (z - L.detail.zoom)) {
+      L.detail = null;
+      map.triggerRepaint();
+    }
+  }
+});
+map.on('resize', scheduleDetail);
+
+// L's detail for the current view: its current one if that still serves,
+// a new crop of the source, or null if the display texture already has as
+// much detail.
+function meshInView(mesh) {
+  const canvas = map.getCanvas();
+  const [minX, minY, maxX, maxY] = meshBounds(mesh);
+  const pts = [[minX, minY], [maxX, minY], [minX, maxY], [maxX, maxY]].map(mercToScreen);
+  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+  return Math.max(...xs) >= 0 && Math.min(...xs) <= canvas.clientWidth &&
+    Math.max(...ys) >= 0 && Math.min(...ys) <= canvas.clientHeight;
+}
+
+function detailFor(L, maxSize, maxPixels) {
+  const { W, H, img } = L.image;
+  const canvas = map.getCanvas();
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const dpr = canvas.width / Math.max(1, w);
+  const A = mercToScreenAffine();
+  const { positions, uvs, count } = meshTriangles(L.mesh, L.origin, L.fine);
+  const [ox, oy] = L.origin;
+  // Source pixel bounds of the view with each margin, and with DETAIL_KEEP
+  // of each.
+  const margins = [...DETAIL_MARGINS, ...DETAIL_MARGINS.map(m => m * DETAIL_KEEP)];
+  const bounds = margins.map(() => [Infinity, Infinity, -Infinity, -Infinity]);
+  const views = margins.map(m => [-m * w, -m * h, (1 + m) * w, (1 + m) * h]);
+  const [vx0, vy0, vx1, vy1] = views[0];
+  let scale = 0;
+  const sx = new Float64Array(3), sy = new Float64Array(3);
+  for (let t = 0; t < count; t += 3) {
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (let k = 0; k < 3; k++) {
+      const x = positions[(t + k) * 2] + ox, y = positions[(t + k) * 2 + 1] + oy;
+      sx[k] = A[0] * x + A[1] * y + A[2];
+      sy[k] = A[3] * x + A[4] * y + A[5];
+      minX = Math.min(minX, sx[k]); maxX = Math.max(maxX, sx[k]);
+      minY = Math.min(minY, sy[k]); maxY = Math.max(maxY, sy[k]);
+    }
+    if (maxX < vx0 || minX > vx1 || maxY < vy0 || minY > vy1) continue;
+    const i = t * 2;
+    const pu = [uvs[i] * W, uvs[i + 2] * W, uvs[i + 4] * W];
+    const pv = [uvs[i + 1] * H, uvs[i + 3] * H, uvs[i + 5] * H];
+    const tri = [0, 1, 2].map(k => [sx[k], sy[k], pu[k], pv[k]]);
+    // Only the part in each view: a single triangle can cover far more.
+    margins.forEach((m, n) => {
+      const b = bounds[n], [x0, y0, x1, y1] = views[n];
+      if (maxX < x0 || minX > x1 || maxY < y0 || minY > y1) return;
+      const whole = minX >= x0 && maxX <= x1 && minY >= y0 && maxY <= y1;
+      for (const [, , u, v] of whole ? tri : clipToView(tri, views[n])) {
+        b[0] = Math.min(b[0], u); b[1] = Math.min(b[1], v);
+        b[2] = Math.max(b[2], u); b[3] = Math.max(b[3], v);
+      }
+    });
+    if (maxX < 0 || minX > w || maxY < 0 || minY > h) continue;
+    // The triangle's screen pixels per source pixel, at its most stretched,
+    // over the view itself.
+    const du1 = pu[1] - pu[0], dv1 = pv[1] - pv[0], du2 = pu[2] - pu[0], dv2 = pv[2] - pv[0];
+    const det = du1 * dv2 - du2 * dv1;
+    if (!det) continue;
+    const ex1 = sx[1] - sx[0], ey1 = sy[1] - sy[0], ex2 = sx[2] - sx[0], ey2 = sy[2] - sy[0];
+    const a = (ex1 * dv2 - ex2 * dv1) / det, b = (ex2 * du1 - ex1 * du2) / det;
+    const c = (ey1 * dv2 - ey2 * dv1) / det, d = (ey2 * du1 - ey1 * du2) / det;
+    const q = (a * a + b * b + c * c + d * d) / 2;
+    const r = Math.sqrt((a * a + b * b - c * c - d * d) ** 2 / 4 + (a * c + b * d) ** 2);
+    scale = Math.max(scale, Math.sqrt(q + r));
+  }
+  // Whole source pixels, with one to spare for the bilinear filter.
+  const crop = ([u0, v0, u1, v1]) => u1 > u0 && v1 > v0 ? [
+    Math.max(0, Math.floor(u0) - 1), Math.max(0, Math.floor(v0) - 1),
+    Math.min(W, Math.ceil(u1) + 1), Math.min(H, Math.ceil(v1) + 1)] : null;
+  const fit = ([u0, v0, u1, v1]) => {
+    const cw = u1 - u0, ch = v1 - v0;
+    return Math.min(1, maxSize / cw, maxSize / ch, Math.sqrt(maxPixels / (cw * ch)));
+  };
+  const inView = crop(bounds[DETAIL_MARGINS.length - 1]);
+  if (!inView || !scale) return null;
+  const want = Math.min(1, scale * dpr);
+  // At the display texture's own scale or coarser there's nothing to gain,
+  // unless it's being drawn from blurry mipmaps.
+  const useful = (s) => !(s <= L.texScale / 2 || (L.texScale >= 1 && s >= 1));
+  if (!useful(Math.min(want, fit(inView)))) return null;
+
+  // Keep the current detail if it is fine enough and covers enough.
+  const old = L.detail;
+  const contains = (r, b) => b && r[0] <= b[0] && r[1] <= b[1] && r[2] >= b[2] && r[3] >= b[3];
+  if (old) {
+    const keep = crop(bounds[DETAIL_MARGINS.length + old.margin]);
+    const pixels = old.source.width * old.source.height;
+    if (old.s >= Math.min(want, fit(inView)) * 0.95 && old.s <= 2 * want && contains(old.px, keep) &&
+      pixels <= maxPixels * 1.01) return old;
+  }
+
+  // The widest margin that fits at the resolution wanted, or else the view
+  // alone as fine as it fits.
+  let n = DETAIL_MARGINS.findIndex((m, k) => { const c = crop(bounds[k]); return c && fit(c) >= want; });
+  if (n < 0) n = DETAIL_MARGINS.length - 1;
+  const px = crop(bounds[n]);
+  const [u0, v0, u1, v1] = px;
+  const cw = u1 - u0, ch = v1 - v0;
+  const s = Math.min(want, fit(px));
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(cw * s));
+  c.height = Math.max(1, Math.round(ch * s));
+  const ctx = c.getContext('2d');
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, u0, v0, cw, ch, 0, 0, c.width, c.height);
+  return {
+    source: c, rect: [u0 / W, v0 / H, u1 / W, v1 / H], px, s, margin: n,
+    screenScale: scale * dpr, zoom: map.getZoom(),
+  };
+}
+
+// A polygon of [x, y, u, v] clipped to the screen rectangle [x0, y0, x1, y1],
+// with u and v interpolated along with x and y.
+function clipToView(poly, [x0, y0, x1, y1]) {
+  const edges = [[0, 1, x0], [0, -1, x1], [1, 1, y0], [1, -1, y1]];  // [axis, sign, bound]
+  for (const [axis, sign, bound] of edges) {
+    const inside = (p) => sign * (p[axis] - bound) >= 0;
+    const out = [];
+    for (let k = 0; k < poly.length; k++) {
+      const a = poly[k], b = poly[(k + 1) % poly.length];
+      if (inside(a)) out.push(a);
+      if (inside(a) !== inside(b)) {
+        const f = (bound - a[axis]) / (b[axis] - a[axis]);
+        out.push(a.map((x, n) => x + (b[n] - x) * f));
+      }
+    }
+    poly = out;
+    if (!poly.length) break;
+  }
+  return poly;
+}
 
 function freeGPU(L) {
   if (L.gpu && imageLayer.renderer) imageLayer.renderer.free(L.gpu);
@@ -577,6 +835,7 @@ function refineView(L, mesh) {
 }
 
 map.on('moveend', () => {
+  scheduleDetail();
   if (state.drag || state.ease) return;
   for (const L of state.layers) {
     if (!L.mesh) continue;
@@ -2118,6 +2377,7 @@ function setLayers(order) {
   }
   syncImageParam();
   map.triggerRepaint();
+  scheduleDetail();
   drawOverlay();
   updateUI();
 }
@@ -2161,6 +2421,7 @@ function layerCard(L) {
   opacity.addEventListener('input', () => {
     L.opacity = Number(opacity.value);
     map.triggerRepaint();
+    scheduleDetail();
   });
   hide.addEventListener('input', () => {
     L.hidePaper = Number(hide.value);
